@@ -14,6 +14,14 @@ System and Service Manager
 [![Packaging status](https://repology.org/badge/tiny-repos/systemd.svg)](https://repology.org/project/systemd/versions)</br>
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/systemd/systemd/badge)](https://securityscorecards.dev/viewer/?platform=github.com&org=systemd&repo=systemd)
 
+## Fork
+
+Age verifcation is not a joke or some minor inconvienince. It is the first step to forcing compliance in open source
+operating systems like Linux. Don't allow it, don't merge or develop things to follow unclear laws. We have to fight this.
+
+I will continue to merge commits into this fork and watch for more age bs added. I'm also considering removing other
+"device info" things systemd has been adding in. Contributions welcome and highly appreciated.
+
 ## Details
 
 Most documentation is available on [systemd's web site](https://systemd.io/).
