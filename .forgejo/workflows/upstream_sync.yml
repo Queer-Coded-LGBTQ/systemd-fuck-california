@@ -1,7 +1,5 @@
 name: Sync upstream commits from systemd/systemd
 
-# looks right lol :3c
-
 on:
   schedule:
   - cron: "42 */8 * * *" # 3 times a day at 08:42/16:42/00:42 UTC
@@ -10,7 +8,7 @@ on:
 
 jobs:
   check-upstream:
-    runs-on: codeberg-tiny
+    runs-on: codeberg-medium
 
     steps:
     - name: Checkout fork
