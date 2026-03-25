@@ -1,0 +1,47 @@
+name: Sync upstream commits from systemd/systemd
+
+# looks right lol :3c
+
+on:
+  schedule:
+  - cron: "42 */8 * * *" # 3 times a day at 08:42/16:42/00:42 UTC
+  workflow_dispatch:
+    # allow manual runs
+
+jobs:
+  check-upstream:
+    runs-on: codeberg-tiny
+
+    steps:
+    - name: Checkout fork
+      uses: https://data.forgejo.org/actions/checkout@v4
+      with:
+        fetch-depth: 0 # full history for comparisons
+
+    - name: Add upstream remote
+      run: |
+        git remote add upstream https://github.com/systemd/systemd.git
+        git fetch upstream
+
+    - name: Detect and sync upstream commits
+      run: |
+        # Set git config temporarily
+        git config --local user.name "qc-infra"
+        git config --local user.email "bot@codeberg.org"
+
+        # Compare upstream/main to origin/main
+        NEW=$(git rev-list --count origin/main..upstream/main || echo 0)
+        echo "NEW_COMMITS=$NEW" >> "$FORGEJO_OUTPUT"
+
+        if [ "$NEW" -gt 0 ]; then
+          echo "Upstream has $NEW new commits, rebasing..."
+          git switch main
+          git merge upstream/main
+          git push origin main
+          echo "Successfully synchronized to upstream."
+        else
+          echo "No new upstream commits."
+        fi
+
+        # Reset git config (remove the set vars)
+        git config unset --local user.name && git config unset --local user.email
