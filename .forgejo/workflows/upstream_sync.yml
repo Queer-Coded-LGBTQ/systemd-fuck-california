@@ -34,7 +34,8 @@ jobs:
         if [ "$NEW" -gt 0 ]; then
           echo "Upstream has $NEW new commits, rebasing..."
           git switch main
-          git merge upstream/main
+          git merge -X ours upstream/main
+          git merge --continue
           git push origin main
           echo "Successfully synchronized to upstream."
         else
