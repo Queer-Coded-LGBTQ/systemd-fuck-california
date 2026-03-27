@@ -10,7 +10,7 @@ on:
 
 jobs:
   check-upstream:
-    runs-on: codeberg-tiny
+    runs-on: codeberg-medium
 
     steps:
     - name: Checkout fork
