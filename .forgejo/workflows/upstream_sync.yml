@@ -1,5 +1,7 @@
 name: Sync upstream commits from systemd/systemd
 
+# looks right lol :3c
+
 on:
   schedule:
   - cron: "42 */8 * * *" # 3 times a day at 08:42/16:42/00:42 UTC
@@ -8,7 +10,7 @@ on:
 
 jobs:
   check-upstream:
-    runs-on: codeberg-medium
+    runs-on: codeberg-tiny
 
     steps:
     - name: Checkout fork
@@ -23,6 +25,12 @@ jobs:
 
     - name: Detect and sync upstream commits
       run: |
+        set -euo pipefail
+        BAD=0
+        QBRANCH_NAME="upstream_auto-sync-$(date +"%Y-%m-%d")"
+        QBRANCH_COMMITID=""
+        local_run_id="${FORGEJO_RUN_ID:-${GITHUB_RUN_NUMBER:-unknown}}"
+
         # Set git config temporarily
         git config --local user.name "qc-infra"
         git config --local user.email "bot@codeberg.org"
@@ -31,16 +39,63 @@ jobs:
         NEW=$(git rev-list --count origin/main..upstream/main || echo 0)
         echo "NEW_COMMITS=$NEW" >> "$FORGEJO_OUTPUT"
 
+        # Define the auto-resolve function for delete/modify conflicts
+        function autoresolvedel {
+          DELETED_FILES=$(git status --porcelain | grep '^[[:space:]]*D' | awk '{print $2}')
+          if [ -n "$DELETED_FILES" ]; then
+              git rm $DELETED_FILES
+              git commit -m "CI script 'sync_upstream' run '$local_run_id' - Auto-resolve delete/modify conflicts per local
+              Removed file count: $(echo $DELETED_FILES | wc -w)
+              Files:
+              $(echo "$DELETED_FILES" | tr ' ' '\n')"
+          fi
+        }
+
+        # Count number of new commits and screen their diffs for age check related keywords
         if [ "$NEW" -gt 0 ]; then
-          echo "Upstream has $NEW new commits, rebasing..."
-          git switch main
-          git merge -X ours upstream/main
-          git merge --continue
-          git push origin main
-          echo "Successfully synchronized to upstream."
+          COMMITS=$(git rev-list origin/main..upstream/main)
+          for COMMIT in $COMMITS; do
+            # Loose regex but catches everything.
+            if git show --format="%H%n%B%n----" "$COMMIT" | grep -qiE '(age|birth)'; then
+              BAD=1 ; break
+              # exit the loop since the commits will be manually reviewed anyways
+            fi
+          done
+
+          if [ "$BAD" -ne 0 ]; then
+            echo MESSAGE=\"Commits failed agecheck screening, creating issue and pushing to a queue branch\" | tee $FORGEJO_OUTPUT
+
+            # Create a queue branch from origin/main
+            git switch -c "$QBRANCH_NAME" origin/main
+            git merge --no-ff upstream/main -m "Queue upstream changes for agecheck review"
+            git push -u origin "$QBRANCH_NAME"
+
+            QBRANCH_COMMITID=$(git ls-remote origin "$QBRANCH_NAME" | cut -f1 || git rev-parse HEAD)
+            curl -sS -X POST \
+              -H "Authorization: token $FORGEJO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg c "$QBRANCH_NAME" --arg id "$QBRANCH_COMMITID" --arg rn "$local_run_id" '
+                {
+                  title: "Upstream sync: branch \($c) at commit \($id) did not pass agecheck screening",
+                  body: "Automated sync of upstream commits into main branch raised concerns.\n\Branch \($c) contains changes assumedly related to age verification and is submitted for manual screening.\n\nCI run: \($rn)"
+                }')" \
+              "$FORGEJO_API_URL/repos/$FORGEJO_REPOSITORY/issues"
+            echo MESSAGE=\"Issue created for upstream commits. Branch: $QBRANCH_NAME\" | tee $FORGEJO_OUTPUT
+
+          else
+            # No commits flagged in screening
+            echo MESSAGE=\"Upstream has $NEW new commits, merging...\" | tee $FORGEJO_OUTPUT
+            git switch main
+            git merge -X ours upstream/main
+            # check for and resolve delete/merge conflicts
+            autoresolvedel
+            git merge --continue
+            git push origin main
+            echo MESSAGE=\"Successfully synchronized to upstream. Count: $NEW\" | tee $FORGEJO_OUTPUT
+          fi
         else
-          echo "No new upstream commits."
+          echo MESSAGE=\"No new upstream commits.\" | tee $FORGEJO_OUTPUT
         fi
 
         # Reset git config (remove the set vars)
-        git config unset --local user.name && git config unset --local user.email
+        git config --local --remove-section user || git config --local --unset-all user.name user.email
