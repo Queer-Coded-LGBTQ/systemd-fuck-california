@@ -67,7 +67,10 @@ jobs:
 
             # Create a queue branch from origin/main
             git switch -c "$QBRANCH_NAME" origin/main
-            git merge --no-ff upstream/main -m "Queue upstream changes for agecheck review"
+            git merge -X ours --no-ff upstream/main -m "Queue upstream changes for agecheck review"
+            # check for and resolve delete/merge conflicts
+            autoresolvedel
+            git merge --continue
             git push -u origin "$QBRANCH_NAME"
 
             QBRANCH_COMMITID=$(git ls-remote origin "$QBRANCH_NAME" | cut -f1 || git rev-parse HEAD)
