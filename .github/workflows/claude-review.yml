@@ -270,15 +270,37 @@ jobs:
               for PR context, and reads the codebase to verify findings.
 
               Each reviewer reviews code quality, style, potential bugs, and security
-              implications. It must return a JSON array of issues:
-              `[{"file": "path", "line": <number> (optional), "severity": "must-fix|suggestion|nit", "body": "...", "commit": "<sha>"}]`
+              implications. It must return a JSON array of issues matching this schema:
+
+              ```json
+              {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["path", "line", "severity", "body", "commit"],
+                  "properties": {
+                    "path":       { "type": "string", "description": "File path relative to repo root" },
+                    "line":       { "type": "integer", "description": "Diff line number (last line for multi-line)" },
+                    "side":       { "enum": ["LEFT", "RIGHT"], "description": "Diff side: LEFT for deletions, RIGHT for additions/context (default: RIGHT)" },
+                    "start_line": { "type": "integer", "description": "First line of a multi-line comment range" },
+                    "start_side": { "enum": ["LEFT", "RIGHT"], "description": "Diff side for start_line" },
+                    "severity":   { "enum": ["must-fix", "suggestion", "nit"] },
+                    "body":       { "type": "string", "description": "Review comment in markdown" },
+                    "commit":     { "type": "string", "description": "SHA of the commit being reviewed" }
+                  }
+                }
+              }
+              ```
 
               The `commit` field MUST be the SHA of the commit being reviewed. Only
               comment on changes in that commit — not preceding commits.
 
-              `line` should be a line number from the NEW side of the diff **that appears
-              inside a diff hunk**. GitHub rejects lines outside the diff context. If you
-              cannot determine a valid diff line, omit `line`.
+              `line` should be a line number from the diff **that appears inside a
+              diff hunk**. GitHub rejects lines outside the diff context. `side`
+              indicates which side of the diff (`LEFT` for deletions, `RIGHT` for
+              additions or context lines); defaults to `RIGHT` if omitted. For
+              multi-line comments, set `start_line` and `start_side` to the first
+              line of the range and `line`/`side` to the last.
 
               Each reviewer MUST verify findings before returning them:
               - For style/convention claims, check at least 3 existing examples in the
@@ -318,13 +340,13 @@ jobs:
                  <!-- claude-pr-review -->
 
                  ### Must fix
-                 - [ ] **short title** — `file:line` — brief explanation
+                 - [ ] **short title** — `path:line` — brief explanation
 
                  ### Suggestions
-                 - [ ] **short title** — `file:line` — brief explanation
+                 - [ ] **short title** — `path:line` — brief explanation
 
                  ### Nits
-                 - [ ] **short title** — `file:line` — brief explanation
+                 - [ ] **short title** — `path:line` — brief explanation
                  ```
 
                  Omit empty sections. Each checkbox item must correspond to an entry in `comments`.
@@ -362,23 +384,15 @@ jobs:
 
               ```json
               {
-                "summary": "...",
-                "comments": [
-                  {
-                    "file": "path/to/file",
-                    "line": 42,
-                    "severity": "must-fix|suggestion|nit",
-                    "body": "review comment in markdown",
-                    "commit": "abc123"
-                  }
-                ],
-                "resolve": [12345]
+                "type": "object",
+                "required": ["summary", "comments"],
+                "properties": {
+                  "summary":  { "type": "string", "description": "Markdown summary for the tracking comment" },
+                  "comments": { "description": "Array of review comments (same schema as the reviewer output above)" },
+                  "resolve":  { "type": "array", "items": { "type": "integer" }, "description": "REST API IDs of review comment threads to resolve" }
+                }
               }
               ```
-
-              - `summary` (required): markdown summary for the tracking comment
-              - `comments` (required): array of review comments; `line` is optional
-              - `resolve` (optional): REST API IDs of review comment threads to resolve
 
               Do NOT attempt to post comments or use any MCP tools to modify the PR.
 
@@ -470,29 +484,32 @@ jobs:
              * comments is handled by Claude in the prompt, so we just post whatever
              * it returns. Using individual comments (rather than a review) means
              * re-runs only add new comments instead of creating a whole new review. */
-            const inlineComments = comments.filter((c) => c.line);
+            const inlineComments = comments.filter((c) => c.path && c.line);
             const skipped = comments.length - inlineComments.length;
             if (skipped > 0)
-              console.log(`Skipping ${skipped} file-level comment(s) (no line number).`);
+              console.log(`Skipping ${skipped} comment(s) missing path or line number.`);
 
             let posted = 0;
             for (const c of inlineComments) {
-              console.log(`  Posting comment on ${c.file}:${c.line}`);
+              console.log(`  Posting comment on ${c.path}:${c.line}`);
               try {
                 await github.rest.pulls.createReviewComment({
                   owner,
                   repo,
                   pull_number: prNumber,
                   commit_id: c.commit,
-                  path: c.file,
+                  path: c.path,
                   line: c.line,
+                  ...(c.side != null && { side: c.side }),
+                  ...(c.start_line != null && { start_line: c.start_line }),
+                  ...(c.start_side != null && { start_side: c.start_side }),
                   body: `Claude: **${c.severity}**: ${c.body}`,
                 });
                 posted++;
               } catch (e) {
                 /* GitHub rejects comments on lines outside the diff context. Log
                  * and continue — the tracking comment still contains all findings. */
-                console.log(`  Warning: failed to post comment on ${c.file}:${c.line}: ${e.message}`);
+                console.log(`  Warning: failed to post comment on ${c.path}:${c.line}: ${e.message}`);
               }
             }
 
