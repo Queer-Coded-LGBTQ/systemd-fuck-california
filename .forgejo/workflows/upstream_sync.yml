@@ -91,7 +91,7 @@ jobs:
           if [ "$NEW" -gt 0 ]; then
             COMMITS="$(git rev-list origin/main..upstream/main)"
             for COMMIT in $COMMITS; do
-              if git show --format="%H%n%B%n----" "$COMMIT" | grep -qiE '(age|birth)'; then
+              if git show --format="%H%n%B%n----" "$COMMIT" | grep -qiE '((^|[^[:alnum:]_])([[:alnum:]_]*[_-])?(age|dob|birth|date)([_-][[:alnum:]_]+|[[:alnum:]_]*)([^[:alnum:]_]|$)|ab1043)'; then
                 BAD=1
                 break
               fi
