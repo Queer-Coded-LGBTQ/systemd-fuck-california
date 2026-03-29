@@ -2,8 +2,9 @@ name: Sync upstream commits from systemd/systemd
 
 on:
   schedule:
-    - cron: "42 */8 * * *"
+    - cron: "42 */8 * * *" # Run every 8 hours on the 42nd minute
   workflow_dispatch:
+    # Allow manual running
 
 jobs:
   check-upstream:
@@ -18,6 +19,7 @@ jobs:
       - name: Add upstream remote
         run: |
           set -euo pipefail
+          # Get upstream remote from systemd/systemd
           git remote add upstream https://github.com/systemd/systemd.git || git remote set-url upstream https://github.com/systemd/systemd.git
           git fetch upstream
 
@@ -27,65 +29,47 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Define variables
           BAD=0
           QBRANCH_NAME="upstream_auto-sync-$(date +"%Y-%m-%d")"
           local_run_id="${FORGEJO_RUN_ID:-${GITHUB_RUN_NUMBER:-unknown}}"
           OUTPUT_FILE="${FORGEJO_OUTPUT:-${GITHUB_OUTPUT:-/tmp/workflow_output}}"
 
+          # Prep git
           git config --local user.name "qc-infra"
           git config --local user.email "bot@codeberg.org"
-
           # Always start from local main tracking origin/main
           git checkout -B main origin/main
 
+          # Define a list of new commits not in origin/main but present in upstream/main
           NEW="$(git rev-list --count origin/main..upstream/main || echo 0)"
           echo "NEW_COMMITS=$NEW" >> "$OUTPUT_FILE"
 
-          resolve_deleted_file_conflicts() {
+          resolve_delete-modify_conflicts() {
             local unresolved
-            unresolved="$(git diff --name-only --diff-filter=U || true)"
-
+            # Get paths marked as deleted
+            unresolved="$(git status --porcelain | grep -E "^ D")"
+            # git status --porcelain outputs status as follows:
+            # " D AGENTS.md"
+            # Simplest grep for that is extended "^ D"
+            # And also cant error out here
             [ -n "$unresolved" ] || return 0
-
-            echo "Unresolved paths:"
-            printf '%s\n' "$unresolved"
-
-            while IFS= read -r path; do
+            for path in "$unresolved"
               [ -n "$path" ] || continue
-
-              # If the file does not exist in HEAD, we deleted it locally.
-              # Keep it deleted no matter what upstream changed.
-              if ! git cat-file -e "HEAD:$path" 2>/dev/null; then
-                echo "Keeping deleted file deleted: $path"
-                git rm -f -- "$path"
-              fi
-            done <<< "$unresolved"
-
-            unresolved="$(git diff --name-only --diff-filter=U || true)"
+              # Remove any file marked as deleted
+              git rm -f -- "$path"
+              git commit -m "CI script 'sync_upstream' run '$local_run_id' - Auto-resolve delete/modify conflicts per local
+              Removed file count: $(echo $DELETED_FILES | wc -w)
+              Files:
+              $(echo "$DELETED_FILES" | tr ' ' '\n')"
+            done
+            unresolved="$(git status --porcelain | grep -E "^ D")"
             if [ -n "$unresolved" ]; then
-              echo "Still unresolved after auto-resolving deleted-file conflicts:"
-              printf '%s\n' "$unresolved"
+              echo "RESOLVER_MESSAGE='Unresolved file paths have not been resolved. Recommend manual pull from upstream.'" | tee -a $OUTPUT_FILE
               return 1
             fi
-
+            echo "RESOLVER_MESSAGE='Deleted files were successfully resolved.'" | tee -a $OUTPUT_FILE
             return 0
-          }
-
-          merge_upstream_with_deleted_files_ignored() {
-            local merge_message="$1"
-
-            # no auto commit; lets us fix conflicts first
-            if git merge --no-commit --no-ff upstream/main -m "$merge_message"; then
-              # Merge succeeded without conflicts
-              git commit --no-edit
-              return 0
-            fi
-
-            echo "Merge reported conflicts, trying to keep fork-deleted files deleted..."
-            resolve_deleted_file_conflicts
-
-            # If merge is now fully resolved, create the merge commit.
-            git commit -m "$merge_message"
           }
 
           if [ "$NEW" -gt 0 ]; then
@@ -98,43 +82,37 @@ jobs:
             done
 
             if [ "$BAD" -ne 0 ]; then
-              echo 'MESSAGE=Commits failed agecheck screening, creating issue and pushing to a queue branch' | tee -a "$OUTPUT_FILE"
-
+              echo "MESSAGE='Commits failed agecheck screening, creating issue and pushing to a queue branch'" | tee -a "$OUTPUT_FILE"
               git checkout -B "$QBRANCH_NAME" origin/main
-
-              merge_upstream_with_deleted_files_ignored "Queue upstream changes for agecheck review"
-
+              # Resolve potential conflicts
+              resolve_delete-modify_conflicts
+              # Commit and push to queue branch
+              git switch -c "$QBRANCH_NAME" origin/main
+              git merge -X ours --no-ff upstream/main -m "Queue upstream changes for agecheck review"
               git push -u origin "$QBRANCH_NAME"
-
+              # Create issue
               QBRANCH_COMMITID="$(git rev-parse HEAD)"
-
               curl -sS -X POST \
                 -H "Authorization: token $FORGEJO_TOKEN" \
                 -H "Content-Type: application/json" \
-                -d "$(jq -n \
-                  --arg c "$QBRANCH_NAME" \
-                  --arg id "$QBRANCH_COMMITID" \
-                  --arg rn "$local_run_id" \
-                  '{
+                -d "$(jq -n --arg c "$QBRANCH_NAME" --arg id "$QBRANCH_COMMITID" --arg rn "$local_run_id" '{
                     title: "Upstream sync: branch \($c) at commit \($id) did not pass agecheck screening",
                     body: "Automated sync of upstream commits into main branch raised concerns.\n\nBranch \($c) contains changes potentially related to age verification and has been queued for manual review.\n\nCI run: \($rn)"
-                  }')" \
-                "$FORGEJO_API_URL/repos/$FORGEJO_REPOSITORY/issues"
-
-              echo "MESSAGE=Issue created for upstream commits. Branch: $QBRANCH_NAME" | tee -a "$OUTPUT_FILE"
+                  }')" "$FORGEJO_API_URL/repos/$FORGEJO_REPOSITORY/issues"
+              echo "MESSAGE='Issue created for upstream commits. Branch: $QBRANCH_NAME'" | tee -a "$OUTPUT_FILE"
             else
-              echo "MESSAGE=Upstream has $NEW new commits, merging..." | tee -a "$OUTPUT_FILE"
-
+              echo "MESSAGE='Upstream has $NEW new commits, merging...'" | tee -a "$OUTPUT_FILE"
               git checkout -B main origin/main
-
-              merge_upstream_with_deleted_files_ignored "Merge upstream/main into main"
-
+              # Resolve potential conflicts
+              resolve_delete-modify_conflicts
+              # Commit to origin/main
+              git merge -X ours upstream/main
+              git merge --continue || echo
               git push origin main
-
-              echo "MESSAGE=Successfully synchronized to upstream. Count: $NEW" | tee -a "$OUTPUT_FILE"
+              echo "MESSAGE='Successfully synchronized to upstream. Count: $NEW'" | tee -a "$OUTPUT_FILE"
             fi
           else
-            echo "MESSAGE=No new upstream commits." | tee -a "$OUTPUT_FILE"
+            echo "MESSAGE='No new upstream commits.'" | tee -a "$OUTPUT_FILE"
           fi
-
-          git config --local --remove-section user || true
+          # Reset git config (remove the set vars)
+          git config --local --remove-section user || git config --local --unset-all user.name user.email
