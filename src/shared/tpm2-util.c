@@ -2892,13 +2892,15 @@ int tpm2_get_best_pcr_bank(
         uint32_t efi_banks;
         r = efi_get_active_pcr_banks(&efi_banks);
         if (r < 0) {
-                if (r != -ENOENT)
+                if (!IN_SET(r, -ENOENT, -EOPNOTSUPP))
                         return r;
 
                 /* If variable is not set use guesswork below */
-                log_debug("Boot loader didn't set the LoaderTpm2ActivePcrBanks EFI variable, we have to guess the used PCR banks.");
+                log_debug("Boot loader didn't set the LoaderTpm2ActivePcrBanks EFI variable or EFI support is unavailable, we have to guess the used PCR banks.");
         } else if (efi_banks == UINT32_MAX)
                 log_debug("Boot loader set the LoaderTpm2ActivePcrBanks EFI variable to indicate that the GetActivePcrBanks() API is not available in the firmware. We have to guess the used PCR banks.");
+        else if (efi_banks == 0)
+                log_debug("Boot loader set the LoaderTpm2ActivePcrBanks EFI variable to zero to indicate that TPM support is not available in the firmware. We'll have to guess the used PCR banks.");
         else {
                 if (BIT_SET(efi_banks, TPM2_ALG_SHA256))
                         *ret = TPM2_ALG_SHA256;
@@ -3001,13 +3003,15 @@ int tpm2_get_good_pcr_banks(
         uint32_t efi_banks;
         r = efi_get_active_pcr_banks(&efi_banks);
         if (r < 0) {
-                if (r != -ENOENT)
+                if (!IN_SET(r, -ENOENT, -EOPNOTSUPP))
                         return r;
 
                 /* If the variable is not set we have to guess via the code below */
-                log_debug("Boot loader didn't set the LoaderTpm2ActivePcrBanks EFI variable, we have to guess the used PCR banks.");
+                log_debug("Boot loader didn't set the LoaderTpm2ActivePcrBanks EFI variable or EFI support is unavailable, we have to guess the used PCR banks.");
         } else if (efi_banks == UINT32_MAX)
                 log_debug("Boot loader set the LoaderTpm2ActivePcrBanks EFI variable to indicate that the GetActivePcrBanks() API is not available in the firmware. We have to guess the used PCR banks.");
+        else if (efi_banks == 0)
+                log_debug("Boot loader set the LoaderTpm2ActivePcrBanks EFI variable to zero to indicate that TPM support is not available in the firmware. We'll have to guess the used PCR banks.");
         else {
                 FOREACH_ARRAY(hash, tpm2_hash_algorithms, TPM2_N_HASH_ALGORITHMS) {
                         if (!BIT_SET(efi_banks, *hash))
@@ -6675,6 +6679,8 @@ static const char* tpm2_userspace_event_type_table[_TPM2_USERSPACE_EVENT_TYPE_MA
         [TPM2_EVENT_NVPCR_INIT]      = "nvpcr-init",
         [TPM2_EVENT_NVPCR_SEPARATOR] = "nvpcr-separator",
         [TPM2_EVENT_DM_VERITY]       = "dm-verity",
+        [TPM2_EVENT_IMDS_USERDATA]   = "imds-userdata",
+        [TPM2_EVENT_OS_SEPARATOR]    = "os-separator",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(tpm2_userspace_event_type, Tpm2UserspaceEventType);
