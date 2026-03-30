@@ -31,7 +31,7 @@ jobs:
 
           # Define variables
           BAD=0
-          QBRANCH_NAME="upstream_auto-sync-$(date +"%Y-%m-%d")"
+          QBRANCH_NAME="upstream_auto-sync_$(date +"%Y-%m-%d_%H%M%S")"
           local_run_id="${FORGEJO_RUN_ID:-${GITHUB_RUN_NUMBER:-unknown}}"
           OUTPUT_FILE="${FORGEJO_OUTPUT:-${GITHUB_OUTPUT:-/tmp/workflow_output}}"
 
