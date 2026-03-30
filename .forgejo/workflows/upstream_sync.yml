@@ -90,7 +90,7 @@ jobs:
               # Resolve potential conflicts
               resolve_delete-modify_conflicts
               # Commit and push to queue branch
-              git switch -c "$QBRANCH_NAME" origin/main
+              git switch "$QBRANCH_NAME" origin/main
               git merge -X ours --no-ff upstream/main -m "Queue upstream changes for agecheck review"
               git push -u origin "$QBRANCH_NAME"
               # Create issue
