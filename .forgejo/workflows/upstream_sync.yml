@@ -49,7 +49,7 @@ jobs:
             local unresolved
             local path
             # Get paths marked as deleted
-            unresolved="$(git status --porcelain | awk '$1 == "DU" || $1 == "UD" {print $2}')"
+            unresolved="$(git status --porcelain | awk '/^(DU|UD)/ {print $2}')"
             # git status --porcelain outputs status as follows:
             # " DU AGENTS.md"
             # " UD AGENTS.md"
@@ -61,12 +61,12 @@ jobs:
             # Commit changes
             if [ -n "$unresolved" ]; then
               git commit -m "CI script 'sync_upstream' run '$local_run_id' - Auto-resolve delete/modify conflicts per local" \
-                -m "Removed file count: $(echo "$DELETED_FILES" | wc -w)" \
+                -m "Removed file count: $(echo "$unresolved" | wc -w)" \
                 -m "Files:
-                $(echo "$DELETED_FILES" | tr ' ' '\n')"
+                $(echo "$unresolved" | tr ' ' '\n')"
             fi
             # Check if the file conflicts were resolved
-            unresolved="$(git status --porcelain | grep -E "^ D" || true)"
+            unresolved="$(git status --porcelain | awk '/^(DU|UD)/ {print $2}')"
             if [ -n "$unresolved" ]; then
               echo "RESOLVER_MESSAGE='Unresolved file paths have not been resolved. Recommend manual pull from upstream.'" | tee -a $OUTPUT_FILE
               return 1
@@ -88,9 +88,12 @@ jobs:
               echo "MESSAGE='Commits failed agecheck screening, creating issue and pushing to a queue branch'" | tee -a "$OUTPUT_FILE"
               git checkout -B "$QBRANCH_NAME" origin/main
               # Resolve potential conflicts
-              resolve_delete-modify_conflicts
-              # Commit and push to queue branch
-              git merge -X ours --no-ff upstream/main -m "Queue upstream changes for agecheck review"
+              if ! git merge -X ours --no-ff upstream/main -m "Queue upstream changes for agecheck review"; then
+                resolve_delete-modify_conflicts
+                # finalize merge after resolving
+                git commit --no-edit
+              fi
+              # Push to queue branch
               git push -u origin "$QBRANCH_NAME"
               # Create issue
               QBRANCH_COMMITID="$(git rev-parse HEAD)"
