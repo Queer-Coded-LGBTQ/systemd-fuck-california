@@ -8,7 +8,7 @@
 #include "bpf-dlopen.h"
 #if HAVE_VMLINUX_H
 #include "bpf-link.h"
-#include "bpf/userns-restrict/userns-restrict-skel.h"
+#include "userns-restrict-skel.h"
 #endif
 #include "build-path.h"
 #include "common-signal.h"
@@ -88,6 +88,8 @@ static int on_deferred_start_worker(sd_event_source *s, uint64_t usec, void *use
 int manager_new(Manager **ret) {
         _cleanup_(manager_freep) Manager *m = NULL;
         int r;
+
+        assert(ret);
 
         m = new(Manager, 1);
         if (!m)

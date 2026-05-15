@@ -208,7 +208,7 @@ static int help(void) {
                 return r;
 
         /* Make the 1st column same width in both tables */
-        (void) table_sync_column_width(options, 0, verbs, 0);
+        (void) table_sync_column_widths(0, options, verbs);
 
         printf("%s [OPTIONS...] COMMAND\n\n"
                "%sGenerate and print 128-bit identifiers.%s\n"
@@ -216,10 +216,14 @@ static int help(void) {
                program_invocation_short_name,
                ansi_highlight(),
                ansi_normal());
-        table_print(verbs, stdout);
+        r = table_print_or_warn(verbs);
+        if (r < 0)
+                return r;
 
         printf("\nOptions:\n");
-        table_print(options, stdout);
+        r = table_print_or_warn(options);
+        if (r < 0)
+                return r;
 
         printf("\nSee the %s for details.\n", link);
         return 0;
@@ -233,10 +237,9 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
 
-        OptionParser state = {};
-        const char *arg;
+        OptionParser opts = { argc, argv };
 
-        FOREACH_OPTION(&state, c, argc, argv, &arg, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
                         return help();
@@ -254,13 +257,12 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
 
                 OPTION_LONG("json", "FORMAT",
                             "Output inspection data in JSON (takes one of pretty, short, off)"):
-                        r = parse_json_argument(arg, &arg_json_format_flags);
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
                         if (r <= 0)
                                 return r;
                         break;
 
-                OPTION_SHORT('j', NULL,
-                             "Equivalent to --json=pretty (on TTY) or --json=short (otherwise)"):
+                OPTION_COMMON_LOWERCASE_J:
                         arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         break;
 
@@ -276,11 +278,11 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         break;
 
                 OPTION('a', "app-specific", "ID", "Generate app-specific IDs"):
-                        r = id128_from_string_nonzero(arg, &arg_app);
+                        r = id128_from_string_nonzero(opts.arg, &arg_app);
                         if (r == -ENXIO)
                                 return log_error_errno(r, "Application ID cannot be all zeros.");
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse \"%s\" as application ID: %m", arg);
+                                return log_error_errno(r, "Failed to parse \"%s\" as application ID: %m", opts.arg);
                         break;
 
                 OPTION('u', "uuid", NULL, "Output in UUID format"):
@@ -288,7 +290,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         break;
                 }
 
-        *ret_args = option_parser_get_args(&state, argc, argv);
+        *ret_args = option_parser_get_args(&opts);
         return 1;
 }
 

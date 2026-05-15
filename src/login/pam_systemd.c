@@ -1144,8 +1144,8 @@ static int register_session(
                                         SD_JSON_BUILD_PAIR_UNSIGNED("UID", ur->uid),
                                         JSON_BUILD_PAIR_PIDREF("PID", &pidref),
                                         JSON_BUILD_PAIR_STRING_NON_EMPTY("Service", c->service),
-                                        SD_JSON_BUILD_PAIR("Type", JSON_BUILD_STRING_UNDERSCORIFY(c->type)),
-                                        SD_JSON_BUILD_PAIR("Class", JSON_BUILD_STRING_UNDERSCORIFY(c->class)),
+                                        JSON_BUILD_PAIR_ENUM("Type", c->type),
+                                        JSON_BUILD_PAIR_ENUM("Class", c->class),
                                         JSON_BUILD_PAIR_STRING_NON_EMPTY("Desktop", c->desktop),
                                         JSON_BUILD_PAIR_STRING_NON_EMPTY("Seat", c->seat),
                                         SD_JSON_BUILD_PAIR_CONDITION(c->vtnr > 0, "VTNr", SD_JSON_BUILD_UNSIGNED(c->vtnr)),
@@ -1750,7 +1750,7 @@ _public_ PAM_EXTERN int pam_sm_open_session(
 
         assert(pamh);
 
-        r = dlopen_libpam();
+        r = dlopen_libpam(LOG_DEBUG);
         if (r < 0)
                 return PAM_SERVICE_ERR;
 

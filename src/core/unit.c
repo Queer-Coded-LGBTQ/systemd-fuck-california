@@ -7,6 +7,7 @@
 #include "sd-bus.h"
 #include "sd-id128.h"
 #include "sd-messages.h"
+#include "sd-varlink.h"
 
 #include "all-units.h"
 #include "alloc-util.h"
@@ -132,6 +133,8 @@ int unit_new_for_name(Manager *m, size_t size, const char *name, Unit **ret) {
         _cleanup_(unit_freep) Unit *u = NULL;
         int r;
 
+        assert(ret);
+
         u = unit_new(m, size);
         if (!u)
                 return -ENOMEM;
@@ -178,8 +181,9 @@ static void unit_init(Unit *u) {
                 if (u->type != UNIT_SLICE)
                         cc->tasks_max = u->manager->defaults.tasks_max;
 
-                cc->memory_pressure_watch = u->manager->defaults.memory_pressure_watch;
-                cc->memory_pressure_threshold_usec = u->manager->defaults.memory_pressure_threshold_usec;
+                cc->memory_zswap_writeback = u->manager->defaults.memory_zswap_writeback;
+
+                memcpy(cc->pressure, u->manager->defaults.pressure, sizeof(cc->pressure));
         }
 
         ec = unit_get_exec_context(u);
@@ -788,6 +792,7 @@ Unit* unit_free(Unit *u) {
 
         u->match_bus_slot = sd_bus_slot_unref(u->match_bus_slot);
         u->bus_track = sd_bus_track_unref(u->bus_track);
+        u->varlink_unit_change = sd_varlink_unref(u->varlink_unit_change);
         u->deserialized_refs = strv_free(u->deserialized_refs);
         u->pending_freezer_invocation = sd_bus_message_unref(u->pending_freezer_invocation);
 
@@ -4300,6 +4305,9 @@ static int user_from_unit_name(Unit *u, char **ret) {
         _cleanup_free_ char *n = NULL;
         int r;
 
+        assert(u);
+        assert(ret);
+
         r = unit_name_to_prefix(u->id, &n);
         if (r < 0)
                 return r;
@@ -4887,6 +4895,42 @@ int unit_make_transient(Unit *u) {
         return 0;
 }
 
+int manager_setup_transient_unit(Manager *m, const char *name, Unit **ret, sd_bus_error *reterr_error) {
+        Unit *u;
+        int r;
+
+        assert(m);
+        assert(name);
+        assert(ret);
+
+        UnitType t = unit_name_to_type(name);
+        if (t < 0)
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                         "Invalid unit name or type: %s", name);
+
+        if (!unit_vtable[t]->can_transient)
+                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                         "Unit type %s does not support transient units.",
+                                         unit_type_to_string(t));
+
+        r = manager_load_unit(m, name, /* path= */ NULL, reterr_error, &u);
+        if (r < 0)
+                return r;
+
+        if (!unit_is_pristine(u))
+                return sd_bus_error_setf(reterr_error, BUS_ERROR_UNIT_EXISTS,
+                                         "Unit %s was already loaded or has a fragment file.", name);
+
+        /* OK, the unit failed to load and is unreferenced, now let's
+         * fill in the transient data instead */
+        r = unit_make_transient(u);
+        if (r < 0)
+                return r;
+
+        *ret = u;
+        return 0;
+}
+
 static bool ignore_leftover_process(const char *comm) {
         return comm && comm[0] == '('; /* Most likely our own helper process (PAM?), ignore */
 }
@@ -5349,15 +5393,15 @@ static void unit_modify_user_nft_set(Unit *u, bool add, NFTSetSource source, uin
         if (!c)
                 return;
 
-        if (!u->manager->nfnl) {
-                r = sd_nfnl_socket_open(&u->manager->nfnl);
-                if (r < 0)
-                        return;
-        }
-
         FOREACH_ARRAY(nft_set, c->nft_set_context.sets, c->nft_set_context.n_sets) {
                 if (nft_set->source != source)
                         continue;
+
+                if (!u->manager->nfnl) {
+                        r = sd_nfnl_socket_open(&u->manager->nfnl);
+                        if (r < 0)
+                                return (void) log_once_errno(LOG_WARNING, r, "Failed to open NETLINK_NETFILTER socket, ignoring: %m");
+                }
 
                 r = nft_set_element_modify_any(u->manager->nfnl, add, nft_set->nfproto, nft_set->table, nft_set->set, &element, sizeof(element));
                 if (r < 0)
@@ -6377,6 +6421,7 @@ int unit_clean(Unit *u, ExecCleanMask mask) {
 
 int unit_can_clean(Unit *u, ExecCleanMask *ret) {
         assert(u);
+        assert(ret);
 
         if (!UNIT_VTABLE(u)->clean ||
             u->load_state != UNIT_LOADED) {
