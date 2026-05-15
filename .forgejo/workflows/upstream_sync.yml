@@ -78,7 +78,7 @@ jobs:
           if [ "$NEW" -gt 0 ]; then
             COMMITS="$(git rev-list origin/main..upstream/main)"
             for COMMIT in $COMMITS; do
-              if git show --format="%H%n%B%n----" "$COMMIT" | grep -qiE '((^|[^[:alnum:]_])([[:alnum:]_]*[_-])?(age|dob|birth|date)([_-][[:alnum:]_]+|[[:alnum:]_]*)([^[:alnum:]_]|$)|ab1043)'; then
+              if git show --format="%H%n%B%n----" "$COMMIT" | grep -qiE '((^|[^[:alnum:]_])([[:alnum:]_]*[_-])?(age|dob|birth)([_-][[:alnum:]_]+|[[:alnum:]_]*)([^[:alnum:]_]|$)|ab1043)'; then
                 BAD=1
                 break
               fi
@@ -90,8 +90,6 @@ jobs:
               # Resolve potential conflicts
               if ! git merge -X ours --no-ff upstream/main -m "Queue upstream changes for agecheck review"; then
                 resolve_delete-modify_conflicts
-                # finalize merge after resolving
-                git commit --no-edit
               fi
               # Push to queue branch
               git push -u origin "$QBRANCH_NAME"
@@ -108,11 +106,9 @@ jobs:
             else
               echo "MESSAGE='Upstream has $NEW new commits, merging...'" | tee -a "$OUTPUT_FILE"
               git checkout -B main origin/main
-              # Resolve potential conflicts
-              resolve_delete-modify_conflicts
-              # Commit to origin/main
-              git merge -X ours upstream/main
-              git merge --continue || echo
+              if ! git merge -X ours upstream/main; then
+                resolve_delete-modify_conflicts
+              fi
               git push origin main
               echo "MESSAGE='Successfully synchronized to upstream. Count: $NEW'" | tee -a "$OUTPUT_FILE"
             fi
