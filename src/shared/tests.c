@@ -71,6 +71,8 @@ int get_testdata_dir(const char *suffix, char **ret) {
         const char *dir;
         char *p;
 
+        assert(ret);
+
         load_testdata_env();
 
         /* if the env var is set, use that */
@@ -359,7 +361,7 @@ const char* ci_environment(void) {
         if (getenv("SALSA_CI_IMAGES"))
                 return (ans = "salsa-ci");
 
-        FOREACH_STRING(var, "CI", "CONTINOUS_INTEGRATION") {
+        FOREACH_STRING(var, "CI", "CONTINUOUS_INTEGRATION") {
                 /* Those vars are booleans according to Semaphore and Travis docs:
                  * https://docs.travis-ci.com/user/environment-variables/#default-environment-variables
                  * https://docs.semaphoreci.com/ci-cd-environment/environment-variables/#ci
