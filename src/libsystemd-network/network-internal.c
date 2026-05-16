@@ -3,8 +3,10 @@
 #include <arpa/inet.h>
 #include <stdio.h>
 
+#include "sd-dhcp-lease.h"
+
 #include "alloc-util.h"
-#include "dhcp-lease-internal.h"
+#include "dhcp-route.h"
 #include "dns-resolver-internal.h"
 #include "extract-word.h"
 #include "hexdecoct.h"
@@ -169,7 +171,7 @@ int deserialize_dnr(sd_dns_resolver **ret, const char *string) {
 
         sd_dns_resolver *dnr = NULL;
         size_t n = 0;
-        CLEANUP_ARRAY(dnr, n, dns_resolver_done_many);
+        CLEANUP_ARRAY(dnr, n, dns_resolver_free_array);
         int priority = 0;
 
         for (;;) {

@@ -4,6 +4,8 @@
 
 #include "constants.h"
 #include "errno-util.h"
+#include "job.h"
+#include "json-util.h"
 #include "manager.h"
 #include "metrics.h"
 #include "path-util.h"
@@ -62,7 +64,7 @@ static int build_managed_oom_json_array_element(Unit *u, const char *property, s
                 return -EINVAL;
 
         return sd_json_buildo(ret_v,
-                              SD_JSON_BUILD_PAIR_STRING("mode", mode),
+                              JSON_BUILD_PAIR_ENUM("mode", mode),
                               SD_JSON_BUILD_PAIR_STRING("path", crt->cgroup_path),
                               SD_JSON_BUILD_PAIR_STRING("property", property),
                               SD_JSON_BUILD_PAIR_CONDITION(use_limit, "limit", SD_JSON_BUILD_UNSIGNED(c->moom_mem_pressure_limit)),
@@ -355,6 +357,24 @@ static void vl_disconnect(sd_varlink_server *s, sd_varlink *link, void *userdata
 
         if (link == m->managed_oom_varlink)
                 m->managed_oom_varlink = sd_varlink_unref(link);
+
+        /* Drop any job varlink references for the disconnecting client.
+         * A varlink link can stream at most one job, so stop after the first match. */
+        Job *j;
+        HASHMAP_FOREACH(j, m->jobs)
+                if (j->varlink == link) {
+                        j->varlink = sd_varlink_unref(j->varlink);
+                        break;
+                }
+
+        /* Also drop any unit-change varlink reference streaming to this link.
+         * A varlink link attaches to at most one unit, so stop after the first match. */
+        Unit *u;
+        HASHMAP_FOREACH(u, m->units)
+                if (u->varlink_unit_change == link) {
+                        u->varlink_unit_change = sd_varlink_unref(u->varlink_unit_change);
+                        break;
+                }
 }
 
 int manager_setup_varlink_server(Manager *m) {
@@ -390,13 +410,14 @@ int manager_setup_varlink_server(Manager *m) {
                         "io.systemd.Manager.Reexecute", vl_method_reexecute_manager,
                         "io.systemd.Manager.Reload", vl_method_reload_manager,
                         "io.systemd.Manager.EnqueueMarkedJobs", vl_method_enqueue_marked_jobs_manager,
-                        "io.systemd.Manager.PowerOff", vl_method_poweroff_manager,
-                        "io.systemd.Manager.Reboot", vl_method_reboot_manager,
-                        "io.systemd.Manager.Halt", vl_method_halt_manager,
-                        "io.systemd.Manager.KExec", vl_method_kexec_manager,
-                        "io.systemd.Manager.SoftReboot", vl_method_soft_reboot_manager,
+                        "io.systemd.Manager.PowerOff", vl_method_poweroff,
+                        "io.systemd.Manager.Reboot", vl_method_reboot,
+                        "io.systemd.Manager.Halt", vl_method_halt,
+                        "io.systemd.Manager.KExec", vl_method_kexec,
+                        "io.systemd.Manager.SoftReboot", vl_method_soft_reboot,
                         "io.systemd.Unit.List", vl_method_list_units,
                         "io.systemd.Unit.SetProperties", vl_method_set_unit_properties,
+                        "io.systemd.Unit.StartTransient", vl_method_start_transient_unit,
                         "io.systemd.service.Ping", varlink_method_ping,
                         "io.systemd.service.GetEnvironment", varlink_method_get_environment);
         if (r < 0)
@@ -418,11 +439,11 @@ int manager_setup_varlink_server(Manager *m) {
                                 "io.systemd.ManagedOOM.SubscribeManagedOOMCGroups", vl_method_subscribe_managed_oom_cgroups);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to register varlink methods: %m");
-
-                r = sd_varlink_server_bind_disconnect(s, vl_disconnect);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to register varlink disconnect handler: %m");
         }
+
+        r = sd_varlink_server_bind_disconnect(s, vl_disconnect);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to register varlink disconnect handler: %m");
 
         r = sd_varlink_server_attach_event(s, m->event, EVENT_PRIORITY_IPC);
         if (r < 0)

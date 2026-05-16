@@ -88,10 +88,10 @@ static int manager_context_build_json(sd_json_variant **ret, const char *name, v
                         ASSERT_PTR(ret),
                         SD_JSON_BUILD_PAIR_BOOLEAN("ShowStatus", manager_get_show_status_on(m)),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("LogLevel", log_level_build_json, m),
-                        SD_JSON_BUILD_PAIR_STRING("LogTarget", log_target_to_string(log_get_target())),
+                        JSON_BUILD_PAIR_ENUM("LogTarget", log_target_to_string(log_get_target())),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("Environment", manager_environment_build_json, m),
-                        SD_JSON_BUILD_PAIR_STRING("DefaultStandardOutput", exec_output_to_string(m->defaults.std_output)),
-                        SD_JSON_BUILD_PAIR_STRING("DefaultStandardError", exec_output_to_string(m->defaults.std_error)),
+                        JSON_BUILD_PAIR_ENUM("DefaultStandardOutput", exec_output_to_string(m->defaults.std_output)),
+                        JSON_BUILD_PAIR_ENUM("DefaultStandardError", exec_output_to_string(m->defaults.std_error)),
                         SD_JSON_BUILD_PAIR_BOOLEAN("ServiceWatchdogs", m->service_watchdogs),
                         JSON_BUILD_PAIR_FINITE_USEC("DefaultTimerAccuracyUSec", m->defaults.timer_accuracy_usec),
                         JSON_BUILD_PAIR_FINITE_USEC("DefaultTimeoutStartUSec", m->defaults.timeout_start_usec),
@@ -106,8 +106,12 @@ static int manager_context_build_json(sd_json_variant **ret, const char *name, v
                         SD_JSON_BUILD_PAIR_BOOLEAN("DefaultTasksAccounting", m->defaults.tasks_accounting),
                         SD_JSON_BUILD_PAIR_CALLBACK("DefaultLimits", rlimit_table_build_json, m->defaults.rlimit),
                         SD_JSON_BUILD_PAIR_UNSIGNED("DefaultTasksMax", cgroup_tasks_max_resolve(&m->defaults.tasks_max)),
-                        JSON_BUILD_PAIR_FINITE_USEC("DefaultMemoryPressureThresholdUSec", m->defaults.memory_pressure_threshold_usec),
-                        SD_JSON_BUILD_PAIR_STRING("DefaultMemoryPressureWatch", cgroup_pressure_watch_to_string(m->defaults.memory_pressure_watch)),
+                        JSON_BUILD_PAIR_FINITE_USEC("DefaultMemoryPressureThresholdUSec", m->defaults.pressure[PRESSURE_MEMORY].threshold_usec),
+                        JSON_BUILD_PAIR_ENUM("DefaultMemoryPressureWatch", cgroup_pressure_watch_to_string(m->defaults.pressure[PRESSURE_MEMORY].watch)),
+                        JSON_BUILD_PAIR_FINITE_USEC("DefaultCPUPressureThresholdUSec", m->defaults.pressure[PRESSURE_CPU].threshold_usec),
+                        JSON_BUILD_PAIR_ENUM("DefaultCPUPressureWatch", cgroup_pressure_watch_to_string(m->defaults.pressure[PRESSURE_CPU].watch)),
+                        JSON_BUILD_PAIR_FINITE_USEC("DefaultIOPressureThresholdUSec", m->defaults.pressure[PRESSURE_IO].threshold_usec),
+                        JSON_BUILD_PAIR_ENUM("DefaultIOPressureWatch", cgroup_pressure_watch_to_string(m->defaults.pressure[PRESSURE_IO].watch)),
                         JSON_BUILD_PAIR_FINITE_USEC("RuntimeWatchdogUSec", manager_get_watchdog(m, WATCHDOG_RUNTIME)),
                         JSON_BUILD_PAIR_FINITE_USEC("RebootWatchdogUSec", manager_get_watchdog(m, WATCHDOG_REBOOT)),
                         JSON_BUILD_PAIR_FINITE_USEC("KExecWatchdogUSec", manager_get_watchdog(m, WATCHDOG_KEXEC)),
@@ -115,10 +119,11 @@ static int manager_context_build_json(sd_json_variant **ret, const char *name, v
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("RuntimeWatchdogPreGovernor", m->watchdog_pretimeout_governor),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("WatchdogDevice", watchdog_get_device()),
                         JSON_BUILD_PAIR_FINITE_USEC("TimerSlackNSec", (uint64_t) prctl(PR_GET_TIMERSLACK)),
-                        SD_JSON_BUILD_PAIR_STRING("DefaultOOMPolicy", oom_policy_to_string(m->defaults.oom_policy)),
+                        JSON_BUILD_PAIR_ENUM("DefaultOOMPolicy", oom_policy_to_string(m->defaults.oom_policy)),
                         SD_JSON_BUILD_PAIR_INTEGER("DefaultOOMScoreAdjust", m->defaults.oom_score_adjust),
                         SD_JSON_BUILD_PAIR_BOOLEAN("DefaultRestrictSUIDSGID", m->defaults.restrict_suid_sgid),
-                        SD_JSON_BUILD_PAIR_STRING("CtrlAltDelBurstAction", emergency_action_to_string(m->cad_burst_action)),
+                        JSON_BUILD_PAIR_ENUM("CtrlAltDelBurstAction", emergency_action_to_string(m->cad_burst_action)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("DefaultMemoryZSwapWriteback", m->defaults.memory_zswap_writeback),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("ConfirmSpawn", manager_get_confirm_spawn(m)),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("ControlGroup", m->cgroup_root));
 }
@@ -188,7 +193,8 @@ static int manager_runtime_build_json(sd_json_variant **ret, const char *name, v
                 JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("WatchdogLastPingTimestamp", watchdog_get_last_ping_as_dual_timestamp(&watchdog_last_ping)),
                 SD_JSON_BUILD_PAIR_STRING("SystemState", manager_state_to_string(manager_state(m))),
                 SD_JSON_BUILD_PAIR_UNSIGNED("ExitCode", m->return_value),
-                SD_JSON_BUILD_PAIR_UNSIGNED("SoftRebootsCount", m->soft_reboots_count));
+                SD_JSON_BUILD_PAIR_UNSIGNED("SoftRebootsCount", m->soft_reboots_count),
+                SD_JSON_BUILD_PAIR_UNSIGNED("ReloadCount", m->reload_count));
 }
 
 int vl_method_describe_manager(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -200,6 +206,10 @@ int vl_method_describe_manager(sd_varlink *link, sd_json_variant *parameters, sd
 
         r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
         if (r != 0)
+                return r;
+
+        r = mac_selinux_access_check_varlink(link, "status");
+        if (r < 0)
                 return r;
 
         r = sd_json_buildo(
@@ -334,7 +344,7 @@ int vl_method_enqueue_marked_jobs_manager(sd_varlink *link, sd_json_variant *par
         if (r <= 0)
                 return r;
 
-        r = varlink_set_sentinel(link, NULL);
+        r = sd_varlink_set_sentinel(link, NULL);
         if (r < 0)
                 return r;
 
@@ -372,6 +382,7 @@ int vl_method_enqueue_marked_jobs_manager(sd_varlink *link, sd_json_variant *par
                                         JOB_FAIL,
                                         /* reload_if_possible= */ !BIT_SET(u->markers, UNIT_MARKER_NEEDS_RESTART),
                                         &job_id,
+                                        /* ret_job= */ NULL,
                                         &bus_error);
                 if (ERRNO_IS_NEG_RESOURCE(r))
                         return r;
@@ -405,19 +416,19 @@ int vl_method_enqueue_marked_jobs_manager(sd_varlink *link, sd_json_variant *par
 
 static int manager_do_set_objective(sd_varlink *link, sd_json_variant *parameters, ManagerObjective objective, const char *selinux_permission, bool can_do_root) {
         Manager *m = ASSERT_PTR(sd_varlink_get_userdata(link));
-        _cleanup_free_ char *rt = NULL;
-        const char *root = NULL;
+        _cleanup_free_ char *root = NULL;
         int r;
 
         assert(link);
         assert(parameters);
+        assert(selinux_permission);
 
         if (!MANAGER_IS_SYSTEM(m))
                 return sd_varlink_error(link, SD_VARLINK_ERROR_METHOD_NOT_IMPLEMENTED, NULL);
 
         if (can_do_root) {
                 static const sd_json_dispatch_field dispatch_table[] = {
-                        { "root", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, 0, 0 },
+                        { "root", SD_JSON_VARIANT_STRING, json_dispatch_path, 0, 0 },
                         {}
                 };
 
@@ -431,49 +442,40 @@ static int manager_do_set_objective(sd_varlink *link, sd_json_variant *parameter
         if (r < 0)
                 return r;
 
-        /* dbus uses SD_BUS_VTABLE_CAPABILITY(CAP_SYS_BOOT) in its checking. We cannot do the same
-         * because reading capabilities from /proc is racy (TOCTOU). So we use the stricter check
-         * TODO: figure out a way to check for CAP_SYS_BOOT */
         r = varlink_check_privileged_peer(link);
         if (r < 0)
                 return r;
 
-        if (!isempty(root)) {
-                if (!path_is_valid(root))
-                        return sd_varlink_error_invalid_parameter_name(link, "root");
-                if (!path_is_absolute(root))
-                        return sd_varlink_error_invalid_parameter_name(link, "root");
-
-                r = path_simplify_alloc(root, &rt);
-                if (r < 0)
-                        return r;
+        if (root) {
+                assert(can_do_root);
+                path_simplify(root);
         }
 
         varlink_log_caller(link, m, manager_objective_to_string(objective));
 
         if (can_do_root)
-                free_and_replace(m->switch_root, rt);
+                free_and_replace(m->switch_root, root);
         m->objective = objective;
 
         return sd_varlink_reply(link, NULL);
 }
 
-int vl_method_poweroff_manager(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+int vl_method_poweroff(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         return manager_do_set_objective(link, parameters, MANAGER_POWEROFF, "halt", /* can_do_root= */ false);
 }
 
-int vl_method_reboot_manager(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+int vl_method_reboot(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         return manager_do_set_objective(link, parameters, MANAGER_REBOOT, "reboot", /* can_do_root= */ false);
 }
 
-int vl_method_halt_manager(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+int vl_method_halt(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         return manager_do_set_objective(link, parameters, MANAGER_HALT, "halt", /* can_do_root= */ false);
 }
 
-int vl_method_kexec_manager(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+int vl_method_kexec(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         return manager_do_set_objective(link, parameters, MANAGER_KEXEC, "reboot", /* can_do_root= */ false);
 }
 
-int vl_method_soft_reboot_manager(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+int vl_method_soft_reboot(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         return manager_do_set_objective(link, parameters, MANAGER_SOFT_REBOOT, "reboot", /* can_do_root= */ true);
 }
