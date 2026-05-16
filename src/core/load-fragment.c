@@ -10,7 +10,6 @@
 #include "sd-bus.h"
 #include "sd-messages.h"
 
-#include "af-list.h"
 #include "all-units.h"
 #include "alloc-util.h"
 #include "bpf-program.h"
@@ -88,6 +87,8 @@ static int parse_socket_protocol(const char *s) {
 int parse_crash_chvt(const char *value, int *data) {
         int b;
 
+        assert(data);
+
         if (safe_atoi(value, data) >= 0)
                 return 0;
 
@@ -106,6 +107,8 @@ int parse_crash_chvt(const char *value, int *data) {
 int parse_confirm_spawn(const char *value, char **console) {
         char *s;
         int r;
+
+        assert(console);
 
         r = value ? parse_boolean(value) : 1;
         if (r == 0) {
@@ -128,6 +131,7 @@ DEFINE_CONFIG_PARSE(config_parse_socket_protocol, parse_socket_protocol);
 DEFINE_CONFIG_PARSE(config_parse_exec_secure_bits, secure_bits_from_string);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_collect_mode, collect_mode, CollectMode);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_device_policy, cgroup_device_policy, CGroupDevicePolicy);
+DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_cpuset_partition, cpuset_partition, CPUSetPartition, _CPUSET_PARTITION_INVALID);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_exec_keyring_mode, exec_keyring_mode, ExecKeyringMode);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_protect_proc, protect_proc, ProtectProc);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_proc_subset, proc_subset, ProcSubset);
@@ -150,7 +154,7 @@ DEFINE_CONFIG_PARSE_ENUM(config_parse_service_timeout_failure_mode, service_time
 DEFINE_CONFIG_PARSE_ENUM(config_parse_socket_bind, socket_address_bind_ipv6_only_or_bool, SocketAddressBindIPv6Only);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_oom_policy, oom_policy, OOMPolicy);
 DEFINE_CONFIG_PARSE_ENUM(config_parse_managed_oom_preference, managed_oom_preference, ManagedOOMPreference);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_memory_pressure_watch, cgroup_pressure_watch, CGroupPressureWatch);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_pressure_watch, cgroup_pressure_watch, CGroupPressureWatch);
 DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_ip_tos, ip_tos, int, -1);
 DEFINE_CONFIG_PARSE_PTR(config_parse_cg_weight, cg_weight_parse, uint64_t);
 DEFINE_CONFIG_PARSE_PTR(config_parse_cg_cpu_weight, cg_cpu_weight_parse, uint64_t);
@@ -163,7 +167,7 @@ DEFINE_CONFIG_PARSE_PTR(config_parse_bpf_delegate_commands, bpf_delegate_command
 DEFINE_CONFIG_PARSE_PTR(config_parse_bpf_delegate_maps, bpf_delegate_maps_from_string, uint64_t);
 DEFINE_CONFIG_PARSE_PTR(config_parse_bpf_delegate_programs, bpf_delegate_programs_from_string, uint64_t);
 DEFINE_CONFIG_PARSE_PTR(config_parse_bpf_delegate_attachments, bpf_delegate_attachments_from_string, uint64_t);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_memory_thp, memory_thp, MemoryTHP);
+DEFINE_CONFIG_PARSE_ENUM(config_parse_exec_memory_thp, exec_memory_thp, ExecMemoryTHP);
 
 bool contains_instance_specifier_superset(const char *s) {
         const char *p, *q;
@@ -564,6 +568,8 @@ static int patch_var_run(
 
         const char *e;
         char *z;
+
+        assert(path);
 
         e = path_startswith(*path, "/var/run/");
         if (!e)
@@ -985,7 +991,7 @@ int config_parse_exec(
                                            ignore ? ", ignoring" : "", rvalue);
                                 return ignore ? 0 : -ENOEXEC;
                         }
-                        if (!string_is_safe(path)) {
+                        if (!string_is_safe(path, /* flags= */ 0)) {
                                 log_syntax(unit, ignore ? LOG_WARNING : LOG_ERR, filename, line, 0,
                                            "Executable path contains special characters%s: %s",
                                            ignore ? ", ignoring" : "", path);
@@ -3468,72 +3474,26 @@ int config_parse_address_families(
                 void *userdata) {
 
         ExecContext *c = data;
-        bool invert = false;
+        bool is_allowlist = c->address_families_allow_list;
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
 
-        if (isempty(rvalue)) {
-                /* Empty assignment resets the list */
-                c->address_families = set_free(c->address_families);
-                c->address_families_allow_list = false;
+        r = parse_address_families(rvalue, &c->address_families, &is_allowlist);
+        /* Copy back unconditionally: parse_address_families() may have partially populated
+         * c->address_families before failing, so keep is_allowlist in sync with that state. */
+        c->address_families_allow_list = is_allowlist;
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse address family, ignoring: %s", rvalue);
                 return 0;
         }
 
-        if (streq(rvalue, "none")) {
-                /* Forbid all address families. */
-                c->address_families = set_free(c->address_families);
-                c->address_families_allow_list = true;
-                return 0;
-        }
-
-        if (rvalue[0] == '~') {
-                invert = true;
-                rvalue++;
-        }
-
-        if (!c->address_families) {
-                c->address_families = set_new(NULL);
-                if (!c->address_families)
-                        return log_oom();
-
-                c->address_families_allow_list = !invert;
-        }
-
-        for (const char *p = rvalue;;) {
-                _cleanup_free_ char *word = NULL;
-                int af;
-
-                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE);
-                if (r == -ENOMEM)
-                        return log_oom();
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Invalid syntax, ignoring: %s", rvalue);
-                        return 0;
-                }
-                if (r == 0)
-                        return 0;
-
-                af = af_from_name(word);
-                if (af < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, af,
-                                   "Failed to parse address family, ignoring: %s", word);
-                        continue;
-                }
-
-                /* If we previously wanted to forbid an address family and now
-                 * we want to allow it, then just remove it from the list.
-                 */
-                if (!invert == c->address_families_allow_list)  {
-                        r = set_put(c->address_families, INT_TO_PTR(af));
-                        if (r < 0)
-                                return log_oom();
-                } else
-                        set_remove(c->address_families, INT_TO_PTR(af));
-        }
+        return 0;
 }
 #endif
 
@@ -4573,7 +4533,7 @@ int config_parse_exec_quota(
                 void *data,
                 void *userdata) {
 
-        QuotaLimit *quota_limit = ASSERT_PTR(data);
+        ExecQuotaLimit *quota_limit = ASSERT_PTR(data);
         uint64_t quota_absolute = UINT64_MAX;
         uint32_t quota_scale = UINT32_MAX;
         int r;
@@ -5229,7 +5189,7 @@ int config_parse_mount_images(
 
         if (isempty(rvalue)) {
                 /* Empty assignment resets the list */
-                mount_image_free_many(c->mount_images, c->n_mount_images);
+                mount_image_free_array(c->mount_images, c->n_mount_images);
                 c->mount_images = NULL;
                 c->n_mount_images = 0;
                 return 0;
@@ -5379,7 +5339,7 @@ int config_parse_extension_images(
 
         if (isempty(rvalue)) {
                 /* Empty assignment resets the list */
-                mount_image_free_many(c->extension_images, c->n_extension_images);
+                mount_image_free_array(c->extension_images, c->n_extension_images);
                 c->extension_images = NULL;
                 c->n_extension_images = 0;
                 return 0;

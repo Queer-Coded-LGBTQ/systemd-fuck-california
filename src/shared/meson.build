@@ -3,6 +3,7 @@
 shared_sources = files(
         'acl-util.c',
         'acpi-fpdt.c',
+        'apparmor-util.c',
         'ask-password-agent.c',
         'ask-password-api.c',
         'async.c',
@@ -50,9 +51,11 @@ shared_sources = files(
         'coredump-util.c',
         'cpu-set-util.c',
         'creds-util.c',
+        'crypto-util.c',
         'cryptsetup-fido2.c',
         'cryptsetup-tpm2.c',
         'cryptsetup-util.c',
+        'curl-util.c',
         'daemon-util.c',
         'data-fd-util.c',
         'dev-setup.c',
@@ -77,6 +80,7 @@ shared_sources = files(
         'exit-status.c',
         'extension-util.c',
         'factory-reset.c',
+        'fdisk-util.c',
         'fdset.c',
         'fido2-util.c',
         'find-esp.c',
@@ -86,12 +90,15 @@ shared_sources = files(
         'fstab-util.c',
         'generator.c',
         'geneve-util.c',
+        'gnutls-util.c',
         'gpt.c',
         'group-record.c',
+        'help-util.c',
         'hibernate-util.c',
         'hostname-setup.c',
         'hwdb-util.c',
         'id128-print.c',
+        'idn-util.c',
         'ima-util.c',
         'image-policy.c',
         'import-util.c',
@@ -114,6 +121,7 @@ shared_sources = files(
         'libaudit-util.c',
         'libcrypt-util.c',
         'libfido2-util.c',
+        'libmount-util.c',
         'local-addresses.c',
         'locale-setup.c',
         'log-assert-critical.c',
@@ -121,12 +129,16 @@ shared_sources = files(
         'loop-util.c',
         'loopback-setup.c',
         'lsm-util.c',
+        'luo-util.c',
         'machine-bind-user.c',
         'machine-credential.c',
         'machine-id-setup.c',
+        'machine-register.c',
+        'machine-util.c',
         'macvlan-util.c',
         'main-func.c',
         'metrics.c',
+        'microhttpd-util.c',
         'mkdir-label.c',
         'mkfs-util.c',
         'module-util.c',
@@ -142,11 +154,11 @@ shared_sources = files(
         'nsresource.c',
         'numa-util.c',
         'open-file.c',
-        'openssl-util.c',
         'options.c',
         'osc-context.c',
         'output-mode.c',
         'pager.c',
+        'pam-util.c',
         'parse-argument.c',
         'parse-helpers.c',
         'password-quality-util-passwdqc.c',
@@ -163,6 +175,7 @@ shared_sources = files(
         'printk-util.c',
         'prompt-util.c',
         'ptyfwd.c',
+        'qmp-client.c',
         'qrcode-util.c',
         'quota-util.c',
         'reboot-util.c',
@@ -186,6 +199,8 @@ shared_sources = files(
         'socket-label.c',
         'socket-netlink.c',
         'specifier.c',
+        'ssl-util.c',
+        'storage-util.c',
         'switch-root.c',
         'swtpm-util.c',
         'tar-util.c',
@@ -207,11 +222,14 @@ shared_sources = files(
         'varlink-io.systemd.FactoryReset.c',
         'varlink-io.systemd.Hostname.c',
         'varlink-io.systemd.Import.c',
+        'varlink-io.systemd.InstanceMetadata.c',
+        'varlink-io.systemd.Job.c',
         'varlink-io.systemd.Journal.c',
         'varlink-io.systemd.JournalAccess.c',
         'varlink-io.systemd.Login.c',
         'varlink-io.systemd.Machine.c',
         'varlink-io.systemd.MachineImage.c',
+        'varlink-io.systemd.MachineInstance.c',
         'varlink-io.systemd.ManagedOOM.c',
         'varlink-io.systemd.Manager.c',
         'varlink-io.systemd.Metrics.c',
@@ -226,9 +244,12 @@ shared_sources = files(
         'varlink-io.systemd.Resolve.c',
         'varlink-io.systemd.Resolve.Hook.c',
         'varlink-io.systemd.Resolve.Monitor.c',
+        'varlink-io.systemd.Shutdown.c',
+        'varlink-io.systemd.StorageProvider.c',
         'varlink-io.systemd.Udev.c',
         'varlink-io.systemd.Unit.c',
         'varlink-io.systemd.UserDatabase.c',
+        'varlink-io.systemd.VirtualMachineInstance.c',
         'varlink-io.systemd.oom.c',
         'varlink-io.systemd.oom.Prekill.c',
         'varlink-io.systemd.service.c',
@@ -271,22 +292,6 @@ endif
 
 if conf.get('HAVE_LIBBPF') == 1
         shared_sources += files('bpf-link.c')
-endif
-
-if conf.get('HAVE_PAM') == 1
-        shared_sources += files('pam-util.c')
-endif
-
-if conf.get('HAVE_LIBMOUNT') == 1
-        shared_sources += files('libmount-util.c')
-endif
-
-if conf.get('HAVE_LIBIDN2') == 1
-        shared_sources += files('idn-util.c')
-endif
-
-if conf.get('HAVE_APPARMOR') == 1
-        shared_sources += files('apparmor-util.c')
 endif
 
 generate_ip_protocol_list = files('generate-ip-protocol-list.sh')
@@ -387,15 +392,19 @@ libshared_deps = [threads,
                   libbpf_cflags,
                   libcrypt_cflags,
                   libcryptsetup_cflags,
+                  libcurl_cflags,
                   libdl,
                   libdw_cflags,
                   libelf_cflags,
+                  libfdisk_cflags,
                   libfido2_cflags,
                   libgcrypt_cflags,
+                  libgnutls_cflags,
                   libidn2_cflags,
                   libkmod_cflags,
+                  libmicrohttpd_cflags,
                   libmount_cflags,
-                  libopenssl,
+                  libopenssl_cflags,
                   libp11kit_cflags,
                   libpam_cflags,
                   libpcre2_cflags,
@@ -438,15 +447,3 @@ libshared = shared_library(
                         userspace],
         install : true,
         install_dir : pkglibdir)
-
-shared_fdisk_sources = files('fdisk-util.c')
-
-libshared_fdisk = static_library(
-        'shared-fdisk',
-        shared_fdisk_sources,
-        include_directories : includes,
-        implicit_include_directories : false,
-        dependencies : [libfdisk,
-                        userspace],
-        c_args : ['-fvisibility=default'],
-        build_by_default : false)

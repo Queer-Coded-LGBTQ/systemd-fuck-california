@@ -250,6 +250,8 @@ int dhcp6_option_append(
 
         int r;
 
+        assert(buf);
+        assert(offset);
         assert(optval || optlen == 0);
 
         r = option_append_hdr(buf, offset, code, optlen);
@@ -546,7 +548,7 @@ int dhcp6_option_parse_string(const uint8_t *data, size_t data_len, char **ret) 
                 return 0;
         }
 
-        r = make_cstring((const char *) data, data_len, MAKE_CSTRING_REFUSE_TRAILING_NUL, &string);
+        r = make_cstring(data, data_len, MAKE_CSTRING_REFUSE_TRAILING_NUL, &string);
         if (r < 0)
                 return r;
 

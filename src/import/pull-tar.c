@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "sd-daemon.h"
 #include "sd-event.h"
 #include "sd-varlink.h"
@@ -150,9 +152,6 @@ int tar_pull_new(
                 .last_percent = UINT_MAX,
                 .progress_ratelimit = { 100 * USEC_PER_MSEC, 1 },
         };
-
-        p->glue->on_finished = pull_job_curl_on_finished;
-        p->glue->userdata = p;
 
         *ret = TAKE_PTR(p);
 
@@ -443,7 +442,7 @@ static void tar_pull_job_on_finished(PullJob *j) {
                 else if (j == p->settings_job)
                         log_info_errno(j->error, "Settings file could not be retrieved, proceeding without.");
                 else
-                        assert("unexpected job");
+                        assert_not_reached();
         }
 
         /* This is invoked if either the download completed successfully, or the download was skipped because
