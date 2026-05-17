@@ -351,6 +351,9 @@ static void test_sd_device_enumerator_filter_subsystem_one(
         unsigned n_new_dev = 0, n_removed_dev = 0;
         sd_device *dev;
 
+        assert(ret_n_new_dev);
+        assert(ret_n_removed_dev);
+
         ASSERT_OK(sd_device_enumerator_new(&e));
         ASSERT_OK(sd_device_enumerator_add_match_subsystem(e, subsystem, true));
         exclude_problematic_devices(e);
@@ -895,7 +898,7 @@ static int intro(void) {
         if (path_is_mount_point("/sys") <= 0)
                 return log_tests_skipped("/sys/ is not mounted");
 
-        r = dlopen_libmount();
+        r = dlopen_libmount(LOG_DEBUG);
         if (r < 0)
                 return log_tests_skipped("libmount not available.");
 

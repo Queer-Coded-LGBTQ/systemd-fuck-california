@@ -164,12 +164,13 @@ CONFIG_PARSER_PROTOTYPE(config_parse_watchdog_sec);
 CONFIG_PARSER_PROTOTYPE(config_parse_tty_size);
 CONFIG_PARSER_PROTOTYPE(config_parse_log_filter_patterns);
 CONFIG_PARSER_PROTOTYPE(config_parse_open_file);
-CONFIG_PARSER_PROTOTYPE(config_parse_memory_pressure_watch);
+CONFIG_PARSER_PROTOTYPE(config_parse_pressure_watch);
 CONFIG_PARSER_PROTOTYPE(config_parse_cgroup_nft_set);
 CONFIG_PARSER_PROTOTYPE(config_parse_mount_node);
 CONFIG_PARSER_PROTOTYPE(config_parse_concurrency_max);
 CONFIG_PARSER_PROTOTYPE(config_parse_bind_network_interface);
-CONFIG_PARSER_PROTOTYPE(config_parse_memory_thp);
+CONFIG_PARSER_PROTOTYPE(config_parse_exec_memory_thp);
+CONFIG_PARSER_PROTOTYPE(config_parse_cpuset_partition);
 
 /* gperf prototypes */
 const struct ConfigPerfItem* load_fragment_gperf_lookup(const char *key, GPERF_LEN_TYPE length);

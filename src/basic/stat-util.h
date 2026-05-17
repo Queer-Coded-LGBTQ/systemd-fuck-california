@@ -23,13 +23,22 @@ int is_symlink(const char *path);
 
 int stat_verify_socket(const struct stat *st);
 int statx_verify_socket(const struct statx *stx);
+int fd_verify_socket(int fd);
 int is_socket(const char *path);
 
 int stat_verify_linked(const struct stat *st);
 int fd_verify_linked(int fd);
 
+int stat_verify_block(const struct stat *st);
+int fd_verify_block(int fd);
+
+int stat_verify_char(const struct stat *st);
+
 int stat_verify_device_node(const struct stat *st);
 int is_device_node(const char *path);
+
+int stat_verify_regular_or_block(const struct stat *st);
+int fd_verify_regular_or_block(int fd);
 
 int dir_is_empty_at(int dir_fd, const char *path, bool ignore_hidden_or_backup);
 static inline int dir_is_empty(const char *path, bool ignore_hidden_or_backup) {
@@ -153,3 +162,5 @@ static inline bool inode_type_can_hardlink(mode_t m) {
          * type). */
         return IN_SET(m & S_IFMT, S_IFSOCK, S_IFLNK, S_IFREG, S_IFBLK, S_IFCHR, S_IFIFO);
 }
+
+int vfs_free_bytes(int fd, uint64_t *ret);
