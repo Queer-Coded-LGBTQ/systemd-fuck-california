@@ -1359,6 +1359,7 @@ static int parse_line(char **line, char **ret_key, char **ret_attr, UdevRuleOper
         assert(line);
         assert(*line);
         assert(ret_key);
+        assert(ret_attr);
         assert(ret_op);
         assert(ret_value);
         assert(ret_is_case_insensitive);
@@ -1840,7 +1841,7 @@ int udev_rules_load(UdevRules **ret_rules, ResolveNameTiming resolve_name_timing
         ConfFile **files = NULL;
         size_t n_files = 0;
 
-        CLEANUP_ARRAY(files, n_files, conf_file_free_many);
+        CLEANUP_ARRAY(files, n_files, conf_file_free_array);
 
         r = conf_files_list_strv_full(".rules", /* root= */ NULL, CONF_FILES_REGULAR | CONF_FILES_FILTER_MASKED,
                                       (const char* const*) directories, &files, &n_files);
