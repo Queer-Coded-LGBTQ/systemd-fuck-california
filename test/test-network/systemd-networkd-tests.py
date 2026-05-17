@@ -73,6 +73,7 @@ resolvectl_bin = shutil.which('resolvectl', path=which_paths)
 timedatectl_bin = shutil.which('timedatectl', path=which_paths)
 udevadm_bin = shutil.which('udevadm', path=which_paths)
 test_ndisc_send = None
+test_modem_manager_mock = None
 build_dir = None
 source_dir = None
 
@@ -930,6 +931,13 @@ def get_dbus_link_path(link):
     out = out.decode()
     return out[:-1].split('"')[1]
 
+def get_dhcp_server_property(link, prop):
+    link_path = get_dbus_link_path(link)
+
+    out = subprocess.check_output(['busctl', 'get-property', 'org.freedesktop.network1',
+                                   link_path, 'org.freedesktop.network1.DHCPServer', prop])
+    return out.strip().decode()
+
 def get_dhcp_client_state(link, family):
     link_path = get_dbus_link_path(link)
 
@@ -972,6 +980,28 @@ def start_radvd(*additional_options, config_file):
 
 def stop_radvd():
     stop_by_pid_file(radvd_pid_file)
+
+def start_modem_manager_mock(*additional_options):
+    dbus_policy_src = os.path.join(networkd_ci_temp_dir, 'mock-modem-manager.conf')
+    cp(dbus_policy_src, '/etc/dbus-1/system.d/mock-modem-manager.conf')
+    check_output('systemctl reload dbus.service')
+
+    command = ' '.join([test_modem_manager_mock] + list(additional_options))
+    with open('/run/systemd/system/test-modem-manager-mock.service', mode='w', encoding='utf-8') as f:
+        f.write('[Unit]\n'
+                'Description=Mock ModemManager for networkd testing\n'
+                '[Service]\n'
+                'Type=notify\n'
+                'BusName=org.freedesktop.ModemManager1\n'
+                f'ExecStart={command}\n')
+    check_output('systemctl daemon-reload')
+    check_output('systemctl start test-modem-manager-mock.service')
+
+def stop_modem_manager_mock():
+    call('systemctl stop test-modem-manager-mock.service')
+    rm_f('/run/systemd/system/test-modem-manager-mock.service')
+    call('systemctl daemon-reload')
+    rm_f('/etc/dbus-1/system.d/mock-modem-manager.conf')
 
 def radvd_check_config(config_file):
     if not shutil.which('radvd'):
@@ -1099,6 +1129,7 @@ def tear_down_common():
     stop_dnsmasq()
     stop_isc_dhcpd()
     stop_radvd()
+    stop_modem_manager_mock()
 
     # 2. remove modules
     call_quiet('rmmod netdevsim')
@@ -1246,7 +1277,13 @@ class Utilities():
             if not link_exists(link):
                 time.sleep(0.5)
                 continue
-            output = networkctl_status(link)
+            try:
+                output = networkctl_status(link)
+            except subprocess.CalledProcessError:
+                # networkctl status may transiently fail e.g. when networkd has not
+                # yet picked up the link from the kernel. Retry until the timeout.
+                time.sleep(0.5)
+                continue
             if re.search(rf'(?m)^\s*State:\s+{operstate}\s+\({setup_state}\)\s*$', output):
                 return True
             time.sleep(0.5)
@@ -4972,6 +5009,7 @@ class NetworkdNetworkTests(unittest.TestCase, Utilities):
         self.check_ipv4_sysctl_attr('dummy98', 'proxy_arp', '1')
         self.check_ipv4_sysctl_attr('dummy98', 'proxy_arp_pvlan', '1')
         self.check_ipv4_sysctl_attr('dummy98', 'accept_local', '1')
+        self.check_ipv4_sysctl_attr('dummy98', 'src_valid_mark', '1')
         self.check_ipv4_sysctl_attr('dummy98', 'rp_filter', '0')
         self.check_ipv4_sysctl_attr('dummy98', 'force_igmp_version', '1')
 
@@ -7269,6 +7307,9 @@ class NetworkdDHCPServerTests(unittest.TestCase, Utilities):
         print(output)
         self.assertRegex(output, "Offered DHCP leases: 192.168.5.[0-9]*")
 
+        self.assertEqual(get_dhcp_server_property('veth-peer', 'PoolSize'), 'u 50')
+        self.assertEqual(get_dhcp_server_property('veth-peer', 'PoolOffset'), 'u 10')
+
         if persist_leases == 'yes':
             path = '/var/lib/systemd/network/dhcp-server-lease/veth-peer'
         elif persist_leases == 'runtime':
@@ -9297,7 +9338,7 @@ class NetworkdDHCPPDTests(unittest.TestCase, Utilities):
 
         # ipv4masklen: 8
         # 6rd-prefix: 2001:db8::/32
-        # br-addresss: 10.0.0.1
+        # br-address: 10.0.0.1
 
         start_dnsmasq('--dhcp-option=212,08:20:20:01:0d:b8:00:00:00:00:00:00:00:00:00:00:00:00:0a:00:00:01',
                       ipv4_range='10.100.100.100,10.100.100.200',
@@ -9567,6 +9608,54 @@ class NetworkdSysctlTest(unittest.TestCase, Utilities):
         self.assertNotIn("changed sysctl '/proc/sys/net/ipv6/conf/dummy98/max_addresses'", log)
         self.assertNotIn("Sysctl monitor BPF returned error", log)
 
+class NetworkdWWANTests(unittest.TestCase, Utilities):
+
+    def setUp(self):
+        setup_common()
+
+    def tearDown(self):
+        tear_down_common()
+
+    def test_wwan_ipv4v6_static(self):
+        """Test WWAN bearer with both IPv4 and IPv6 static configuration.
+
+        Regression test for https://github.com/systemd/systemd/issues/41389
+        """
+        if not os.path.exists(test_modem_manager_mock):
+            self.skipTest(f'{test_modem_manager_mock} does not exist.')
+
+        copy_network_unit('12-dummy.netdev', '25-wwan-ipv4v6.network')
+        try:
+            start_modem_manager_mock(
+                '--ifname', 'dummy98',
+                '--ipv4-address', '100.120.244.160',
+                '--ipv4-gateway', '100.120.244.161',
+                '--ipv4-prefix', '26',
+                '--ipv6-address', '2001:db8::1',
+                '--ipv6-gateway', '2001:db8::2',
+                '--ipv6-prefix', '64',
+            )
+        except (subprocess.CalledProcessError, PermissionError, OSError) as e:
+            self.skipTest(f'Failed to start mock ModemManager: {e}')
+        start_networkd()
+        self.wait_online('dummy98:routable')
+
+        output = check_output('ip -4 address show dev dummy98')
+        print(output)
+        self.assertIn('100.120.244.160/26', output)
+
+        output = check_output('ip -6 address show dev dummy98')
+        print(output)
+        self.assertIn('2001:db8::1/64', output)
+
+        output = check_output('ip -4 route show dev dummy98')
+        print(output)
+        self.assertIn('default via 100.120.244.161', output)
+
+        output = check_output('ip -6 route show dev dummy98')
+        print(output)
+        self.assertIn('default via 2001:db8::2', output)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--build-dir', help='Path to build dir', dest='build_dir')
@@ -9625,6 +9714,11 @@ if __name__ == '__main__':
         test_ndisc_send = os.path.normpath(os.path.join(build_dir, 'test-ndisc-send'))
     else:
         test_ndisc_send = '/usr/lib/tests/test-ndisc-send'
+
+    if build_dir:
+        test_modem_manager_mock = os.path.normpath(os.path.join(build_dir, 'test-modem-manager-mock'))
+    else:
+        test_modem_manager_mock = '/usr/lib/systemd/tests/unit-tests/manual/test-modem-manager-mock'
 
     if asan_options:
         env.update({'ASAN_OPTIONS': asan_options})

@@ -13,13 +13,14 @@
 #include "sd-dhcp-lease.h"
 #include "sd-event.h"
 
-#include "alloc-util.h"
 #include "dhcp-duid-internal.h"
 #include "dhcp-network.h"
 #include "dhcp-option.h"
-#include "dhcp-packet.h"
 #include "ether-addr-util.h"
 #include "fd-util.h"
+#include "iovec-util.h"
+#include "iovec-wrapper.h"
+#include "ip-util.h"
 #include "log.h"
 #include "tests.h"
 
@@ -47,7 +48,7 @@ static be32_t xid;
 TEST(dhcp_client_setters) {
         /* Initialize client without Anonymize settings. */
         _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
-        ASSERT_OK(sd_dhcp_client_new(&client, /* anonymize= */ false));
+        ASSERT_OK(sd_dhcp_client_new(&client));
         ASSERT_NOT_NULL(client);
 
         ASSERT_RETURN_EXPECTED_SE(sd_dhcp_client_set_request_option(NULL, 0) == -EINVAL);
@@ -90,48 +91,21 @@ TEST(dhcp_client_setters) {
         ASSERT_OK_ZERO(sd_dhcp_client_set_request_option(client, 17));
 }
 
-TEST(dhcp_client_anonymize) {
+TEST(dhcp_client_set_anonymize) {
         /* Initialize client with Anonymize settings. */
         _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
-        ASSERT_OK(sd_dhcp_client_new(&client, /* anonymize= */ true));
+        ASSERT_OK(sd_dhcp_client_new(&client));
+        ASSERT_OK(sd_dhcp_client_set_anonymize(client, true));
         ASSERT_NOT_NULL(client);
 
-        ASSERT_OK_ZERO(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_NETBIOS_NAME_SERVER));
-        /* This PRL option is not set when using Anonymize */
-        ASSERT_OK_POSITIVE(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_HOST_NAME));
+        ASSERT_OK_POSITIVE(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_NETBIOS_NAME_SERVER));
+        ASSERT_OK_ZERO(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_HOST_NAME));
         ASSERT_ERROR(sd_dhcp_client_set_request_option(client, SD_DHCP_OPTION_PARAMETER_REQUEST_LIST), EINVAL);
 
         /* RFC7844: option 101 (SD_DHCP_OPTION_NEW_TZDB_TIMEZONE) is not set in the
          * default PRL when using Anonymize, */
         ASSERT_OK_POSITIVE(sd_dhcp_client_set_request_option(client, 101));
         ASSERT_OK_ZERO(sd_dhcp_client_set_request_option(client, 101));
-}
-
-TEST(dhcp_packet_checksum) {
-        uint8_t buf[20] = {
-                0x45, 0x00, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00,
-                0x40, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0xff, 0xff, 0xff, 0xff
-        };
-
-        ASSERT_EQ(dhcp_packet_checksum(buf, 20), be16toh(0x78ae));
-}
-
-TEST(dhcp_identifier_set_iaid) {
-        uint32_t iaid_legacy;
-        be32_t iaid;
-
-        ASSERT_OK(dhcp_identifier_set_iaid(NULL, &hw_addr, /* legacy_unstable_byteorder= */ true, &iaid_legacy));
-        ASSERT_OK(dhcp_identifier_set_iaid(NULL, &hw_addr, /* legacy_unstable_byteorder= */ false, &iaid));
-
-        /* we expect, that the MAC address was hashed. The legacy value is in native endianness. */
-        ASSERT_EQ(iaid_legacy, 0x8dde4ba8u);
-        ASSERT_EQ(iaid, htole32(0x8dde4ba8u));
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-        ASSERT_EQ(iaid, iaid_legacy);
-#else
-        ASSERT_EQ(iaid, bswap_32(iaid_legacy));
-#endif
 }
 
 static int check_options(uint8_t code, uint8_t len, const void *option, void *userdata) {
@@ -159,15 +133,19 @@ static int check_options(uint8_t code, uint8_t len, const void *option, void *us
         return 0;
 }
 
-int dhcp_network_send_raw_socket(int s, const union sockaddr_union *link, const void *packet, size_t len) {
+int dhcp_network_send_raw_socket(int fd, const union sockaddr_union *link, const struct iovec_wrapper *iovw) {
         uint16_t ip_check, udp_check;
 
-        ASSERT_OK(s);
-        ASSERT_NOT_NULL(packet);
+        ASSERT_OK(fd);
+        ASSERT_NOT_NULL(iovw);
 
+        _cleanup_(iovec_done) struct iovec iov = {};
+        ASSERT_OK(iovw_concat(iovw, &iov));
+
+        size_t len = iov.iov_len;
         ASSERT_GT(len, sizeof(DHCPPacket));
 
-        _cleanup_free_ DHCPPacket *discover = ASSERT_NOT_NULL(memdup(packet, len));
+        DHCPPacket *discover = ASSERT_NOT_NULL(iov.iov_base);
 
         ASSERT_EQ(discover->ip.ttl, IPDEFTTL);
         ASSERT_EQ(discover->ip.protocol, IPPROTO_UDP);
@@ -181,13 +159,13 @@ int dhcp_network_send_raw_socket(int s, const union sockaddr_union *link, const 
         discover->ip.ttl = 0;
         discover->ip.check = discover->udp.len;
 
-        udp_check = ~dhcp_packet_checksum(&discover->ip.ttl, len - 8);
+        udp_check = ~ip_checksum(&discover->ip.ttl, len - 8);
         ASSERT_EQ(udp_check, 0xffff);
 
         discover->ip.ttl = IPDEFTTL;
         discover->ip.check = ip_check;
 
-        ip_check = ~dhcp_packet_checksum((uint8_t*) &discover->ip, sizeof(discover->ip));
+        ip_check = ~ip_checksum((uint8_t*) &discover->ip, sizeof(discover->ip));
         ASSERT_EQ(ip_check, 0xffff);
 
         ASSERT_NE(discover->dhcp.xid, 0u);
@@ -218,7 +196,7 @@ int dhcp_network_bind_udp_socket(int ifindex, be32_t address, uint16_t port, int
         return ASSERT_OK_ERRNO(socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
 }
 
-int dhcp_network_send_udp_socket(int s, be32_t address, uint16_t port, const void *packet, size_t len) {
+int dhcp_network_send_udp_socket(int fd, be32_t address, uint16_t port, const struct iovec_wrapper *iovw) {
         return 0;
 }
 
@@ -233,7 +211,7 @@ TEST(discover_message) {
         ASSERT_NOT_NULL(e);
 
         _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
-        ASSERT_OK(sd_dhcp_client_new(&client, /* anonymize= */ false));
+        ASSERT_OK(sd_dhcp_client_new(&client));
         ASSERT_NOT_NULL(client);
 
         ASSERT_OK(sd_dhcp_client_attach_event(client, e, /* priority= */ 0));
@@ -374,7 +352,8 @@ static void test_addr_acq_recv_request(size_t size, DHCPMessage *request) {
         ASSERT_OK_EQ(dhcp_option_parse(request, size, check_options, NULL, NULL), DHCP_REQUEST);
         ASSERT_EQ(request->xid, xid);
 
-        ASSERT_EQ(msg_bytes[size - 1], SD_DHCP_OPTION_END);
+        uint8_t *end = ASSERT_NOT_NULL(memrchr(msg_bytes, SD_DHCP_OPTION_END, size));
+        ASSERT_TRUE(memeqzero(end + 1, msg_bytes + size - end - 1));
 
         log_info("  recv DHCP Request  0x%08x", be32toh(xid));
 
@@ -396,7 +375,8 @@ static void test_addr_acq_recv_discover(size_t size, DHCPMessage *discover) {
 
         ASSERT_OK_EQ(dhcp_option_parse(discover, size, check_options, NULL, NULL), DHCP_DISCOVER);
 
-        ASSERT_EQ(msg_bytes[size - 1], SD_DHCP_OPTION_END);
+        uint8_t *end = ASSERT_NOT_NULL(memrchr(msg_bytes, SD_DHCP_OPTION_END, size));
+        ASSERT_TRUE(memeqzero(end + 1, msg_bytes + size - end - 1));
 
         xid = discover->xid;
 
@@ -420,7 +400,7 @@ TEST(addr_acq) {
         ASSERT_NOT_NULL(e);
 
         _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
-        ASSERT_OK(sd_dhcp_client_new(&client, /* anonymize= */ false));
+        ASSERT_OK(sd_dhcp_client_new(&client));
         ASSERT_NOT_NULL(client);
 
         ASSERT_OK(sd_dhcp_client_attach_event(client, e, /* priority= */ 0));
@@ -595,7 +575,7 @@ static void test_bootp_one(void) {
         ASSERT_NOT_NULL(e);
 
         _cleanup_(sd_dhcp_client_unrefp) sd_dhcp_client *client = NULL;
-        ASSERT_OK(sd_dhcp_client_new(&client, /* anonymize= */ false));
+        ASSERT_OK(sd_dhcp_client_new(&client));
         ASSERT_NOT_NULL(client);
 
         ASSERT_OK(sd_dhcp_client_attach_event(client, e, /* priority= */ 0));
