@@ -1,22 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "machine-util.h"
 #include "shared-forward.h"
-
-typedef enum ImageFormat {
-        IMAGE_FORMAT_RAW,
-        IMAGE_FORMAT_QCOW2,
-        _IMAGE_FORMAT_MAX,
-        _IMAGE_FORMAT_INVALID = -EINVAL,
-} ImageFormat;
-
-typedef enum DiskType {
-        DISK_TYPE_VIRTIO_BLK,
-        DISK_TYPE_VIRTIO_SCSI,
-        DISK_TYPE_NVME,
-        _DISK_TYPE_MAX,
-        _DISK_TYPE_INVALID = -EINVAL,
-} DiskType;
 
 typedef struct ExtraDrive {
         char *path;
@@ -41,6 +27,21 @@ typedef enum ConsoleMode {
         _CONSOLE_MODE_INVALID = -EINVAL,
 } ConsoleMode;
 
+typedef enum ConsoleTransport {
+        CONSOLE_TRANSPORT_VIRTIO,       /* virtio-serial (hvc0) */
+        CONSOLE_TRANSPORT_SERIAL,       /* regular serial port (ttyS0/ttyAMA0) */
+        _CONSOLE_TRANSPORT_MAX,
+        _CONSOLE_TRANSPORT_INVALID = -EINVAL,
+} ConsoleTransport;
+
+typedef enum Firmware {
+        FIRMWARE_UEFI,  /* load OVMF firmware */
+        FIRMWARE_BIOS,  /* don't load OVMF, let qemu use its built-in BIOS (e.g. SeaBIOS on x86) */
+        FIRMWARE_NONE,  /* no firmware at all, requires --linux= for direct kernel boot */
+        _FIRMWARE_MAX,
+        _FIRMWARE_INVALID = -EINVAL,
+} Firmware;
+
 typedef enum SettingsMask {
         SETTING_START_MODE        = UINT64_C(1) << 0,
         SETTING_MACHINE_ID        = UINT64_C(1) << 6,
@@ -52,5 +53,5 @@ typedef enum SettingsMask {
 } SettingsMask;
 
 DECLARE_STRING_TABLE_LOOKUP(console_mode, ConsoleMode);
-DECLARE_STRING_TABLE_LOOKUP(disk_type, DiskType);
-DECLARE_STRING_TABLE_LOOKUP(image_format, ImageFormat);
+DECLARE_STRING_TABLE_LOOKUP(console_transport, ConsoleTransport);
+DECLARE_STRING_TABLE_LOOKUP(firmware, Firmware);

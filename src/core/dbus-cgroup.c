@@ -26,6 +26,7 @@ BUS_DEFINE_PROPERTY_GET(bus_property_get_tasks_max, "t", CGroupTasksMax, cgroup_
 BUS_DEFINE_PROPERTY_GET_ENUM(bus_property_get_cgroup_pressure_watch, cgroup_pressure_watch, CGroupPressureWatch);
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_cgroup_device_policy, cgroup_device_policy, CGroupDevicePolicy);
+static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_cpuset_partition, cpuset_partition, CPUSetPartition);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_managed_oom_mode, managed_oom_mode, ManagedOOMMode);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_managed_oom_preference, managed_oom_preference, ManagedOOMPreference);
 
@@ -385,6 +386,7 @@ const sd_bus_vtable bus_cgroup_vtable[] = {
         SD_BUS_PROPERTY("StartupAllowedCPUs", "ay", property_get_cpuset, offsetof(CGroupContext, startup_cpuset_cpus), 0),
         SD_BUS_PROPERTY("AllowedMemoryNodes", "ay", property_get_cpuset, offsetof(CGroupContext, cpuset_mems), 0),
         SD_BUS_PROPERTY("StartupAllowedMemoryNodes", "ay", property_get_cpuset, offsetof(CGroupContext, startup_cpuset_mems), 0),
+        SD_BUS_PROPERTY("CPUSetPartition", "s", property_get_cpuset_partition, offsetof(CGroupContext, cpuset_partition), 0),
         SD_BUS_PROPERTY("IOAccounting", "b", bus_property_get_bool, offsetof(CGroupContext, io_accounting), 0),
         SD_BUS_PROPERTY("IOWeight", "t", NULL, offsetof(CGroupContext, io_weight), 0),
         SD_BUS_PROPERTY("StartupIOWeight", "t", NULL, offsetof(CGroupContext, startup_io_weight), 0),
@@ -427,8 +429,12 @@ const sd_bus_vtable bus_cgroup_vtable[] = {
         SD_BUS_PROPERTY("SocketBindDeny", "a(iiqq)", property_get_socket_bind, offsetof(CGroupContext, socket_bind_deny), 0),
         SD_BUS_PROPERTY("RestrictNetworkInterfaces", "(bas)", property_get_restrict_network_interfaces, 0, 0),
         SD_BUS_PROPERTY("BindNetworkInterface", "s", NULL, offsetof(CGroupContext, bind_network_interface), 0),
-        SD_BUS_PROPERTY("MemoryPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(CGroupContext, memory_pressure_watch), 0),
-        SD_BUS_PROPERTY("MemoryPressureThresholdUSec", "t", bus_property_get_usec, offsetof(CGroupContext, memory_pressure_threshold_usec), 0),
+        SD_BUS_PROPERTY("MemoryPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(CGroupContext, pressure[PRESSURE_MEMORY].watch), 0),
+        SD_BUS_PROPERTY("MemoryPressureThresholdUSec", "t", bus_property_get_usec, offsetof(CGroupContext, pressure[PRESSURE_MEMORY].threshold_usec), 0),
+        SD_BUS_PROPERTY("CPUPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(CGroupContext, pressure[PRESSURE_CPU].watch), 0),
+        SD_BUS_PROPERTY("CPUPressureThresholdUSec", "t", bus_property_get_usec, offsetof(CGroupContext, pressure[PRESSURE_CPU].threshold_usec), 0),
+        SD_BUS_PROPERTY("IOPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(CGroupContext, pressure[PRESSURE_IO].watch), 0),
+        SD_BUS_PROPERTY("IOPressureThresholdUSec", "t", bus_property_get_usec, offsetof(CGroupContext, pressure[PRESSURE_IO].threshold_usec), 0),
         SD_BUS_PROPERTY("NFTSet", "a(iiss)", property_get_cgroup_nft_set, 0, 0),
         SD_BUS_PROPERTY("CoredumpReceive", "b", bus_property_get_bool, offsetof(CGroupContext, coredump_receive), 0),
 
@@ -712,9 +718,12 @@ static int bus_cgroup_set_transient_property(
 
                 return 1;
 
-        } else if (streq(name, "MemoryPressureWatch")) {
+        } else if (STR_IN_SET(name, "MemoryPressureWatch", "CPUPressureWatch", "IOPressureWatch")) {
                 CGroupPressureWatch p;
                 const char *t;
+
+                PressureResource pt = streq(name, "MemoryPressureWatch") ? PRESSURE_MEMORY :
+                                      streq(name, "CPUPressureWatch") ? PRESSURE_CPU : PRESSURE_IO;
 
                 r = sd_bus_message_read(message, "s", &t);
                 if (r < 0)
@@ -729,26 +738,29 @@ static int bus_cgroup_set_transient_property(
                 }
 
                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
-                        c->memory_pressure_watch = p;
-                        unit_write_settingf(u, flags, name, "MemoryPressureWatch=%s", strempty(cgroup_pressure_watch_to_string(p)));
+                        c->pressure[pt].watch = p;
+                        unit_write_settingf(u, flags, name, "%s=%s", name, strempty(cgroup_pressure_watch_to_string(p)));
                 }
 
                 return 1;
 
-        } else if (streq(name, "MemoryPressureThresholdUSec")) {
+        } else if (STR_IN_SET(name, "MemoryPressureThresholdUSec", "CPUPressureThresholdUSec", "IOPressureThresholdUSec")) {
                 uint64_t t;
+
+                PressureResource pt = streq(name, "MemoryPressureThresholdUSec") ? PRESSURE_MEMORY :
+                                      streq(name, "CPUPressureThresholdUSec") ? PRESSURE_CPU : PRESSURE_IO;
 
                 r = sd_bus_message_read(message, "t", &t);
                 if (r < 0)
                         return r;
 
                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
-                        c->memory_pressure_threshold_usec = t;
+                        c->pressure[pt].threshold_usec = t;
 
                         if (t == UINT64_MAX)
-                                unit_write_setting(u, flags, name, "MemoryPressureThresholdUSec=");
+                                unit_write_settingf(u, flags, name, "%s=", name);
                         else
-                                unit_write_settingf(u, flags, name, "MemoryPressureThresholdUSec=%" PRIu64, t);
+                                unit_write_settingf(u, flags, name, "%s=%" PRIu64, name, t);
                 }
 
                 return 1;
@@ -1479,6 +1491,35 @@ int bus_cgroup_set_property(
                         c->device_policy = p;
                         unit_invalidate_cgroup(u, CGROUP_MASK_BPF_DEVICES);
                         unit_write_settingf(u, flags, name, "DevicePolicy=%s", policy);
+                }
+
+                return 1;
+
+        } else if (streq(name, "CPUSetPartition")) {
+                const char *partition_str;
+                CPUSetPartition p;
+
+                r = sd_bus_message_read(message, "s", &partition_str);
+                if (r < 0)
+                        return r;
+
+                if (isempty(partition_str))
+                        p = _CPUSET_PARTITION_INVALID;
+                else {
+                        p = cpuset_partition_from_string(partition_str);
+                        if (p < 0)
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                                         "Invalid CPUSetPartition value: %s", partition_str);
+                }
+
+                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                        c->cpuset_partition = p;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_CPUSET);
+
+                        if (p == _CPUSET_PARTITION_INVALID)
+                                unit_write_settingf(u, flags, name, "%s=", name);
+                        else
+                                unit_write_settingf(u, flags, name, "%s=%s", name, partition_str);
                 }
 
                 return 1;

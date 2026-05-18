@@ -11,10 +11,9 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
-#include "utf8.h"
 
 bool boot_entry_token_valid(const char *p) {
-        return utf8_is_valid(p) && string_is_safe(p) && filename_is_valid(p);
+        return string_is_safe(p, STRING_FILENAME);
 }
 
 static int entry_token_load_one(int rfd, const char *dir, BootEntryTokenType *type, char **token) {
@@ -32,7 +31,7 @@ static int entry_token_load_one(int rfd, const char *dir, BootEntryTokenType *ty
         if (!p)
                 return log_oom();
 
-        r = chase_and_fopenat_unlocked(rfd, p, CHASE_AT_RESOLVE_IN_ROOT, "re", NULL, &f);
+        r = chase_and_fopenat_unlocked(rfd, rfd, p, /* chase_flags= */ 0, "re", NULL, &f);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
@@ -252,6 +251,12 @@ int parse_boot_entry_token_type(const char *s, BootEntryTokenType *type, char **
          * NOTE THAT THIS WILL FREE THE PREVIOUS ARGUMENT POINTER ON SUCCESS!
          * Hence, do not pass in uninitialized pointers.
          */
+
+        if (streq(s, "auto")) {
+                *type = BOOT_ENTRY_TOKEN_AUTO;
+                *token = mfree(*token);
+                return 0;
+        }
 
         if (streq(s, "machine-id")) {
                 *type = BOOT_ENTRY_TOKEN_MACHINE_ID;
