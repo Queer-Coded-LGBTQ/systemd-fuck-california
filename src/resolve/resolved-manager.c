@@ -664,6 +664,9 @@ static int manager_dispatch_reload_signal(sd_event_source *s, const struct signa
         manager_etc_hosts_flush(m);
         manager_static_records_flush(m);
 
+        m->etc_hosts_last = USEC_INFINITY;
+        m->static_records_last = USEC_INFINITY;
+
         manager_set_defaults(m);
 
         r = dns_trust_anchor_load(&m->trust_anchor);
@@ -1461,6 +1464,8 @@ static int manager_next_random_name(const char *old, char **ret_new) {
         uint64_t u, a;
         char *n;
 
+        assert(ret_new);
+
         p = strchr(old, 0);
         assert(p);
 
@@ -2151,9 +2156,9 @@ static int dns_configuration_json_append(
                         JSON_BUILD_PAIR_CONDITION_BOOLEAN(dnssec_mode >= 0, "dnssecSupported", dnssec_supported),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("dnssec", dnssec_mode_to_string(dnssec_mode)),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("dnsOverTLS", dns_over_tls_mode_to_string(dns_over_tls_mode)),
-                        JSON_BUILD_PAIR_STRING_NON_EMPTY("llmnr", resolve_support_to_string(llmnr_support)),
-                        JSON_BUILD_PAIR_STRING_NON_EMPTY("mDNS", resolve_support_to_string(mdns_support)),
-                        JSON_BUILD_PAIR_STRING_NON_EMPTY("resolvConfMode", resolv_conf_mode_to_string(resolv_conf_mode)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY_UNDERSCORIFY("llmnr", resolve_support_to_string(llmnr_support)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY_UNDERSCORIFY("mDNS", resolve_support_to_string(mdns_support)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY_UNDERSCORIFY("resolvConfMode", resolv_conf_mode_to_string(resolv_conf_mode)),
                         JSON_BUILD_PAIR_VARIANT_NON_NULL("scopes", scopes_json));
 }
 
@@ -2330,7 +2335,7 @@ int manager_send_dns_configuration_changed(Manager *m, Link *l, bool reset) {
         if (sd_json_variant_equal(configuration, m->dns_configuration_json))
                 return 0;
 
-        JSON_VARIANT_REPLACE(m->dns_configuration_json, TAKE_PTR(configuration));
+        json_variant_unref_and_replace(m->dns_configuration_json, configuration);
 
         r = varlink_many_notify(m->varlink_dns_configuration_subscription, m->dns_configuration_json);
         if (r < 0)

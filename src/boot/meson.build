@@ -80,10 +80,13 @@ endif
 efi_conf = configuration_data()
 
 # import several configs from userspace
-foreach name : ['HAVE_ATTRIBUTE_RETAIN',
-                'HAVE_WARNING_ZERO_AS_NULL_POINTER_CONSTANT',
-                'HAVE_WARNING_ZERO_LENGTH_BOUNDS',
-               ]
+foreach name : ['HAVE_WARNING_ZERO_LENGTH_BOUNDS',
+                'HAVE_WARNING_ZERO_AS_NULL_POINTER_CONSTANT']
+        efi_conf.set(name, conf.get(name))
+endforeach
+
+foreach attr : possible_c_attributes
+        name = 'HAVE_ATTRIBUTE_' + attr.to_upper()
         efi_conf.set(name, conf.get(name))
 endforeach
 
@@ -306,6 +309,7 @@ endif
 libefi_sources = files(
         'chid.c',
         'console.c',
+        'cpio.c',
         'device-path-util.c',
         'devicetree.c',
         'drivers.c',
@@ -316,6 +320,7 @@ libefi_sources = files(
         'efi-string.c',
         'export-vars.c',
         'graphics.c',
+        'hii.c',
         'initrd.c',
         'measure.c',
         'part-discovery.c',
@@ -337,7 +342,7 @@ systemd_boot_sources = files(
 )
 
 stub_sources = files(
-        'cpio.c',
+        'boot-secret.c',
         'linux.c',
         'splash.c',
         'stub.c',

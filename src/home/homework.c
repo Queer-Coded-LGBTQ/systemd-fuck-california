@@ -915,6 +915,7 @@ static int home_activate(UserRecord *h, UserRecord **ret_home) {
         int r;
 
         assert(h);
+        assert(ret_home);
 
         if (!h->user_name)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "User record lacks user name, refusing.");
@@ -1330,7 +1331,7 @@ static int determine_default_storage(UserStorage *ret) {
                         if (r < 0)
                                 log_warning_errno(r, "Failed to determine if %s is encrypted, ignoring: %m", get_home_root());
 
-                        r = dlopen_cryptsetup();
+                        r = dlopen_cryptsetup(LOG_DEBUG);
                         if (r < 0)
                                 log_info("Not using '%s' storage, since libcryptsetup could not be loaded.", user_storage_to_string(USER_LUKS));
                         else {
@@ -2003,8 +2004,6 @@ static int run(int argc, char *argv[]) {
         start = now(CLOCK_MONOTONIC);
 
         log_setup();
-
-        cryptsetup_enable_logging(NULL);
 
         umask(0022);
 
