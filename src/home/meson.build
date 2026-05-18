@@ -51,6 +51,10 @@ homectl_sources = files(
         'homectl.c',
 )
 
+homectl_extract = files(
+        'homectl-prompts.c',
+)
+
 pam_systemd_home_sources = files(
         'home-util.c',
         'pam_systemd_home.c',
@@ -65,7 +69,7 @@ executables += [
                 'extract' : systemd_homed_extract_sources,
                 'dependencies' : [
                         libm,
-                        libopenssl,
+                        libopenssl_cflags,
                         threads,
                 ],
         },
@@ -73,14 +77,10 @@ executables += [
                 'name' : 'systemd-homework',
                 'sources' : systemd_homework_sources,
                 'objects' : ['systemd-homed'],
-                'link_with' : [
-                        libshared,
-                        libshared_fdisk
-                ],
                 'dependencies' : [
                         libblkid_cflags,
-                        libfdisk,
-                        libopenssl,
+                        libfdisk_cflags,
+                        libopenssl_cflags,
                         libp11kit_cflags,
                         threads,
                 ],
@@ -89,13 +89,19 @@ executables += [
                 'name' : 'homectl',
                 'public' : true,
                 'sources' : homectl_sources,
+                'extract' : homectl_extract,
                 'objects' : ['systemd-homed'],
                 'dependencies' : [
                         libdl,
-                        libopenssl,
+                        libopenssl_cflags,
                         libp11kit_cflags,
                         threads,
                 ],
+        },
+        test_template + {
+                'sources' : files('test-homectl-prompts.c'),
+                'objects' : ['homectl'],
+                'type' : 'manual',
         },
         test_template + {
                 'sources' : files('test-homed-regression-31896.c'),

@@ -82,11 +82,9 @@ Condition* condition_new(ConditionType type, const char *parameter, bool trigger
                 .negate = negate,
         };
 
-        if (parameter) {
-                c->parameter = strdup(parameter);
-                if (!c->parameter)
-                        return mfree(c);
-        }
+        c->parameter = strdup(parameter);
+        if (!c->parameter)
+                return mfree(c);
 
         return c;
 }
@@ -741,6 +739,8 @@ static int condition_test_security(Condition *c, char **env) {
                 return detect_confidential_virtualization() > 0;
         if (streq(c->parameter, "measured-uki"))
                 return efi_measured_uki(LOG_DEBUG);
+        if (streq(c->parameter, "measured-os"))
+                return efi_measured_os(LOG_DEBUG);
 
         return false;
 }

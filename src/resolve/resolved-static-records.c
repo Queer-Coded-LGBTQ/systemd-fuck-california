@@ -29,7 +29,7 @@
  * serializations of DNS RRs. Also note the semantics are different from DNS zone file format, for example
  * regarding delegation (i.e. the RRs defined here have no effect on subdomains), which is probably nicer for
  * one-off mappings of domains to specific resources. Or in other words, this is supposed to be a drop-in
- * based alternative to /etc/hosts, not a one to DNS zone files. (The JSON format is also a lot more
+ * based alternative to /etc/hosts, not one to DNS zone files. (The JSON format is also a lot more
  * extensible to us, for example we could teach it to map certain lookups to specific DNS errors, or extend
  * it so that subdomains always get NXDOMAIN or similar).
  *
@@ -49,6 +49,8 @@ DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
 
 static int load_static_record_file_item(sd_json_variant *rj, Hashmap **records) {
         int r;
+
+        assert(records);
 
         _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
         r = dns_resource_record_from_json(rj, &rr);
@@ -145,7 +147,7 @@ static int manager_static_records_read(Manager *m) {
 
         ConfFile **files = NULL;
         size_t n_files = 0;
-        CLEANUP_ARRAY(files, n_files, conf_file_free_many);
+        CLEANUP_ARRAY(files, n_files, conf_file_free_array);
 
         r = conf_files_list_nulstr_full(
                         ".rr",
@@ -222,5 +224,4 @@ void manager_static_records_flush(Manager *m) {
 
         m->static_records = hashmap_free(m->static_records);
         m->static_records_stat = set_free(m->static_records_stat);
-        m->static_records_last = USEC_INFINITY;
 }
