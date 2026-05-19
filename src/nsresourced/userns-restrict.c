@@ -3,7 +3,7 @@
 #include <sys/stat.h>
 
 #if HAVE_VMLINUX_H
-#include "bpf/userns-restrict/userns-restrict-skel.h"
+#include "userns-restrict-skel.h"
 #endif
 
 #include "bpf-dlopen.h"
@@ -68,7 +68,7 @@ int userns_restrict_install(
         if (r == 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "bpf-lsm not supported, can't lock down user namespace.");
 
-        r = dlopen_bpf();
+        r = dlopen_bpf(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -244,7 +244,7 @@ int userns_restrict_put_by_inode(
 
                         if (n_try == 0)
                                 return log_debug_errno(SYNTHETIC_ERRNO(EEXIST),
-                                                       "Stillcan't create inode entry in BPF map after 10 tries.");
+                                                       "Still cannot create inode entry in BPF map after 10 tries.");
 
                         r = sym_bpf_map_lookup_elem(outer_map_fd, &ino, &innermap_id);
                         if (r >= 0) {

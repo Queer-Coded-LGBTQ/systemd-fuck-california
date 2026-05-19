@@ -6,12 +6,6 @@
 #include <sys/mount.h>
 #include <unistd.h>
 
-#if HAVE_OPENSSL
-#include <openssl/err.h>
-#include <openssl/pem.h>
-#include <openssl/x509.h>
-#endif
-
 #include "sd-device.h"
 #include "sd-id128.h"
 #include "sd-json.h"
@@ -26,6 +20,7 @@
 #include "conf-files.h"
 #include "constants.h"
 #include "copy.h"
+#include "crypto-util.h"
 #include "cryptsetup-util.h"
 #include "device-private.h"
 #include "devnum-util.h"
@@ -57,7 +52,6 @@
 #include "mountpoint-util.h"
 #include "namespace-util.h"
 #include "nulstr-util.h"
-#include "openssl-util.h"
 #include "os-util.h"
 #include "path-util.h"
 #include "pcrextend-util.h"
@@ -139,54 +133,24 @@ static const char *getenv_fstype(PartitionDesignator d) {
 
 int probe_sector_size(int fd, uint32_t *ret) {
 
-        /* Disk images might be for 512B or for 4096 sector sizes, let's try to auto-detect that by searching
-         * for the GPT headers at the relevant byte offsets */
-
-        assert_cc(sizeof(GptHeader) == 92);
-
-        /* We expect a sector size in the range 512…4096. The GPT header is located in the second
-         * sector. Hence it could be at byte 512 at the earliest, and at byte 4096 at the latest. And we must
-         * read with granularity of the largest sector size we care about. Which means 8K. */
-        uint8_t sectors[2 * 4096];
-        uint32_t found = 0;
-        ssize_t n;
-
         assert(fd >= 0);
         assert(ret);
 
-        n = pread(fd, sectors, sizeof(sectors), 0);
-        if (n < 0)
-                return -errno;
-        if (n != sizeof(sectors)) /* too short? */
-                goto not_found;
-
-        /* Let's see if we find the GPT partition header with various expected sector sizes */
-        for (uint32_t sz = 512; sz <= 4096; sz <<= 1) {
-                const GptHeader *p;
-
-                assert(sizeof(sectors) >= sz * 2);
-                p = (const GptHeader*) (sectors + sz);
-
-                if (!gpt_header_has_signature(p))
-                        continue;
-
-                if (found != 0)
-                        return log_debug_errno(SYNTHETIC_ERRNO(ENOTUNIQ),
-                                               "Detected valid partition table at offsets matching multiple sector sizes, refusing.");
-
-                found = sz;
+        ssize_t ssz = gpt_probe(fd, /* ret_header= */ NULL, /* ret_entries= */ NULL, /* ret_n_entries= */ NULL, /* ret_entry_size= */ NULL);
+        if (ssz == -ENOTUNIQ)
+                return log_debug_errno(ssz,
+                                       "Detected valid partition table at offsets matching multiple sector sizes, refusing.");
+        if (ssz < 0)
+                return ssz;
+        if (ssz == 0) {
+                log_debug("Couldn't find any partition table to derive sector size of.");
+                *ret = 512; /* pick the traditional default */
+                return 0;   /* indicate we didn't find it */
         }
 
-        if (found != 0) {
-                log_debug("Determined sector size %" PRIu32 " based on discovered partition table.", found);
-                *ret = found;
-                return 1; /* indicate we *did* find it */
-        }
-
-not_found:
-        log_debug("Couldn't find any partition table to derive sector size of.");
-        *ret = 512; /* pick the traditional default */
-        return 0;   /* indicate we didn't find it */
+        log_debug("Determined sector size %" PRIu32 " based on discovered partition table.", (uint32_t) ssz);
+        *ret = ssz;
+        return 1; /* indicate we *did* find it */
 }
 
 int probe_sector_size_prefer_ioctl(int fd, uint32_t *ret) {
@@ -225,15 +189,23 @@ static int probe_blkid_filter(blkid_probe p) {
         if (r < 0)
                 return r;
 
+        /* allowed_fstypes() returns the list of filesystem types that we are willing to mount. For the
+         * blkid probe filter we additionally need to be able to detect crypto_LUKS (so that we can set up
+         * LUKS decryption for encrypted partitions) and swap (so that we can identify swap partitions). */
+        r = strv_extend_many(&fstypes, "crypto_LUKS", "swap");
+        if (r < 0)
+                return r;
+
         errno = 0;
         r = sym_blkid_probe_filter_superblocks_type(p, BLKID_FLTR_ONLYIN, fstypes);
         if (r != 0)
                 return errno_or_else(EINVAL);
 
-        errno = 0;
-        r = sym_blkid_probe_filter_superblocks_usage(p, BLKID_FLTR_NOTIN, BLKID_USAGE_RAID);
-        if (r != 0)
-                return errno_or_else(EINVAL);
+        /* Note: don't call blkid_probe_filter_superblocks_usage() here. Both filter functions share the
+         * same bitmap internally, and each call resets it before applying its own filter — so a subsequent
+         * usage filter would wipe the type filter we just set. The ONLYIN type filter above already
+         * excludes everything not in the allowed list, including RAID superblocks, so a separate usage
+         * filter is redundant anyway. */
 
         return 0;
 }
@@ -261,7 +233,7 @@ int probe_filesystem_full(
         assert(fd >= 0 || path);
         assert(ret_fstype);
 
-        r = dlopen_libblkid();
+        r = dlopen_libblkid(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -458,11 +430,15 @@ static int partition_is_luks2_integrity(int part_fd, uint64_t offset, uint64_t s
         if (sz != sizeof(header))
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read LUKS header.");
 
-        if (memcmp(header.luks_magic, LUKS2_MAGIC, sizeof(header.luks_magic)) != 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Partition's magic is not LUKS.");
+        if (memcmp(header.luks_magic, LUKS2_MAGIC, sizeof(header.luks_magic)) != 0) {
+                log_debug("Partition does not have a LUKS magic header, assuming no integrity.");
+                return 0;
+        }
 
-        if (be16toh(header.version) != 2)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unsupported LUKS header version: %" PRIu16 ".", be16toh(header.version));
+        if (be16toh(header.version) != 2) {
+                log_debug("Partition is LUKS v%" PRIu16 ", not LUKS2, assuming no integrity.", be16toh(header.version));
+                return 0;
+        }
 
         if (be64toh(header.hdr_len) > size)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "LUKS header length exceeds partition size.");
@@ -964,6 +940,7 @@ static int dissect_image_from_unpartitioned(
         assert(devname);
         assert(m);
         assert(fstype);
+        POINTER_MAY_BE_NULL(mount_node_fd);
 
         if (!image_filter_test(filter, PARTITION_ROOT, /* label= */ NULL)) /* do a filter check with an empty partition label */
                 return -ECOMM;
@@ -1097,7 +1074,7 @@ static int dissect_image(
                 }
         }
 
-        r = dlopen_libblkid();
+        r = dlopen_libblkid(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1301,7 +1278,7 @@ static int dissect_image(
                  * partition already existent. */
 
                 if (FLAGS_SET(flags, DISSECT_IMAGE_ADD_PARTITION_DEVICES)) {
-                        r = block_device_add_partition(fd, node, nr, (uint64_t) start * 512, (uint64_t) size * 512);
+                        r = block_device_add_partition(fd, nr, (uint64_t) start * 512, (uint64_t) size * 512);
                         if (r < 0) {
                                 if (r != -EBUSY)
                                         return log_debug_errno(r, "BLKPG_ADD_PARTITION failed: %m");
@@ -1443,7 +1420,7 @@ static int dissect_image(
                                                         /* ret_root_hash_sig= */ NULL);
                                         if (r < 0)
                                                 return r;
-                                        if (iovec_memcmp(&verity->root_hash, &root_hash) != 0) {
+                                        if (!iovec_equal(&verity->root_hash, &root_hash)) {
                                                 if (DEBUG_LOGGING) {
                                                         _cleanup_free_ char *found = NULL, *expected = NULL;
 
@@ -1702,6 +1679,10 @@ static int dissect_image(
         FOREACH_ELEMENT(dd, ((const PartitionDesignator[]) { PARTITION_ROOT, PARTITION_USR })) {
                 PartitionDesignator dv = partition_verity_hash_of(*dd);
                 PartitionDesignator ds = partition_verity_sig_of(*dd);
+
+                /* Hint to help static analyzers */
+                assert(dv >= 0);
+                assert(ds >= 0);
 
                 if (!m->partitions[*dd].found && (m->partitions[dv].found || m->partitions[ds].found))
                         return log_debug_errno(
@@ -2159,14 +2140,16 @@ DissectedImage* dissected_image_unref(DissectedImage *m) {
 static int is_loop_device(const char *path) {
         char s[SYS_BLOCK_PATH_MAX("/../loop/")];
         struct stat st;
+        int r;
 
         assert(path);
 
         if (stat(path, &st) < 0)
                 return -errno;
 
-        if (!S_ISBLK(st.st_mode))
-                return -ENOTBLK;
+        r = stat_verify_block(&st);
+        if (r < 0)
+                return r;
 
         xsprintf_sys_block_path(s, "/loop/", st.st_dev);
         if (access(s, F_OK) < 0) {
@@ -2315,7 +2298,7 @@ int partition_pick_mount_options(
         case PARTITION_XBOOTLDR:
                 flags |= MS_NOSUID|MS_NOEXEC|MS_NOSYMFOLLOW;
 
-                /* The ESP might contain a pre-boot random seed. Let's make this unaccessible to regular
+                /* The ESP might contain a pre-boot random seed. Let's make this inaccessible to regular
                  * userspace. ESP/XBOOTLDR is almost certainly VFAT, hence if we don't know assume it is. */
                 if (!fstype || fstype_can_fmask_dmask(fstype))
                         if (!strextend_with_separator(&options, ",", "fmask=0177,dmask=0077"))
@@ -2940,7 +2923,7 @@ static int decrypt_partition(
                 DecryptedImage *d) {
 
         _cleanup_free_ char *node = NULL, *name = NULL;
-        _cleanup_(sym_crypt_freep) struct crypt_device *cd = NULL;
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         _cleanup_close_ int fd = -EBADF;
         int r;
 
@@ -2960,7 +2943,7 @@ static int decrypt_partition(
         if (!FLAGS_SET(policy_flags, PARTITION_POLICY_ENCRYPTED))
                 return log_debug_errno(SYNTHETIC_ERRNO(ERFKILL), "Attempted to unlock partition via LUKS, but it's prohibited.");
 
-        r = dlopen_cryptsetup();
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -3010,7 +2993,7 @@ static int verity_can_reuse(
                 struct crypt_device **ret_cd) {
 
         /* If the same volume was already open, check that the root hashes match, and reuse it if they do */
-        _cleanup_(sym_crypt_freep) struct crypt_device *cd = NULL;
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         struct crypt_params_verity crypt_params = {};
         int r;
 
@@ -3038,7 +3021,7 @@ static int verity_can_reuse(
         r = sym_crypt_volume_key_get(cd, CRYPT_ANY_SLOT, root_hash_existing.iov_base, &root_hash_existing.iov_len, NULL, 0);
         if (r < 0)
                 return log_debug_errno(r, "Error opening verity device, crypt_volume_key_get failed: %m");
-        if (iovec_memcmp(&verity->root_hash, &root_hash_existing) != 0)
+        if (!iovec_equal(&verity->root_hash, &root_hash_existing))
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Error opening verity device, it already exists but root hashes are different.");
 
         /* Ensure that, if signatures are supported, we only reuse the device if the previous mount used the
@@ -3087,7 +3070,7 @@ static int validate_signature_userspace(const VeritySettings *verity, const char
                 return 0;
         }
         if (!b) {
-                log_debug("Userspace dm-verity signature authentication disabled via systemd.allow_userspace_verity= kernel command line variable.");
+                log_debug("Userspace dm-verity signature authentication disabled via systemd.allow_userspace_verity= kernel command line option.");
                 return 0;
         }
 
@@ -3102,6 +3085,10 @@ static int validate_signature_userspace(const VeritySettings *verity, const char
         assert(iovec_is_set(&verity->root_hash));
         assert(iovec_is_set(&verity->root_hash_sig));
 
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
         /* Because installing a signature certificate into the kernel chain is so messy, let's optionally do
          * userspace validation. */
 
@@ -3114,7 +3101,7 @@ static int validate_signature_userspace(const VeritySettings *verity, const char
         }
 
         const unsigned char *d = verity->root_hash_sig.iov_base;
-        p7 = d2i_PKCS7(NULL, &d, (long) verity->root_hash_sig.iov_len);
+        p7 = sym_d2i_PKCS7(NULL, &d, (long) verity->root_hash_sig.iov_len);
         if (!p7)
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse PKCS7 DER signature data.");
 
@@ -3122,11 +3109,11 @@ static int validate_signature_userspace(const VeritySettings *verity, const char
         if (!s)
                 return log_oom_debug();
 
-        bio = BIO_new_mem_buf(s, strlen(s));
+        bio = sym_BIO_new_mem_buf(s, strlen(s));
         if (!bio)
                 return log_oom_debug();
 
-        sk = sk_X509_new_null();
+        sk = sym_sk_X509_new_null();
         if (!sk)
                 return log_oom_debug();
 
@@ -3140,23 +3127,23 @@ static int validate_signature_userspace(const VeritySettings *verity, const char
                         continue;
                 }
 
-                c = PEM_read_X509(f, NULL, NULL, NULL);
+                c = sym_PEM_read_X509(f, NULL, NULL, NULL);
                 if (!c) {
                         log_debug("Failed to load X509 certificate '%s', ignoring.", *i);
                         continue;
                 }
 
-                if (sk_X509_push(sk, c) == 0)
+                if (sym_sk_X509_push(sk, c) == 0)
                         return log_oom_debug();
 
                 TAKE_PTR(c);
         }
 
-        r = PKCS7_verify(p7, sk, NULL, bio, NULL, PKCS7_NOINTERN|PKCS7_NOVERIFY);
+        r = sym_PKCS7_verify(p7, sk, NULL, bio, NULL, PKCS7_NOINTERN|PKCS7_NOVERIFY);
         if (r)
                 log_debug("Userspace PKCS#7 validation succeeded.");
         else
-                log_debug("Userspace PKCS#7 validation failed: %s", ERR_error_string(ERR_get_error(), NULL));
+                log_debug("Userspace PKCS#7 validation failed: %s", sym_ERR_error_string(sym_ERR_get_error(), NULL));
 
         return r;
 #else
@@ -3298,7 +3285,7 @@ static int verity_partition(
                 PartitionPolicyFlags policy_flags,
                 DecryptedImage *d) {
 
-        _cleanup_(sym_crypt_freep) struct crypt_device *cd = NULL;
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         _cleanup_free_ char *node = NULL, *name = NULL;
         _cleanup_close_ int mount_node_fd = -EBADF;
         int r;
@@ -3328,7 +3315,7 @@ static int verity_partition(
                 return 0;
         }
 
-        r = dlopen_cryptsetup();
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -3368,7 +3355,7 @@ static int verity_partition(
          * retry a few times before giving up. */
         for (unsigned i = 0; i < N_DEVICE_NODE_LIST_ATTEMPTS; i++) {
                 _cleanup_(dm_deferred_remove_cleanp) char *restore_deferred_remove = NULL;
-                _cleanup_(sym_crypt_freep) struct crypt_device *existing_cd = NULL;
+                _cleanup_(crypt_freep) struct crypt_device *existing_cd = NULL;
                 _cleanup_close_ int fd = -EBADF;
 
                 /* First, check if the device already exists. */
@@ -3743,7 +3730,7 @@ static char *build_auxiliary_path(const char *image, const char *suffix) {
 
         e = endswith(image, ".raw");
         if (!e)
-                return strjoin(e, suffix);
+                return strjoin(image, suffix);
 
         n = new(char, e - image + strlen(suffix) + 1);
         if (!n)
@@ -3833,7 +3820,7 @@ int verity_settings_load(
                                 if (r < 0) {
                                         _cleanup_free_ char *p = NULL;
 
-                                        if (r != -ENOENT && !ERRNO_IS_XATTR_ABSENT(r))
+                                        if (!ERRNO_IS_XATTR_ABSENT(r))
                                                 return r;
 
                                         p = build_auxiliary_path(image, ".roothash");
@@ -3862,7 +3849,7 @@ int verity_settings_load(
                                 if (r < 0) {
                                         _cleanup_free_ char *p = NULL;
 
-                                        if (r != -ENOENT && !ERRNO_IS_XATTR_ABSENT(r))
+                                        if (!ERRNO_IS_XATTR_ABSENT(r))
                                                 return r;
 
                                         p = build_auxiliary_path(image, ".usrhash");
@@ -4063,7 +4050,7 @@ int dissected_image_load_verity_sig_partition(
 
         /* Check if specified root hash matches if it is specified */
         if (iovec_is_set(&verity->root_hash) &&
-            iovec_memcmp(&verity->root_hash, &root_hash) != 0) {
+            !iovec_equal(&verity->root_hash, &root_hash)) {
                 _cleanup_free_ char *a = NULL, *b = NULL;
 
                 a = hexmem(root_hash.iov_base, root_hash.iov_len);
@@ -4191,7 +4178,7 @@ int dissected_image_acquire_metadata(
 
         assert(m);
 
-        r = dlopen_libmount();
+        r = dlopen_libmount(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -4714,7 +4701,7 @@ int mount_image_privately_interactively(
 
         r = loop_device_make_by_path(
                         image,
-                        FLAGS_SET(flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : O_RDWR,
+                        FLAGS_SET(flags, DISSECT_IMAGE_DEVICE_READ_ONLY) ? O_RDONLY : -1,
                         /* sector_size= */ UINT32_MAX,
                         FLAGS_SET(flags, DISSECT_IMAGE_NO_PARTITION_TABLE) ? 0 : LO_FLAGS_PARTSCAN,
                         LOCK_SH,

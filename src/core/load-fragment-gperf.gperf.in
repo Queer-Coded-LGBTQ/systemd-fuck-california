@@ -196,7 +196,7 @@
 {% endif %}
 {{type}}.ProtectHostname,                     config_parse_protect_hostname,                      0,                                  offsetof({{type}}, exec_context)
 {{type}}.MemoryKSM,                           config_parse_tristate,                              0,                                  offsetof({{type}}, exec_context.memory_ksm)
-{{type}}.MemoryTHP,                           config_parse_memory_thp,                            0,                                  offsetof({{type}}, exec_context.memory_thp)
+{{type}}.MemoryTHP,                           config_parse_exec_memory_thp,                       0,                                  offsetof({{type}}, exec_context.memory_thp)
 {%- endmacro -%}
 
 {%- macro KILL_CONTEXT_CONFIG_ITEMS(type) -%}
@@ -215,6 +215,7 @@
 {{type}}.StartupAllowedCPUs,                  config_parse_unit_cpu_set,                          0,                                  offsetof({{type}}, cgroup_context.startup_cpuset_cpus)
 {{type}}.AllowedMemoryNodes,                  config_parse_unit_cpu_set,                          0,                                  offsetof({{type}}, cgroup_context.cpuset_mems)
 {{type}}.StartupAllowedMemoryNodes,           config_parse_unit_cpu_set,                          0,                                  offsetof({{type}}, cgroup_context.startup_cpuset_mems)
+{{type}}.CPUSetPartition,                     config_parse_cpuset_partition,                      0,                                  offsetof({{type}}, cgroup_context.cpuset_partition)
 {{type}}.CPUAccounting,                       config_parse_warn_compat,                           DISABLED_LEGACY,                    0
 {{type}}.CPUWeight,                           config_parse_cg_cpu_weight,                         0,                                  offsetof({{type}}, cgroup_context.cpu_weight)
 {{type}}.StartupCPUWeight,                    config_parse_cg_cpu_weight,                         0,                                  offsetof({{type}}, cgroup_context.startup_cpu_weight)
@@ -271,13 +272,18 @@
 {{type}}.ManagedOOMMemoryPressureLimit,       config_parse_managed_oom_mem_pressure_limit,        0,                                  offsetof({{type}}, cgroup_context.moom_mem_pressure_limit)
 {{type}}.ManagedOOMMemoryPressureDurationSec, config_parse_managed_oom_mem_pressure_duration_sec, 0,                                  offsetof({{type}}, cgroup_context.moom_mem_pressure_duration_usec)
 {{type}}.ManagedOOMPreference,                config_parse_managed_oom_preference,                0,                                  offsetof({{type}}, cgroup_context.moom_preference)
+{{type}}.OOMRules,                            config_parse_managed_oom_rules,                     1,                                  offsetof({{type}}, cgroup_context.moom_rules)
 {{type}}.NetClass,                            config_parse_warn_compat,                           DISABLED_LEGACY,                    0
 {{type}}.BPFProgram,                          config_parse_bpf_foreign_program,                   0,                                  offsetof({{type}}, cgroup_context)
 {{type}}.SocketBindAllow,                     config_parse_cgroup_socket_bind,                    0,                                  offsetof({{type}}, cgroup_context.socket_bind_allow)
 {{type}}.SocketBindDeny,                      config_parse_cgroup_socket_bind,                    0,                                  offsetof({{type}}, cgroup_context.socket_bind_deny)
 {{type}}.RestrictNetworkInterfaces,           config_parse_restrict_network_interfaces,           0,                                  offsetof({{type}}, cgroup_context)
-{{type}}.MemoryPressureThresholdSec,          config_parse_sec,                                   0,                                  offsetof({{type}}, cgroup_context.memory_pressure_threshold_usec)
-{{type}}.MemoryPressureWatch,                 config_parse_memory_pressure_watch,                 0,                                  offsetof({{type}}, cgroup_context.memory_pressure_watch)
+{{type}}.MemoryPressureThresholdSec,          config_parse_sec,                                   0,                                  offsetof({{type}}, cgroup_context.pressure[PRESSURE_MEMORY].threshold_usec)
+{{type}}.MemoryPressureWatch,                 config_parse_pressure_watch,                        0,                                  offsetof({{type}}, cgroup_context.pressure[PRESSURE_MEMORY].watch)
+{{type}}.CPUPressureThresholdSec,             config_parse_sec,                                   0,                                  offsetof({{type}}, cgroup_context.pressure[PRESSURE_CPU].threshold_usec)
+{{type}}.CPUPressureWatch,                    config_parse_pressure_watch,                        0,                                  offsetof({{type}}, cgroup_context.pressure[PRESSURE_CPU].watch)
+{{type}}.IOPressureThresholdSec,              config_parse_sec,                                   0,                                  offsetof({{type}}, cgroup_context.pressure[PRESSURE_IO].threshold_usec)
+{{type}}.IOPressureWatch,                     config_parse_pressure_watch,                        0,                                  offsetof({{type}}, cgroup_context.pressure[PRESSURE_IO].watch)
 {{type}}.NFTSet,                              config_parse_cgroup_nft_set,                        NFT_SET_PARSE_CGROUP,               offsetof({{type}}, cgroup_context)
 {{type}}.CoredumpReceive,                     config_parse_bool,                                  0,                                  offsetof({{type}}, cgroup_context.coredump_receive)
 {{type}}.BindNetworkInterface,                config_parse_bind_network_interface,                0,                                  offsetof({{type}}, cgroup_context)

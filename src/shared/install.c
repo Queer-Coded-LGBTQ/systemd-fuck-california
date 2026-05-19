@@ -319,16 +319,14 @@ InstallChangeType install_changes_add(
         return type;
 }
 
-void install_changes_free(InstallChange *changes, size_t n_changes) {
-        assert(changes || n_changes == 0);
+static void install_change_done(InstallChange *change) {
+        assert(change);
 
-        FOREACH_ARRAY(i, changes, n_changes) {
-                free(i->path);
-                free(i->source);
-        }
-
-        free(changes);
+        change->path = mfree(change->path);
+        change->source = mfree(change->source);
 }
+
+DEFINE_ARRAY_FREE_FUNC(install_changes_free, InstallChange, install_change_done);
 
 static void install_change_dump_success(const InstallChange *change) {
         assert(change);
@@ -646,6 +644,7 @@ static int mark_symlink_for_removal(
         char *n;
         int r;
 
+        assert(remove_symlinks_to);
         assert(p);
 
         r = set_ensure_allocated(remove_symlinks_to, &path_hash_ops_free);
@@ -1037,6 +1036,7 @@ static int find_symlinks_in_scope(
 
         assert(lp);
         assert(info);
+        assert(state);
 
         /* As we iterate over the list of search paths in lp->search_path, we may encounter "same name"
          * symlinks. The ones which are "below" (i.e. have lower priority) than the unit file itself are
@@ -1842,6 +1842,8 @@ static int install_info_discover_and_check(
 
         int r;
 
+        POINTER_MAY_BE_NULL(ret);
+
         r = install_info_discover(ctx, lp, name_or_path, flags, ret, changes, n_changes);
         if (r < 0)
                 return r;
@@ -1858,6 +1860,8 @@ int unit_file_verify_alias(
 
         _cleanup_free_ char *dst_updated = NULL;
         int r;
+
+        assert(ret_dst);
 
         /* Verify that dst is a valid either a valid alias or a valid .wants/.requires symlink for the target
          * unit *i. Return negative on error or if not compatible, zero on success.
@@ -2901,6 +2905,9 @@ static int do_unit_file_disable(
         bool has_install_info = false;
         int r;
 
+        assert(changes);
+        assert(n_changes);
+
         STRV_FOREACH(name, names) {
                 InstallInfo *info;
 
@@ -3510,6 +3517,7 @@ static int query_presets(const char *name, const UnitFilePresets *presets, char 
 
         assert(name);
         assert(presets);
+        POINTER_MAY_BE_NULL(instance_name_list);
 
         if (!unit_name_is_valid(name, UNIT_NAME_ANY))
                 return -EINVAL;
