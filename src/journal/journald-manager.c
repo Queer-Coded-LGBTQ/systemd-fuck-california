@@ -135,6 +135,8 @@ static int manager_determine_path_usage(
 }
 
 static void cache_space_invalidate(JournalStorageSpace *space) {
+        assert(space);
+
         zero(*space);
 }
 
@@ -461,7 +463,9 @@ static int manager_find_user_journal(Manager *m, uid_t uid, JournalFile **ret) {
         _cleanup_free_ char *p = NULL;
         int r;
 
+        assert(m);
         assert(!uid_for_system_journal(uid));
+        assert(ret);
 
         f = ordered_hashmap_get(m->user_journals, UID_TO_PTR(uid));
         if (f)
