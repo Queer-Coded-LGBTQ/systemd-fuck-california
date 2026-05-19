@@ -478,7 +478,7 @@ static int list_machine_one_and_maybe_read_metadata(sd_varlink *link, Machine *m
                         &v,
                         SD_JSON_BUILD_PAIR_STRING("name", m->name),
                         SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(m->id), "id", SD_JSON_BUILD_ID128(m->id)),
-                        SD_JSON_BUILD_PAIR_STRING("class", machine_class_to_string(m->class)),
+                        JSON_BUILD_PAIR_ENUM("class", machine_class_to_string(m->class)),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("service", m->service),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("rootDirectory", m->root_directory),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("unit", m->unit),
@@ -489,6 +489,7 @@ static int list_machine_one_and_maybe_read_metadata(sd_varlink *link, Machine *m
                         JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("vSockCid", m->vsock_cid, VMADDR_CID_ANY),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("sshAddress", m->ssh_address),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("sshPrivateKeyPath", m->ssh_private_key_path),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("controlAddress", m->control_address),
                         JSON_BUILD_PAIR_VARIANT_NON_NULL("addresses", addr_array),
                         JSON_BUILD_PAIR_STRV_ENV_PAIR_NON_EMPTY("OSRelease", os_release),
                         JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("UIDShift", shift, UID_INVALID),
@@ -534,7 +535,18 @@ static int vl_method_list(sd_varlink *link, sd_json_variant *parameters, sd_varl
         if (r != 0)
                 return r;
 
-        r = varlink_set_sentinel(link, VARLINK_ERROR_MACHINE_NO_SUCH_MACHINE);
+        if (m->runtime_scope != RUNTIME_SCOPE_USER && should_acquire_metadata(p.acquire_metadata)) {
+                r = varlink_verify_polkit_async(
+                                link,
+                                m->system_bus,
+                                "org.freedesktop.machine1.inspect-machines",
+                                (const char**) STRV_MAKE("name", strna(p.name)),
+                                &m->polkit_registry);
+                if (r <= 0)
+                        return r;
+        }
+
+        r = sd_varlink_set_sentinel(link, VARLINK_ERROR_MACHINE_NO_SUCH_MACHINE);
         if (r < 0)
                 return r;
 
@@ -681,7 +693,18 @@ static int vl_method_list_images(sd_varlink *link, sd_json_variant *parameters, 
         if (r != 0)
                 return r;
 
-        r = varlink_set_sentinel(link, VARLINK_ERROR_MACHINE_IMAGE_NO_SUCH_IMAGE);
+        if (m->runtime_scope != RUNTIME_SCOPE_USER && should_acquire_metadata(p.acquire_metadata)) {
+                r = varlink_verify_polkit_async(
+                                link,
+                                m->system_bus,
+                                "org.freedesktop.machine1.inspect-images",
+                                (const char**) STRV_MAKE("name", strna(p.image_name)),
+                                &m->polkit_registry);
+                if (r <= 0)
+                        return r;
+        }
+
+        r = sd_varlink_set_sentinel(link, VARLINK_ERROR_MACHINE_IMAGE_NO_SUCH_IMAGE);
         if (r < 0)
                 return r;
 

@@ -72,6 +72,7 @@
 #define REENABLE_WARNING                                                \
         _Pragma("GCC diagnostic pop")
 
+#define _alias_(x) typeof(x) __attribute__((alias(#x)))
 #define _align_(x) __attribute__((__aligned__(x)))
 #define _alignas_(x) __attribute__((__aligned__(alignof(x))))
 #define _alignptr_ __attribute__((__aligned__(sizeof(void *))))
@@ -98,22 +99,28 @@
 #define _weak_ __attribute__((__weak__))
 #define _weakref_(x) __attribute__((__weakref__(#x)))
 
+#if HAVE_ATTRIBUTE_ALLOC_SIZE
+#  define _alloc_(...) __attribute__((__alloc_size__(__VA_ARGS__)))
+#else
+#  define _alloc_(...)
+#endif
+
+#if HAVE_ATTRIBUTE_FALLTHROUGH
+#  define _fallthrough_ __attribute__((__fallthrough__))
+#else
+#  define _fallthrough_
+#endif
+
 #if HAVE_ATTRIBUTE_RETAIN
 #  define _retain_ __attribute__((__retain__))
 #else
 #  define _retain_
 #endif
 
-#ifdef __clang__
-#  define _alloc_(...)
+#if HAVE_ATTRIBUTE_NO_REORDER
+#  define _no_reorder_ __attribute__((__no_reorder__))
 #else
-#  define _alloc_(...) __attribute__((__alloc_size__(__VA_ARGS__)))
-#endif
-
-#if defined(__clang__) && __clang_major__ < 10
-#  define _fallthrough_
-#else
-#  define _fallthrough_ __attribute__((__fallthrough__))
+#  define _no_reorder_
 #endif
 
 #if __GNUC__ >= 15
@@ -143,7 +150,6 @@
 
 #define XCONCATENATE(x, y) x ## y
 #define CONCATENATE(x, y) XCONCATENATE(x, y)
-#define CONCATENATE3(x, y, z) CONCATENATE(x, CONCATENATE(y, z))
 
 #define assert_cc(expr) _Static_assert(expr, #expr)
 
@@ -166,7 +172,7 @@
 #define U64_GB (UINT64_C(1024) * U64_MB)
 
 #undef MAX
-#define MAX(a, b) __MAX(UNIQ, (a), UNIQ, (b))
+#define MAX(a, b) __MAX(UNIQ, a, UNIQ, b)
 #define __MAX(aq, a, bq, b)                             \
         ({                                              \
                 const typeof(a) UNIQ_T(A, aq) = (a);    \
@@ -174,12 +180,14 @@
                 UNIQ_T(A, aq) > UNIQ_T(B, bq) ? UNIQ_T(A, aq) : UNIQ_T(B, bq); \
         })
 
-#ifdef __clang__
-#  define ABS(a) __builtin_llabs(a)
-#else
-#  define ABS(a) __builtin_imaxabs(a)
-#endif
-assert_cc(sizeof(long long) == sizeof(intmax_t));
+#define ABS(a) _Generic((a),                                            \
+                float:              __builtin_fabsf((float) (a)),       \
+                double:             __builtin_fabs((double) (a)),       \
+                long double:        __builtin_fabsl((long double) (a)), \
+                unsigned long long: (a),                                \
+                unsigned long:      (a),                                \
+                unsigned int:       (a),                                \
+                default:            __builtin_llabs((long long) (a)))
 
 #define IS_UNSIGNED_INTEGER_TYPE(type) \
         (__builtin_types_compatible_p(typeof(type), unsigned char) ||   \
@@ -222,13 +230,27 @@ assert_cc(sizeof(long long) == sizeof(intmax_t));
                 MAX(_d, a);                             \
         })
 
+#define MAX5(x, y, z, a, b)                             \
+        ({                                              \
+                const typeof(x) _e = MAX4(x, y, z, a);  \
+                MAX(_e, b);                             \
+        })
+
 #undef MIN
-#define MIN(a, b) __MIN(UNIQ, (a), UNIQ, (b))
+#define MIN(a, b) __MIN(UNIQ, a, UNIQ, b)
 #define __MIN(aq, a, bq, b)                             \
         ({                                              \
                 const typeof(a) UNIQ_T(A, aq) = (a);    \
                 const typeof(b) UNIQ_T(B, bq) = (b);    \
                 UNIQ_T(A, aq) < UNIQ_T(B, bq) ? UNIQ_T(A, aq) : UNIQ_T(B, bq); \
+        })
+
+#define ABS_DIFF(a, b) __ABS_DIFF(UNIQ, a, UNIQ, b)
+#define __ABS_DIFF(aq, a, bq, b)                        \
+        ({                                              \
+                const typeof(a) UNIQ_T(A, aq) = (a);    \
+                const typeof(b) UNIQ_T(B, bq) = (b);    \
+                UNIQ_T(A, aq) < UNIQ_T(B, bq) ? UNIQ_T(B, bq) - UNIQ_T(A, aq) : UNIQ_T(A, aq) - UNIQ_T(B, bq); \
         })
 
 /* evaluates to (void) if _A or _B are not constant or of different types */
@@ -258,6 +280,13 @@ assert_cc(sizeof(long long) == sizeof(intmax_t));
                         const typeof(x) _x = (x);                      \
                         CONST_ISPOWEROF2(_x);                          \
                 }))
+
+/* Returns the largest power of two that divides x (i.e. x's natural alignment in bytes), or 0 if x is 0. */
+#define NATURAL_ALIGNMENT(x)                                                    \
+        ({                                                                      \
+                const uint64_t _x = (x);                                        \
+                _x == 0 ? UINT64_C(0) : UINT64_C(1) << __builtin_ctzll(_x);     \
+        })
 
 #define ADD_SAFE(ret, a, b) (!__builtin_add_overflow(a, b, ret))
 #define INC_SAFE(a, b) __INC_SAFE(UNIQ, a, b)
@@ -301,7 +330,7 @@ assert_cc(sizeof(long long) == sizeof(intmax_t));
         })
 
 #undef CLAMP
-#define CLAMP(x, low, high) __CLAMP(UNIQ, (x), UNIQ, (low), UNIQ, (high))
+#define CLAMP(x, low, high) __CLAMP(UNIQ, x, UNIQ, low, UNIQ, high)
 #define __CLAMP(xq, x, lowq, low, highq, high)                          \
         ({                                                              \
                 const typeof(x) UNIQ_T(X, xq) = (x);                    \
@@ -318,7 +347,7 @@ assert_cc(sizeof(long long) == sizeof(intmax_t));
  * computation should be possible in the given type. Therefore, we use
  * [x / y + !!(x % y)]. Note that on "Real CPUs" a division returns both the
  * quotient and the remainder, so both should be equally fast. */
-#define DIV_ROUND_UP(x, y) __DIV_ROUND_UP(UNIQ, (x), UNIQ, (y))
+#define DIV_ROUND_UP(x, y) __DIV_ROUND_UP(UNIQ, x, UNIQ, y)
 #define __DIV_ROUND_UP(xq, x, yq, y)                                    \
         ({                                                              \
                 const typeof(x) UNIQ_T(X, xq) = (x);                    \
@@ -330,11 +359,11 @@ assert_cc(sizeof(long long) == sizeof(intmax_t));
 #define __ROUND_UP(q, x, y)                                             \
         ({                                                              \
                 const typeof(y) UNIQ_T(A, q) = (y);                     \
-                const typeof(x) UNIQ_T(B, q) = DIV_ROUND_UP((x), UNIQ_T(A, q)); \
+                const typeof(x) UNIQ_T(B, q) = DIV_ROUND_UP(x, UNIQ_T(A, q)); \
                 typeof(x) UNIQ_T(C, q);                                 \
                 MUL_SAFE(&UNIQ_T(C, q), UNIQ_T(B, q), UNIQ_T(A, q)) ? UNIQ_T(C, q) : (typeof(x)) -1; \
         })
-#define ROUND_UP(x, y) __ROUND_UP(UNIQ, (x), (y))
+#define ROUND_UP(x, y) __ROUND_UP(UNIQ, x, y)
 
 #define  CASE_F_1(X)      case X:
 #define  CASE_F_2(X, ...) case X:  CASE_F_1( __VA_ARGS__)

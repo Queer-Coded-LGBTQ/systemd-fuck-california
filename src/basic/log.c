@@ -557,7 +557,7 @@ static int write_to_syslog(
                 if (!syslog_is_stream)
                         break;
 
-                if (iovec_increment(iovec, ELEMENTSOF(iovec), n))
+                if (iovec_inc_many(iovec, ELEMENTSOF(iovec), n))
                         break;
         }
 
@@ -949,6 +949,9 @@ int log_format_iovec(
                 int error,
                 const char *format,
                 va_list ap) {
+
+        assert(iovec);
+        assert(n);
 
         while (format && *n + 1 < iovec_len) {
                 va_list aq;

@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <sys/stat.h>
 #include <sysexits.h>
 
@@ -10,14 +9,17 @@
 #include "build.h"
 #include "conf-files.h"
 #include "constants.h"
+#include "crypto-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "format-table.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
 #include "log.h"
 #include "main-func.h"
 #include "mkdir.h"
+#include "options.h"
 #include "parse-util.h"
 #include "pretty-print.h"
 #include "set.h"
@@ -38,94 +40,75 @@ STATIC_DESTRUCTOR_REGISTER(arg_tpm2_device, freep);
 #define TPM2_SRK_TPM2B_PUBLIC_PERSISTENT_PATH "/var/lib/systemd/tpm2-srk-public-key.tpm2b_public"
 #define TPM2_SRK_TPM2B_PUBLIC_RUNTIME_PATH "/run/systemd/tpm2-srk-public-key.tpm2b_public"
 
-static int help(int argc, char *argv[], void *userdata) {
+static int help(void) {
         _cleanup_free_ char *link = NULL;
+        _cleanup_(table_unrefp) Table *options = NULL;
         int r;
 
         r = terminal_urlify_man("systemd-tpm2-setup", "8", &link);
         if (r < 0)
                 return log_oom();
 
-        printf("%1$s [OPTIONS...]\n"
-               "\n%5$sSet up the TPM2 Storage Root Key (SRK), and initialize NvPCRs.%6$s\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help               Show this help\n"
-               "     --version            Show package version\n"
-               "     --tpm2-device=PATH\n"
-               "                          Pick TPM2 device\n"
-               "     --early=BOOL         Store SRK public key in /run/ rather than /var/lib/\n"
-               "     --graceful           Exit gracefully if no TPM2 device is found\n"
-               "\nSee the %2$s for details.\n",
+        r = option_parser_get_help_table(&options);
+        if (r < 0)
+                return r;
+
+        printf("%s [OPTIONS...]\n"
+               "\n%sSet up the TPM2 Storage Root Key (SRK), and initialize NvPCRs.%s\n"
+               "\n%sOptions:%s\n",
                program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
                ansi_highlight(),
+               ansi_normal(),
+               ansi_underline(),
                ansi_normal());
 
+        r = table_print_or_warn(options);
+        if (r < 0)
+                return r;
+
+        printf("\nSee the %s for details.\n", link);
         return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_TPM2_DEVICE,
-                ARG_EARLY,
-                ARG_GRACEFUL,
-        };
-
-        static const struct option options[] = {
-                { "help",        no_argument,       NULL, 'h'             },
-                { "version",     no_argument,       NULL, ARG_VERSION     },
-                { "tpm2-device", required_argument, NULL, ARG_TPM2_DEVICE },
-                { "early",       required_argument, NULL, ARG_EARLY       },
-                { "graceful",    no_argument,       NULL, ARG_GRACEFUL    },
-                {}
-        };
-
-        int c, r;
+        int r;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help(0, NULL, NULL);
+                OPTION_COMMON_HELP:
+                        return help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_TPM2_DEVICE:
-                        if (streq(optarg, "list"))
+                OPTION_LONG("tpm2-device", "PATH", "Pick TPM2 device"):
+                        if (streq(opts.arg, "list"))
                                 return tpm2_list_devices(/* legend= */ true, /* quiet= */ false);
 
-                        if (free_and_strdup(&arg_tpm2_device, streq(optarg, "auto") ? NULL : optarg) < 0)
+                        if (free_and_strdup(&arg_tpm2_device, streq(opts.arg, "auto") ? NULL : opts.arg) < 0)
                                 return log_oom();
-
                         break;
 
-                case ARG_EARLY:
-                        r = parse_boolean(optarg);
+                OPTION_LONG("early", "BOOL", "Store SRK public key in /run/ rather than /var/lib/"):
+                        r = parse_boolean(opts.arg);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --early= argument: %s", optarg);
+                                return log_error_errno(r, "Failed to parse --early= argument: %s", opts.arg);
 
                         arg_early = r;
                         break;
 
-                case ARG_GRACEFUL:
+                OPTION_LONG("graceful", NULL, "Exit gracefully if no TPM2 device is found"):
                         arg_graceful = true;
                         break;
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
                 }
 
-        if (optind != argc)
+        if (option_parser_get_n_args(&opts) != 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program expects no argument.");
 
         return 1;
@@ -144,7 +127,7 @@ static void public_key_data_done(struct public_key_data *d) {
         assert(d);
 
         if (d->pkey) {
-                EVP_PKEY_free(d->pkey);
+                sym_EVP_PKEY_free(d->pkey);
                 d->pkey = NULL;
         }
         if (d->public) {
@@ -165,7 +148,7 @@ static int public_key_make_fingerprint(struct public_key_data *d) {
         assert(!d->fingerprint);
         assert(!d->fingerprint_hex);
 
-        r = pubkey_fingerprint(d->pkey, EVP_sha256(), &d->fingerprint, &d->fingerprint_size);
+        r = pubkey_fingerprint(d->pkey, sym_EVP_sha256(), &d->fingerprint, &d->fingerprint_size);
         if (r < 0)
                 return log_error_errno(r, "Failed to calculate fingerprint of public key: %m");
 
@@ -337,7 +320,7 @@ static int setup_srk(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to open SRK public key file '%s' for writing: %m", pem_path);
 
-        if (PEM_write_PUBKEY(f, tpm2_key.pkey) <= 0)
+        if (sym_PEM_write_PUBKEY(f, tpm2_key.pkey) <= 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write SRK public key file '%s'.", pem_path);
 
         if (fchmod(fileno(f), 0444) < 0)
@@ -516,10 +499,14 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        if (arg_graceful && !tpm2_is_fully_supported()) {
+        if (arg_graceful && !tpm2_is_mostly_supported()) {
                 log_notice("No complete TPM2 support detected, exiting gracefully.");
                 return EXIT_SUCCESS;
         }
+
+        r = dlopen_libcrypto(LOG_ERR);
+        if (r < 0)
+                return r;
 
         umask(0022);
 
