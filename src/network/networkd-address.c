@@ -173,6 +173,8 @@ DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
 int address_new(Address **ret) {
         _cleanup_(address_unrefp) Address *address = NULL;
 
+        assert(ret);
+
         address = new(Address, 1);
         if (!address)
                 return -ENOMEM;
@@ -2475,6 +2477,9 @@ int network_drop_invalid_addresses(Network *network) {
                         return log_oom();
                 assert(r > 0);
         }
+
+        /* Detach duplicated entries now. */
+        duplicated_addresses = set_free(duplicated_addresses);
 
         r = network_adjust_dhcp_server(network, &addresses);
         if (r < 0)

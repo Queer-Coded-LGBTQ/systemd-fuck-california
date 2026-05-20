@@ -2,14 +2,20 @@
 
 libsystemd_network_sources = files(
         'arp-util.c',
+        'dhcp-client-send.c',
+        'dhcp-message.c',
+        'dhcp-message-dump.c',
         'dhcp-network.c',
         'dhcp-option.c',
         'dhcp-packet.c',
+        'dhcp-protocol.c',
+        'dhcp-route.c',
         'dhcp6-network.c',
         'dhcp6-option.c',
         'dhcp6-protocol.c',
         'icmp6-packet.c',
         'icmp6-util.c',
+        'ip-util.c',
         'lldp-neighbor.c',
         'lldp-network.c',
         'ndisc-option.c',
@@ -34,6 +40,7 @@ libsystemd_network_sources = files(
         'sd-ndisc-router.c',
         'sd-ndisc-router-solicit.c',
         'sd-radv.c',
+        'tlv-util.c',
 )
 
 sources += libsystemd_network_sources
@@ -74,6 +81,15 @@ executables += [
                 'sources' : files('test-dhcp-client.c'),
         },
         network_test_template + {
+                'sources' : files('test-dhcp-client-id.c'),
+        },
+        network_test_template + {
+                'sources' : files('test-dhcp-duid.c'),
+        },
+        network_test_template + {
+                'sources' : files('test-dhcp-message.c'),
+        },
+        network_test_template + {
                 'sources' : files('test-dhcp-option.c'),
         },
         network_test_template + {
@@ -81,6 +97,9 @@ executables += [
         },
         network_test_template + {
                 'sources' : files('test-dhcp6-client.c'),
+        },
+        network_test_template + {
+                'sources' : files('test-ip-util.c'),
         },
         network_test_template + {
                 'sources' : files('test-ipv4ll-manual.c'),
@@ -105,7 +124,7 @@ executables += [
                 'type' : 'manual',
         },
         network_test_template + {
-                'sources' : files('test-sd-dhcp-lease.c'),
+                'sources' : files('test-tlv-util.c'),
         },
         network_fuzz_template + {
                 'sources' : files('fuzz-dhcp-client.c'),

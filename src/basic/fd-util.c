@@ -166,6 +166,15 @@ int fd_nonblock(int fd, bool nonblock) {
         return 1;
 }
 
+void nonblock_resetp(int *fd) {
+        assert(fd);
+
+        PROTECT_ERRNO;
+
+        if (*fd >= 0)
+                (void) fd_nonblock(*fd, false);
+}
+
 int stdio_disable_nonblock(void) {
         int ret = 0;
 
@@ -868,6 +877,7 @@ int fd_reopen_condition(
 
         assert(fd >= 0);
         assert(!FLAGS_SET(flags, O_CREAT));
+        assert(ret_new_fd);
 
         /* Invokes fd_reopen(fd, flags), but only if the existing F_GETFL flags don't match the specified
          * flags (masked by the specified mask). This is useful for converting O_PATH fds into real fds if

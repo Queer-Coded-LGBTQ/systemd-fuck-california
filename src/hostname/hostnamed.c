@@ -20,9 +20,9 @@
 #include "constants.h"
 #include "daemon-util.h"
 #include "device-private.h"
+#include "device-util.h"
 #include "env-file.h"
 #include "env-util.h"
-#include "escape.h"
 #include "extract-word.h"
 #include "fileio.h"
 #include "hashmap.h"
@@ -230,20 +230,7 @@ static void context_read_os_release(Context *c) {
         if (free_and_strdup(&c->data[PROP_OS_PRETTY_NAME], os_release_pretty_name(os_pretty_name, os_name)) < 0)
                 log_oom();
 
-        if (!isempty(os_fancy_name)) {
-                _cleanup_free_ char *unescaped = NULL;
-
-                /* We undo one level of C escapes on this */
-                ssize_t l = cunescape(os_fancy_name, /* flags= */ 0, &unescaped);
-                if (l < 0) {
-                        log_warning_errno(l, "Failed to unescape fancy OS name, ignoring: %m");
-                        os_fancy_name = mfree(os_fancy_name);
-                } else if (!utf8_is_valid(unescaped)) {
-                        log_warning("Unescaped fancy OS name contains invalid UTF-8, ignoring.");
-                        os_fancy_name = mfree(os_fancy_name);
-                } else
-                        free_and_replace(os_fancy_name, unescaped);
-        }
+        unescape_fancy_name(&os_fancy_name);
 
         if (isempty(os_fancy_name)) {
                 free(os_fancy_name); /* free if empty string */
@@ -398,6 +385,8 @@ static int get_hardware_sku(Context *c, char **ret) {
         _cleanup_free_ char *model = NULL, *sku = NULL;
         int r;
 
+        assert(ret);
+
         r = get_dmi_property(c, "ID_SKU", &sku);
         if (r < 0)
                 return r;
@@ -418,6 +407,8 @@ static int get_hardware_sku(Context *c, char **ret) {
 static int get_hardware_version(Context *c, char **ret) {
         _cleanup_free_ char *version = NULL;
         int r;
+
+        assert(ret);
 
         r = get_dmi_property(c, "ID_HARDWARE_VERSION", &version);
         if (r < 0)
@@ -452,12 +443,14 @@ static int get_sysattr(sd_device *device, const char *key, char **ret) {
         if (!device)
                 return -ENODEV;
 
-        r = sd_device_get_sysattr_value(device, key, &s);
+        r = device_get_sysattr_safe_string(device, key, &s);
         if (r < 0)
-                return r;
+                return log_device_debug_errno(device, r, "Failed to read '%s' attribute: %m", key);
 
         if (!string_is_safe_for_dbus(s))
-                return -ENXIO;
+                return log_device_debug_errno(device, SYNTHETIC_ERRNO(ENXIO),
+                                              "'%s' attribute is not safe for exposing through DBus: %s",
+                                              key, s);
 
         return strdup_to(ret, empty_to_null(s));
 }
@@ -713,7 +706,7 @@ static const char* fallback_chassis_by_device_tree(Context *c) {
         if (!c->device_tree)
                 return NULL;
 
-        r = sd_device_get_sysattr_value(c->device_tree, "chassis-type", &type);
+        r = device_get_sysattr_safe_string(c->device_tree, "chassis-type", &type);
         if (r < 0) {
                 log_debug_errno(r, "Failed to read device-tree chassis type, ignoring: %m");
                 return NULL;
@@ -822,6 +815,8 @@ static int context_update_kernel_hostname(
 }
 
 static void unset_statp(struct stat **p) {
+        assert(p);
+
         if (!*p)
                 return;
 

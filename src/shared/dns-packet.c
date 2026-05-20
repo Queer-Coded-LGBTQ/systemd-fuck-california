@@ -120,6 +120,8 @@ int dns_packet_new(
                 a = min_alloc_dsize;
 
         /* round up to next page size */
+        /* Silence static analyzers */
+        assert(a <= SIZE_MAX - ALIGN(sizeof(DnsPacket)));
         a = PAGE_ALIGN(ALIGN(sizeof(DnsPacket)) + a) - ALIGN(sizeof(DnsPacket));
 
         /* make sure we never allocate more than useful */
@@ -226,6 +228,8 @@ int dns_packet_dup(DnsPacket **ret, DnsPacket *p) {
         if (r < 0)
                 return r;
 
+        /* Silence static analyzers */
+        assert(p->size <= SIZE_MAX - ALIGN(sizeof(DnsPacket)));
         c = malloc(ALIGN(sizeof(DnsPacket)) + p->size);
         if (!c)
                 return -ENOMEM;
@@ -1469,7 +1473,9 @@ int dns_packet_read_uint8(DnsPacket *p, uint8_t *ret, size_t *start) {
         if (r < 0)
                 return r;
 
-        *ret = ((uint8_t*) d)[0];
+        if (ret)
+                *ret = ((uint8_t*) d)[0];
+
         return 0;
 }
 
@@ -1499,7 +1505,8 @@ int dns_packet_read_uint32(DnsPacket *p, uint32_t *ret, size_t *start) {
         if (r < 0)
                 return r;
 
-        *ret = unaligned_read_be32(d);
+        if (ret)
+                *ret = unaligned_read_be32(d);
 
         return 0;
 }
@@ -1512,6 +1519,7 @@ int dns_packet_read_string(DnsPacket *p, char **ret, size_t *start) {
         int r;
 
         assert(p);
+        assert(ret);
 
         r = dns_packet_read_uint8(p, &c, NULL);
         if (r < 0)
@@ -2400,6 +2408,7 @@ static bool opt_is_good(DnsResourceRecord *rr, bool *rfc6975) {
          * a reply). */
 
         assert(rr);
+        assert(rfc6975);
         assert(rr->key->type == DNS_TYPE_OPT);
 
         /* Check that the version is 0 */
@@ -2440,6 +2449,8 @@ static int dns_packet_extract_question(DnsPacket *p, DnsQuestion **ret_question)
         unsigned n;
         int r;
 
+        assert(ret_question);
+
         n = DNS_PACKET_QDCOUNT(p);
         if (n > 0) {
                 question = dns_question_new(n);
@@ -2452,8 +2463,15 @@ static int dns_packet_extract_question(DnsPacket *p, DnsQuestion **ret_question)
                 if (!keys)
                         return log_oom();
 
-                r = set_reserve(keys, n * 2); /* Higher multipliers give slightly higher efficiency through
-                                               * hash collisions, but the gains quickly drop off after 2. */
+                /* Pre-allocate the question hashmap, but cap the pre-allocation to a number of questions the
+                 * packet can realistically contain. That is, pick the minimal value from the claimed number
+                 * of questions (n) and a maximum number of potential questions the remaining packet data can
+                 * actually contain: p->size - p->rindex are the remaining unread bytes in the packet, and 5U
+                 * is the minimum size of each question - 1 (QNAME) + 2 (QTYPE) + 2 (QCLASS).
+                 *
+                 * Note for the multiplication: higher multipliers give slightly higher efficiency through
+                 * hash collisions, but the gains quickly drop off after 2. */
+                r = set_reserve(keys, MIN(n, (p->size - p->rindex) / 5U) * 2);
                 if (r < 0)
                         return r;
 
@@ -2493,11 +2511,18 @@ static int dns_packet_extract_answer(DnsPacket *p, DnsAnswer **ret_answer) {
         bool bad_opt = false;
         int r;
 
+        assert(ret_answer);
+
         n = DNS_PACKET_RRCOUNT(p);
         if (n == 0)
                 return 0;
 
-        answer = dns_answer_new(n);
+        /* Pre-allocate the answer hashmap, but cap the pre-allocation to a number of RRs the packet can
+         * realistically contain. That is, pick the minimal value from the claimed number of RRs (n) and a
+         * maximum number of potential RRs the remaining packet data can actually contain: p->size -
+         * p->rindex are the remaining unread bytes in the packet, and the 11U is the minimum size of each RR
+         * - 1 (NAME) + 2 (TYPE) + 2 (CLASS) + 4 (TTL) + 2 (RDLENGTH). */
+        answer = dns_answer_new(MIN(n, (p->size - p->rindex) / 11U));
         if (!answer)
                 return -ENOMEM;
 
@@ -2848,7 +2873,7 @@ int dns_packet_ede_rcode(DnsPacket *p, int *ret_ede_rcode, char **ret_ede_msg) {
                                 return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
                                                        "EDNS0 truncated EDE info code.");
 
-                        r = make_cstring((char *) d + 6, length - 2U, MAKE_CSTRING_ALLOW_TRAILING_NUL, &msg);
+                        r = make_cstring(d + 6, length - 2U, MAKE_CSTRING_ALLOW_TRAILING_NUL, &msg);
                         if (r < 0)
                                 return log_debug_errno(r, "Invalid EDE text in opt.");
 
