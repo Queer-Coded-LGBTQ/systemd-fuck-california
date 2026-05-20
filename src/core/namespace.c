@@ -1049,7 +1049,7 @@ static bool verity_has_later_duplicates(MountList *ml, const MountEntry *needle)
         for (const MountEntry *m = needle + 1; m < ml->mounts + ml->n_mounts; m++) {
                 if (m->mode != MOUNT_EXTENSION_IMAGE)
                         continue;
-                if (iovec_memcmp(&m->verity.root_hash, &needle->verity.root_hash) == 0)
+                if (iovec_equal(&m->verity.root_hash, &needle->verity.root_hash))
                         return true;
         }
 
@@ -3250,17 +3250,14 @@ int bind_mount_add(BindMount **b, size_t *n, const BindMount *item) {
         return 0;
 }
 
-void mount_image_free_many(MountImage *m, size_t n) {
-        assert(m || n == 0);
-
-        FOREACH_ARRAY(i, m, n) {
-                free(i->source);
-                free(i->destination);
-                mount_options_free_all(i->mount_options);
-        }
-
-        free(m);
+static void mount_image_done(MountImage *m) {
+        assert(m);
+        m->source = mfree(m->source);
+        m->destination = mfree(m->destination);
+        m->mount_options = mount_options_free_all(m->mount_options);
 }
+
+DEFINE_ARRAY_FREE_FUNC(mount_image_free_array, MountImage, mount_image_done);
 
 int mount_image_add(MountImage **m, size_t *n, const MountImage *item) {
         _cleanup_free_ char *s = NULL, *d = NULL;
@@ -3665,7 +3662,7 @@ static int unpeel_get_fd(const char *mount_path, int *ret_fd) {
                         _exit(EXIT_FAILURE);
                 }
                 if (r > 0) {
-                        log_debug_errno(r, "'%s' is still an overlay after opening mount tree: %m", mount_path);
+                        log_debug("'%s' is still an overlay after opening mount tree", mount_path);
                         _exit(EXIT_FAILURE);
                 }
 
@@ -3987,7 +3984,7 @@ int refresh_extensions_in_namespace(
         if (r > 0)
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Target namespace is not separate, cannot reload extensions");
 
-        (void) dlopen_cryptsetup();
+        (void) dlopen_cryptsetup(LOG_DEBUG);
 
         extension_dir = path_join(p->private_namespace_dir, "unit-extensions");
         if (!extension_dir)

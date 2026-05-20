@@ -1,9 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <arpa/inet.h>
-
 #include "alloc-util.h"
-#include "dhcp-lease-internal.h"
 #include "hashmap.h"
 #include "hostname-setup.h"
 #include "network-internal.h"
@@ -11,6 +8,7 @@
 #include "networkd-route-util.h"
 #include "strv.h"
 #include "tests.h"
+#include "vrf.h"
 
 TEST(deserialize_in_addr) {
         _cleanup_free_ struct in_addr *addresses = NULL;
@@ -39,51 +37,6 @@ TEST(deserialize_in_addr) {
         ASSERT_TRUE(in6_addr_equal(&d.in6, &addresses6[0]));
         ASSERT_TRUE(in6_addr_equal(&e.in6, &addresses6[1]));
         ASSERT_TRUE(in6_addr_equal(&f.in6, &addresses6[2]));
-}
-
-TEST(deserialize_dhcp_routes) {
-        _cleanup_free_ struct sd_dhcp_route *routes = NULL;
-        size_t size;
-
-        ASSERT_OK(deserialize_dhcp_routes(&routes, &size, ""));
-        ASSERT_EQ(size, 0U);
-        ASSERT_NULL(routes);
-
-        ASSERT_OK(deserialize_dhcp_routes(&routes, &size, "192.168.0.0/16,192.168.0.1 10.1.2.0/24,10.1.2.1 0.0.0.0/0,10.0.1.1"));
-        ASSERT_EQ(size, 3U);
-        ASSERT_NOT_NULL(routes);
-
-        ASSERT_EQ(routes[0].dst_addr.s_addr, inet_addr("192.168.0.0"));
-        ASSERT_EQ(routes[0].gw_addr.s_addr, inet_addr("192.168.0.1"));
-        ASSERT_EQ(routes[0].dst_prefixlen, 16U);
-
-        ASSERT_EQ(routes[1].dst_addr.s_addr, inet_addr("10.1.2.0"));
-        ASSERT_EQ(routes[1].gw_addr.s_addr, inet_addr("10.1.2.1"));
-        ASSERT_EQ(routes[1].dst_prefixlen, 24U);
-
-        ASSERT_EQ(routes[2].dst_addr.s_addr, inet_addr("0.0.0.0"));
-        ASSERT_EQ(routes[2].gw_addr.s_addr, inet_addr("10.0.1.1"));
-        ASSERT_EQ(routes[2].dst_prefixlen, 0U);
-
-        routes = mfree(routes);
-
-        ASSERT_OK(deserialize_dhcp_routes(&routes, &size, "192.168.0.0/16,192.168.0.1 10.1.2.0#24,10.1.2.1 0.0.0.0/0,10.0.1.1"));
-        ASSERT_EQ(size, 2U);
-        ASSERT_NOT_NULL(routes);
-
-        ASSERT_EQ(routes[0].dst_addr.s_addr, inet_addr("192.168.0.0"));
-        ASSERT_EQ(routes[0].gw_addr.s_addr, inet_addr("192.168.0.1"));
-        ASSERT_EQ(routes[0].dst_prefixlen, 16U);
-
-        ASSERT_EQ(routes[1].dst_addr.s_addr, inet_addr("0.0.0.0"));
-        ASSERT_EQ(routes[1].gw_addr.s_addr, inet_addr("10.0.1.1"));
-        ASSERT_EQ(routes[1].dst_prefixlen, 0U);
-
-        routes = mfree(routes);
-
-        ASSERT_OK(deserialize_dhcp_routes(&routes, &size, "192.168.0.0/55,192.168.0.1 10.1.2.0#24,10.1.2.1 0.0.0.0/0,10.0.1.X"));
-        ASSERT_EQ(size, 0U);
-        ASSERT_NULL(routes);
 }
 
 static void test_route_tables_one(Manager *manager, const char *name, uint32_t number) {
@@ -148,6 +101,29 @@ TEST(route_tables) {
         test_route_tables_one(manager, "default", 253);
         test_route_tables_one(manager, "main", 254);
         test_route_tables_one(manager, "local", 255);
+}
+
+TEST(vrf_table) {
+        _cleanup_(manager_freep) Manager *manager = NULL;
+        Vrf vrf = {};
+
+        ASSERT_OK(manager_new(&manager, /* test_mode= */ true));
+        ASSERT_OK(manager_setup(manager));
+
+        vrf.meta.manager = manager;
+
+        ASSERT_OK(config_parse_vrf_table("netdev", "filename", 1, "VRF", 1, "Table", 0, "default", &vrf.table, &vrf));
+        ASSERT_EQ(vrf.table, 253U);
+
+        ASSERT_OK(config_parse_route_table_names("manager", "filename", 1, "section", 1, "RouteTable", 0, "vrf-test:1234", manager, manager));
+        ASSERT_OK(config_parse_vrf_table("netdev", "filename", 1, "VRF", 1, "Table", 0, "vrf-test", &vrf.table, &vrf));
+        ASSERT_EQ(vrf.table, 1234U);
+
+        ASSERT_OK(config_parse_vrf_table("netdev", "filename", 1, "VRF", 1, "Table", 0, "5678", &vrf.table, &vrf));
+        ASSERT_EQ(vrf.table, 5678U);
+
+        ASSERT_OK(config_parse_vrf_table("netdev", "filename", 1, "VRF", 1, "Table", 0, "no-such-table", &vrf.table, &vrf));
+        ASSERT_EQ(vrf.table, 5678U);
 }
 
 TEST(manager_enumerate) {

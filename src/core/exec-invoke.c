@@ -21,7 +21,7 @@
 #include "ask-password-api.h"
 #include "barrier.h"
 #include "bitfield.h"
-#include "bpf-dlopen.h"
+#include "bpf-util.h"
 #include "bpf-restrict-fs.h"
 #include "btrfs-util.h"
 #include "capability-util.h"
@@ -1086,14 +1086,11 @@ static int enforce_user(
 
 #if HAVE_PAM
 
-static void pam_response_free_array(struct pam_response *responses, size_t n_responses) {
-        assert(responses || n_responses == 0);
-
-        FOREACH_ARRAY(resp, responses, n_responses)
-                erase_and_free(resp->resp);
-
-        free(responses);
+static void pam_response_done(struct pam_response *response) {
+        erase_and_free(ASSERT_PTR(response)->resp);
 }
+
+static DEFINE_ARRAY_FREE_FUNC(pam_response_free_array, struct pam_response, pam_response_done);
 
 typedef struct AskPasswordConvData {
         const ExecContext *context;
@@ -1362,9 +1359,9 @@ static int setup_pam(
          * parent process will exec() the actual daemon. We do things this way to ensure that the main PID of
          * the daemon is the one we initially fork()ed. */
 
-        r = dlopen_libpam();
+        r = dlopen_libpam(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "PAM support not available: %m");
+                return r;
 
         r = barrier_create(&barrier);
         if (r < 0)
@@ -1628,7 +1625,7 @@ static bool seccomp_allows_drop_privileges(const ExecContext *c) {
         assert(c);
 
         /* No libseccomp, all is fine */
-        if (dlopen_libseccomp() < 0)
+        if (dlopen_libseccomp(LOG_DEBUG) < 0)
                 return true;
 
         /* No syscall filter, we are allowed to drop privileges */
@@ -1930,7 +1927,7 @@ static int apply_restrict_filesystems(const ExecContext *c, const ExecParameters
         }
 
         /* We are in a new binary, so dl-open again */
-        r = dlopen_bpf();
+        r = dlopen_bpf(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2034,7 +2031,7 @@ static int build_environment(
                 const char *shell,
                 dev_t journal_stream_dev,
                 ino_t journal_stream_ino,
-                const char *memory_pressure_path,
+                char *const *pressure_path,
                 bool needs_sandboxing,
                 char ***ret) {
 
@@ -2215,25 +2212,38 @@ static int build_environment(
         if (r < 0)
                 return r;
 
-        if (memory_pressure_path) {
-                r = strv_extend_joined_with_size(&e, &n, "MEMORY_PRESSURE_WATCH=", memory_pressure_path);
+        for (PressureResource t = 0; t < _PRESSURE_RESOURCE_MAX; t++) {
+                if (!pressure_path[t])
+                        continue;
+
+                const PressureResourceInfo *info = pressure_resource_get_info(t);
+
+                _cleanup_free_ char *env_watch = strjoin(info->env_watch, "=");
+                if (!env_watch)
+                        return -ENOMEM;
+
+                r = strv_extend_joined_with_size(&e, &n, env_watch, pressure_path[t]);
                 if (r < 0)
                         return r;
 
-                if (!path_equal(memory_pressure_path, "/dev/null")) {
+                if (!path_equal(pressure_path[t], "/dev/null")) {
                         _cleanup_free_ char *b = NULL, *x = NULL;
 
                         if (asprintf(&b, "%s " USEC_FMT " " USEC_FMT,
-                                     MEMORY_PRESSURE_DEFAULT_TYPE,
-                                     cgroup_context->memory_pressure_threshold_usec == USEC_INFINITY ? MEMORY_PRESSURE_DEFAULT_THRESHOLD_USEC :
-                                     CLAMP(cgroup_context->memory_pressure_threshold_usec, 1U, MEMORY_PRESSURE_DEFAULT_WINDOW_USEC),
-                                     MEMORY_PRESSURE_DEFAULT_WINDOW_USEC) < 0)
+                                     PRESSURE_DEFAULT_TYPE,
+                                     cgroup_context->pressure[t].threshold_usec == USEC_INFINITY ? PRESSURE_DEFAULT_THRESHOLD_USEC :
+                                     CLAMP(cgroup_context->pressure[t].threshold_usec, 1U, PRESSURE_DEFAULT_WINDOW_USEC),
+                                     PRESSURE_DEFAULT_WINDOW_USEC) < 0)
                                 return -ENOMEM;
 
                         if (base64mem(b, strlen(b) + 1, &x) < 0)
                                 return -ENOMEM;
 
-                        r = strv_extend_joined_with_size(&e, &n, "MEMORY_PRESSURE_WRITE=", x);
+                        _cleanup_free_ char *env_write = strjoin(info->env_write, "=");
+                        if (!env_write)
+                                return -ENOMEM;
+
+                        r = strv_extend_joined_with_size(&e, &n, env_write, x);
                         if (r < 0)
                                 return r;
                 }
@@ -2752,7 +2762,7 @@ static int create_many_symlinks(const char *root, const char *source, char **sym
         return 0;
 }
 
-static int set_exec_storage_quota(int fd, uint32_t proj_id, const QuotaLimit *ql) {
+static int set_exec_storage_quota(int fd, uint32_t proj_id, const ExecQuotaLimit *ql) {
         int r;
         uint64_t block_limit = 0, inode_limit = 0;
 
@@ -2842,7 +2852,7 @@ static int apply_exec_quotas(
                 const char *target_dir,
                 const char *cgroup_path,
                 ExecDirectoryType type,
-                const QuotaLimit *ql,
+                const ExecQuotaLimit *ql,
                 uint32_t *exec_dt_proj_id, /* in/out */
                 bool *already_enforced) {  /* in/out */
 
@@ -3855,7 +3865,7 @@ static int apply_mount_namespace(
                 const ExecParameters *params,
                 const ExecRuntime *runtime,
                 const PinnedResource *rootfs,
-                const char *memory_pressure_path,
+                char *const *pressure_path,
                 bool needs_sandboxing,
                 uid_t exec_directory_uid,
                 gid_t exec_directory_gid,
@@ -3887,16 +3897,28 @@ static int apply_mount_namespace(
         if (r < 0)
                 return r;
 
-        /* We need to make the pressure path writable even if /sys/fs/cgroups is made read-only, as the
-         * service will need to write to it in order to start the notifications. */
-        if (exec_is_cgroup_mount_read_only(context) && memory_pressure_path && !streq(memory_pressure_path, "/dev/null")) {
+        /* We need to make the pressure paths writable even if /sys/fs/cgroups is made read-only, as the
+         * service will need to write to them in order to start the notifications. */
+        bool need_pressure_rw = false;
+        for (PressureResource t = 0; t < _PRESSURE_RESOURCE_MAX; t++)
+                if (pressure_path[t] && !streq(pressure_path[t], "/dev/null")) {
+                        need_pressure_rw = true;
+                        break;
+                }
+
+        if (exec_is_cgroup_mount_read_only(context) && need_pressure_rw) {
                 read_write_paths_cleanup = strv_copy(context->read_write_paths);
                 if (!read_write_paths_cleanup)
                         return -ENOMEM;
 
-                r = strv_extend(&read_write_paths_cleanup, memory_pressure_path);
-                if (r < 0)
-                        return r;
+                for (PressureResource t = 0; t < _PRESSURE_RESOURCE_MAX; t++) {
+                        if (!pressure_path[t] || streq(pressure_path[t], "/dev/null"))
+                                continue;
+
+                        r = strv_extend(&read_write_paths_cleanup, pressure_path[t]);
+                        if (r < 0)
+                                return r;
+                }
 
                 read_write_paths = read_write_paths_cleanup;
         } else
@@ -4130,7 +4152,7 @@ static int apply_working_directory(
 
                 r = chase(wd,
                           runtime->ephemeral_copy ?: context->root_directory,
-                          CHASE_PREFIX_ROOT|CHASE_AT_RESOLVE_IN_ROOT|CHASE_TRIGGER_AUTOFS,
+                          CHASE_PREFIX_ROOT|CHASE_TRIGGER_AUTOFS,
                           /* ret_path= */ NULL,
                           &dfd);
                 if (r >= 0)
@@ -4689,7 +4711,7 @@ static int setup_delegated_namespaces(
                 const ExecRuntime *runtime,
                 const PinnedResource *rootfs,
                 bool delegate,
-                const char *memory_pressure_path,
+                char *const *pressure_path,
                 uid_t uid,
                 gid_t gid,
                 const ExecCommand *command,
@@ -4820,7 +4842,7 @@ static int setup_delegated_namespaces(
                                 params,
                                 runtime,
                                 rootfs,
-                                memory_pressure_path,
+                                pressure_path,
                                 needs_sandboxing,
                                 uid,
                                 gid,
@@ -4850,23 +4872,23 @@ static int setup_delegated_namespaces(
         return 0;
 }
 
-static int set_memory_thp(MemoryTHP thp) {
+static int set_memory_thp(ExecMemoryTHP thp) {
         int r;
 
         switch (thp) {
 
-        case MEMORY_THP_INHERIT:
+        case EXEC_MEMORY_THP_INHERIT:
                 return 0;
 
-        case MEMORY_THP_DISABLE:
+        case EXEC_MEMORY_THP_DISABLE:
                 r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0));
                 break;
 
-        case MEMORY_THP_MADVISE:
+        case EXEC_MEMORY_THP_MADVISE:
                 r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 1, PR_THP_DISABLE_EXCEPT_ADVISED, 0, 0));
                 break;
 
-        case MEMORY_THP_SYSTEM:
+        case EXEC_MEMORY_THP_SYSTEM:
                 r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0));
                 break;
 
@@ -5146,6 +5168,10 @@ static int setup_term_environment(const ExecContext *context, char ***env) {
         return strv_env_replace_strdup(env, "TERM=" FALLBACK_TERM);
 }
 
+static inline void free_pressure_paths(char *(*p)[_PRESSURE_RESOURCE_MAX]) {
+        free_many_charp(*p, _PRESSURE_RESOURCE_MAX);
+}
+
 int exec_invoke(
                 const ExecCommand *command,
                 const ExecContext *context,
@@ -5157,7 +5183,8 @@ int exec_invoke(
         _cleanup_strv_free_ char **our_env = NULL, **pass_env = NULL, **joined_exec_search_path = NULL, **accum_env = NULL;
         int r;
         const char *username = NULL, *groupname = NULL;
-        _cleanup_free_ char *home_buffer = NULL, *memory_pressure_path = NULL, *own_user = NULL;
+        _cleanup_free_ char *home_buffer = NULL, *own_user = NULL;
+        _cleanup_(free_pressure_paths) char *pressure_path[_PRESSURE_RESOURCE_MAX] = {};
         const char *pwent_home = NULL, *shell = NULL;
         dev_t journal_stream_dev = 0;
         ino_t journal_stream_ino = 0;
@@ -5684,11 +5711,11 @@ int exec_invoke(
         r = set_memory_thp(context->memory_thp);
         if (r == -EOPNOTSUPP)
                 log_debug_errno(r, "Setting MemoryTHP=%s is not supported, ignoring.",
-                                memory_thp_to_string(context->memory_thp));
+                                exec_memory_thp_to_string(context->memory_thp));
         else if (r < 0) {
                 *exit_status = EXIT_MEMORY_THP;
                 return log_error_errno(r, "Failed to set MemoryTHP=%s: %m",
-                                       memory_thp_to_string(context->memory_thp));
+                                       exec_memory_thp_to_string(context->memory_thp));
         }
 
 #if ENABLE_UTMP
@@ -5753,36 +5780,44 @@ int exec_invoke(
                 }
 
                 if (is_pressure_supported() > 0) {
-                        if (cgroup_context_want_memory_pressure(cgroup_context)) {
-                                r = cg_get_path(params->cgroup_path, "memory.pressure", &memory_pressure_path);
-                                if (r < 0) {
-                                        *exit_status = EXIT_MEMORY;
-                                        return log_oom();
-                                }
+                        for (PressureResource t = 0; t < _PRESSURE_RESOURCE_MAX; t++) {
+                                if (cgroup_context_want_pressure(cgroup_context, t)) {
+                                        _cleanup_free_ char *pressure_file = strjoin(pressure_resource_to_string(t), ".pressure");
+                                        if (!pressure_file) {
+                                                *exit_status = EXIT_MEMORY;
+                                                return log_oom();
+                                        }
 
-                                r = chmod_and_chown(memory_pressure_path, 0644, uid, gid);
-                                if (r < 0) {
-                                        log_full_errno(r == -ENOENT || ERRNO_IS_PRIVILEGE(r) ? LOG_DEBUG : LOG_WARNING, r,
-                                                       "Failed to adjust ownership of '%s', ignoring: %m", memory_pressure_path);
-                                        memory_pressure_path = mfree(memory_pressure_path);
-                                }
-                                /* First we use the current cgroup path to chmod and chown the memory pressure path, then pass the path relative
-                                 * to the cgroup namespace to environment variables and mounts. If chown/chmod fails, we should not pass memory
-                                 * pressure path environment variable or read-write mount to the unit. This is why we check if
-                                 * memory_pressure_path != NULL in the conditional below. */
-                                if (memory_pressure_path && needs_sandboxing && exec_needs_cgroup_namespace(context)) {
-                                        memory_pressure_path = mfree(memory_pressure_path);
-                                        r = cg_get_path("/", "memory.pressure", &memory_pressure_path);
+                                        r = cg_get_path(params->cgroup_path, pressure_file, &pressure_path[t]);
                                         if (r < 0) {
                                                 *exit_status = EXIT_MEMORY;
                                                 return log_oom();
                                         }
-                                }
-                        } else if (cgroup_context->memory_pressure_watch == CGROUP_PRESSURE_WATCH_NO) {
-                                memory_pressure_path = strdup("/dev/null"); /* /dev/null is explicit indicator for turning of memory pressure watch */
-                                if (!memory_pressure_path) {
-                                        *exit_status = EXIT_MEMORY;
-                                        return log_oom();
+
+                                        r = chmod_and_chown(pressure_path[t], 0644, uid, gid);
+                                        if (r < 0) {
+                                                log_full_errno(r == -ENOENT || ERRNO_IS_PRIVILEGE(r) ? LOG_DEBUG : LOG_WARNING, r,
+                                                               "Failed to adjust ownership of '%s', ignoring: %m", pressure_path[t]);
+                                                pressure_path[t] = mfree(pressure_path[t]);
+                                        }
+                                        /* First we use the current cgroup path to chmod and chown the pressure path, then pass the
+                                         * path relative to the cgroup namespace to environment variables and mounts. If chown/chmod
+                                         * fails, we should not pass pressure path environment variable or read-write mount to the
+                                         * unit. This is why we check if pressure_path[t] != NULL in the conditional below. */
+                                        if (pressure_path[t] && needs_sandboxing && exec_needs_cgroup_namespace(context)) {
+                                                pressure_path[t] = mfree(pressure_path[t]);
+                                                r = cg_get_path("/", pressure_file, &pressure_path[t]);
+                                                if (r < 0) {
+                                                        *exit_status = EXIT_MEMORY;
+                                                        return log_oom();
+                                                }
+                                        }
+                                } else if (cgroup_context->pressure[t].watch == CGROUP_PRESSURE_WATCH_NO) {
+                                        pressure_path[t] = strdup("/dev/null"); /* /dev/null is explicit indicator for turning off pressure watch */
+                                        if (!pressure_path[t]) {
+                                                *exit_status = EXIT_MEMORY;
+                                                return log_oom();
+                                        }
                                 }
                         }
                 }
@@ -5829,7 +5864,7 @@ int exec_invoke(
                         shell,
                         journal_stream_dev,
                         journal_stream_ino,
-                        memory_pressure_path,
+                        pressure_path,
                         needs_sandboxing,
                         &our_env);
         if (r < 0) {
@@ -5991,10 +6026,10 @@ int exec_invoke(
         }
 
         /* Load a bunch of libraries we'll possibly need later, before we turn off dlopen() */
-        (void) dlopen_bpf();
-        (void) dlopen_cryptsetup();
-        (void) dlopen_libmount();
-        (void) dlopen_libseccomp();
+        (void) dlopen_bpf(LOG_DEBUG);
+        (void) dlopen_cryptsetup(LOG_DEBUG);
+        (void) dlopen_libmount(LOG_DEBUG);
+        (void) dlopen_libseccomp(LOG_DEBUG);
 
         /* Let's now disable further dlopen()ing of libraries, since we are about to do namespace
          * shenanigans, and do not want to mix resources from host and namespace */
@@ -6047,7 +6082,7 @@ int exec_invoke(
                         runtime,
                         &rootfs,
                         /* delegate= */ false,
-                        memory_pressure_path,
+                        pressure_path,
                         uid,
                         gid,
                         command,
@@ -6144,7 +6179,7 @@ int exec_invoke(
                         runtime,
                         &rootfs,
                         /* delegate= */ true,
-                        memory_pressure_path,
+                        pressure_path,
                         uid,
                         gid,
                         command,
