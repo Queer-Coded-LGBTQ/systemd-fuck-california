@@ -174,6 +174,9 @@ char* ascii_strlower_n(char *s, size_t n) {
 
 int ascii_strcasecmp_n(const char *a, const char *b, size_t n) {
 
+        assert(a);
+        assert(b);
+
         for (; n > 0; a++, b++, n--) {
                 int x, y;
 
@@ -276,6 +279,10 @@ static bool string_has_ansi_sequence(const char *s, size_t len) {
 }
 
 static size_t previous_ansi_sequence(const char *s, size_t length, const char **ret_where) {
+
+        assert(s);
+        assert(ret_where);
+
         /* Locate the previous ANSI sequence and save its start in *ret_where and return length. */
 
         for (size_t i = length - 2; i > 0; i--) {  /* -2 because at least two bytes are needed */
@@ -660,6 +667,7 @@ char* strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
 
         assert(ibuf);
         assert(*ibuf);
+        POINTER_MAY_BE_NULL(_isz);
 
         /* This does three things:
          *
@@ -969,22 +977,27 @@ oom:
         return -ENOMEM;
 }
 
-char* strrep(const char *s, unsigned n) {
-        char *r, *p;
+char* strrep(const char *s, size_t n) {
+        char *ret, *p;
         size_t l;
 
         assert(s);
 
         l = strlen(s);
-        p = r = malloc(l * n + 1);
-        if (!r)
+        if (!MUL_ASSIGN_SAFE(&l, n))
+                return NULL;
+        if (!INC_SAFE(&l, 1))
                 return NULL;
 
-        for (unsigned i = 0; i < n; i++)
+        p = ret = malloc(l);
+        if (!ret)
+                return NULL;
+
+        for (size_t i = 0; i < n; i++)
                 p = stpcpy(p, s);
 
         *p = 0;
-        return r;
+        return ret;
 }
 
 int split_pair(const char *s, const char *sep, char **ret_first, char **ret_second) {
@@ -1086,25 +1099,44 @@ int strdup_to_full(char **ret, const char *src) {
         }
 };
 
-bool string_is_safe(const char *p) {
-        if (!p)
+bool string_is_safe(const char *p, StringSafeFlags flags) {
+
+        /* Baseline checks are:
+         *   • No control characters (i.e. 0…31 + 127)
+         *   • UTF-8 valid (well, technically we skip this test if STRING_ASCII is set, since that is a tighter test)
+         */
+
+        if (FLAGS_SET(flags, STRING_ALLOW_EMPTY) ? !p : isempty(p))
                 return false;
 
-        /* Checks if the specified string contains no quotes or control characters */
+        if (!FLAGS_SET(flags, STRING_ASCII) && !utf8_is_valid(p))
+                return false;
 
         for (const char *t = p; *t; t++) {
-                if (*t > 0 && *t < ' ') /* no control characters */
+                /* never allow control characters, except for new line */
+                if ((*t > 0 && *t < ' ' && *t != '\n') || *t == 0x7f)
                         return false;
 
-                if (strchr(QUOTES "\\\x7f", *t))
+                if (!FLAGS_SET(flags, STRING_ALLOW_NEWLINES) && *t == '\n')
+                        return false;
+
+                if (!FLAGS_SET(flags, STRING_ALLOW_BACKSLASHES) && *t == '\\')
+                        return false;
+
+                if (!FLAGS_SET(flags, STRING_ALLOW_QUOTES) && strchr(QUOTES, *t))
+                        return false;
+
+                if (!FLAGS_SET(flags, STRING_ALLOW_GLOBS) && strchr(GLOB_CHARS, *t))
+                        return false;
+
+                if (FLAGS_SET(flags, STRING_ASCII) && (uint8_t) *t >= 0x80)
                         return false;
         }
 
-        return true;
-}
+        if (FLAGS_SET(flags, STRING_FILENAME) && !filename_is_valid(p))
+                return false;
 
-bool string_is_safe_ascii(const char *p) {
-        return ascii_is_valid(p) && string_is_safe(p);
+        return true;
 }
 
 char* str_realloc(char *p) {
@@ -1133,6 +1165,7 @@ int string_truncate_lines(const char *s, size_t n_lines, char **ret) {
         size_t n = 0;
 
         assert(s);
+        assert(ret);
 
         /* Truncate after the specified number of lines. Returns > 0 if a truncation was applied or == 0 if
          * there were fewer lines in the string anyway. Trailing newlines on input are ignored, and not
@@ -1186,6 +1219,8 @@ int string_truncate_lines(const char *s, size_t n_lines, char **ret) {
 int string_extract_line(const char *s, size_t i, char **ret) {
         const char *p = s;
         size_t c = 0;
+
+        assert(ret);
 
         /* Extract the i'nth line from the specified string. Returns > 0 if there are more lines after that,
          * and == 0 if we are looking at the last line or already beyond the last line. As special
@@ -1276,7 +1311,7 @@ char* string_replace_char(char *str, char old_char, char new_char) {
         return str;
 }
 
-int make_cstring(const char *s, size_t n, MakeCStringMode mode, char **ret) {
+int make_cstring(const void *s, size_t n, MakeCStringMode mode, char **ret) {
         char *b;
 
         assert(s || n == 0);
@@ -1295,11 +1330,11 @@ int make_cstring(const char *s, size_t n, MakeCStringMode mode, char **ret) {
 
                 b = new0(char, 1);
         } else {
-                const char *nul;
+                const uint8_t *nul;
 
                 nul = memchr(s, 0, n);
                 if (nul) {
-                        if (nul < s + n - 1 || /* embedded NUL? */
+                        if (nul < (const uint8_t*) s + n - 1 || /* embedded NUL? */
                             mode == MAKE_CSTRING_REFUSE_TRAILING_NUL)
                                 return -EINVAL;
 
@@ -1503,15 +1538,30 @@ char* strrstr_internal(const char *haystack, const char *needle) {
 
         /* Special case: for the empty string we return the very last possible occurrence, i.e. *after* the
          * last char, not before. */
-        if (*needle == 0)
+        if (needle[0] == 0)
                 return (char*) strchr(haystack, 0);
+
+        /* Special case: for single character strings, just use optimized strrchr() */
+        if (needle[1] == 0)
+                return (char*) strrchr(haystack, needle[0]);
 
         for (const char *p = strstr(haystack, needle), *q; p; p = q) {
                 q = strstr(p + 1, needle);
                 if (!q)
-                        return (char *) p;
+                        return (char*) p;
         }
         return NULL;
+}
+
+char* strrstr_no_case_internal(const char *haystack, const char *needle) {
+        if (!haystack || !needle)
+                return NULL;
+
+        for (const char *p = strchr(haystack, 0); p > haystack; p--)
+                if (startswith_no_case(p, needle))
+                        return (char*) p;
+
+        return startswith_no_case(haystack, needle) ? (char*) haystack : NULL;
 }
 
 size_t str_common_prefix(const char *a, const char *b) {

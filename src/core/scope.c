@@ -483,6 +483,8 @@ static int scope_get_timeout(Unit *u, usec_t *timeout) {
         usec_t t;
         int r;
 
+        assert(timeout);
+
         if (!s->timer_event_source)
                 return 0;
 
@@ -742,6 +744,7 @@ const UnitVTable scope_vtable = {
         .can_fail = true,
         .once_only = true,
         .can_set_managed_oom = true,
+        .track_orphaned = true,
 
         .init = scope_init,
         .load = scope_load,

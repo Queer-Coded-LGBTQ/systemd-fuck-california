@@ -30,7 +30,7 @@
 #include "ip-protocol-list.h"
 #include "log.h"
 #include "manager.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "namespace-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -2026,6 +2026,7 @@ static int socket_chown(Socket *s, PidRef *ret_pid) {
         int r;
 
         assert(s);
+        assert(ret_pid);
 
         r = socket_arm_timer(s, /* relative= */ true, s->timeout_usec);
         if (r < 0)
@@ -3525,6 +3526,8 @@ static int socket_get_timeout(Unit *u, usec_t *timeout) {
         usec_t t;
         int r;
 
+        assert(timeout);
+
         if (!s->timer_event_source)
                 return 0;
 
@@ -3723,6 +3726,7 @@ const UnitVTable socket_vtable = {
         .can_transient = true,
         .can_trigger = true,
         .can_fail = true,
+        .track_orphaned = true,
 
         .init = socket_init,
         .done = socket_done,
