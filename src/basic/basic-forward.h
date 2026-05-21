@@ -69,6 +69,15 @@ struct fdisk_context;
 struct fdisk_table;
 struct crypt_device;
 
+typedef struct buf_mem_st BUF_MEM;
+typedef struct evp_pkey_st EVP_PKEY;
+typedef struct evp_md_st EVP_MD;
+typedef struct evp_md_ctx_st EVP_MD_CTX;
+typedef struct ssl_st SSL;
+typedef struct ssl_ctx_st SSL_CTX;
+typedef struct ssl_session_st SSL_SESSION;
+typedef struct x509_st X509;
+
 /* basic/ forward declarations */
 
 typedef void (*hash_func_t)(const void *p, struct siphash *state);
@@ -94,6 +103,7 @@ typedef enum Glyph Glyph;
 typedef enum ImageClass ImageClass;
 typedef enum JobMode JobMode;
 typedef enum RuntimeScope RuntimeScope;
+typedef enum StringSafeFlags StringSafeFlags;
 typedef enum TimestampStyle TimestampStyle;
 typedef enum UnitActiveState UnitActiveState;
 typedef enum UnitDependency UnitDependency;
@@ -111,6 +121,7 @@ typedef struct Set Set;
 
 typedef struct dual_timestamp dual_timestamp;
 typedef struct triple_timestamp triple_timestamp;
+typedef struct Compressor Compressor;
 typedef struct ConfFile ConfFile;
 typedef struct LockFile LockFile;
 typedef struct PidRef PidRef;
@@ -143,3 +154,7 @@ typedef struct SocketAddress SocketAddress;
 
 /* MAX_ERRNO is defined as 4095 in linux/err.h. We use the same value here. */
 #define ERRNO_MAX               4095
+
+/* This is MAX_ADDR_LEN as defined in linux/netdevice.h, but net/if_arp.h
+ * defines a macro of the same name with a much lower size. */
+#define HW_ADDR_MAX_SIZE 32

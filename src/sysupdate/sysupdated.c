@@ -24,7 +24,6 @@
 #include "escape.h"
 #include "event-util.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "format-util.h"
 #include "hashmap.h"
 #include "log.h"
@@ -246,8 +245,13 @@ static int job_parse_child_output(int _fd, sd_json_variant **ret) {
                 return 0;
         }
 
-        r = sd_json_parse_file_at(/* f= */ NULL, fd, /* path= */ NULL, /* flags= */ 0,
-                                  &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
+        r = sd_json_parse_fd(
+                        /* path= */ "stdout",
+                        TAKE_FD(fd),
+                        SD_JSON_PARSE_DONATE_FD|SD_JSON_PARSE_SEEK0,
+                        &v,
+                        /* reterr_line= */ NULL,
+                        /* reterr_column= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse child output as JSON: %m");
 
@@ -771,7 +775,6 @@ static int target_new(Manager *m, TargetClass class, const char *name, const cha
 static int sysupdate_run_simple(sd_json_variant **ret, Target *t, ...) {
         _cleanup_close_pair_ int pipe[2] = EBADF_PAIR;
         _cleanup_(pidref_done_sigkill_wait) PidRef pid = PIDREF_NULL;
-        _cleanup_fclose_ FILE *f = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_free_ char *target_arg = NULL;
         int r;
@@ -845,11 +848,14 @@ static int sysupdate_run_simple(sd_json_variant **ret, Target *t, ...) {
         }
 
         pipe[1] = safe_close(pipe[1]);
-        f = take_fdopen(&pipe[0], "r");
-        if (!f)
-                return -errno;
 
-        r = sd_json_parse_file(f, "stdout", 0, &v, NULL, NULL);
+        r = sd_json_parse_fd(
+                        "stdout",
+                        TAKE_FD(pipe[0]),
+                        SD_JSON_PARSE_DONATE_FD,
+                        &v,
+                        /* reterr_line= */ NULL,
+                        /* reterr_column= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse JSON: %m");
 
@@ -977,8 +983,8 @@ static int target_method_describe(sd_bus_message *msg, void *userdata, sd_bus_er
         if (r < 0)
                 return r;
 
-        if (isempty(version))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Version must be specified");
+        if (!version_is_valid(version))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
 
         if ((flags & ~SD_SYSUPDATE_FLAGS_ALL) != 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid flags specified");
@@ -1126,8 +1132,12 @@ static int target_method_acquire(sd_bus_message *msg, void *userdata, sd_bus_err
          * an update anyway. */
         if (isempty(version))
                 action = "org.freedesktop.sysupdate1.update";
-        else
+        else {
+                if (!version_is_valid(version))
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
+
                 action = "org.freedesktop.sysupdate1.update-to-version";
+        }
 
         const char *details[] = {
                 "class", target_class_to_string(t->class),
@@ -1210,8 +1220,12 @@ static int target_method_install(sd_bus_message *msg, void *userdata, sd_bus_err
          * an update anyway. */
         if (isempty(version))
                 action = "org.freedesktop.sysupdate1.update";
-        else
+        else {
+                if (!version_is_valid(version))
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
+
                 action = "org.freedesktop.sysupdate1.update-to-version";
+        }
 
         const char *details[] = {
                 "class", target_class_to_string(t->class),
@@ -1326,7 +1340,9 @@ static int target_method_get_version(sd_bus_message *msg, void *userdata, sd_bus
 
         version_json = sd_json_variant_by_key(v, "current");
         if (!version_json)
-                return log_sysupdate_bad_json(SYNTHETIC_ERRNO(EPROTO), "list", "Missing key 'current'");
+                version_json = sd_json_variant_by_key(v, "current+pending");
+        if (!version_json)
+                return log_sysupdate_bad_json(SYNTHETIC_ERRNO(EPROTO), "list", "Missing key 'current' or 'current+pending'");
 
         if (sd_json_variant_is_null(version_json))
                 return sd_bus_reply_method_return(msg, "s", "");
@@ -1417,6 +1433,19 @@ static int target_method_list_features(sd_bus_message *msg, void *userdata, sd_b
         return sd_bus_message_send(reply);
 }
 
+static bool feature_name_is_valid(const char *name) {
+        if (isempty(name))
+                return false;
+
+        if (!ascii_is_valid(name))
+                return false;
+
+        if (!filename_is_valid(strjoina(name, ".feature.d")))
+                return false;
+
+        return true;
+}
+
 static int target_method_describe_feature(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
         Target *t = ASSERT_PTR(userdata);
         _cleanup_(job_freep) Job *j = NULL;
@@ -1430,8 +1459,8 @@ static int target_method_describe_feature(sd_bus_message *msg, void *userdata, s
         if (r < 0)
                 return r;
 
-        if (isempty(feature))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Feature must be specified");
+        if (!feature_name_is_valid(feature))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid feature name");
 
         if (flags != 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Flags must be 0");
@@ -1450,19 +1479,6 @@ static int target_method_describe_feature(sd_bus_message *msg, void *userdata, s
         TAKE_PTR(j); /* Avoid job from being killed & freed */
 
         return 1;
-}
-
-static bool feature_name_is_valid(const char *name) {
-        if (isempty(name))
-                return false;
-
-        if (!ascii_is_valid(name))
-                return false;
-
-        if (!filename_is_valid(strjoina(name, ".feature.d")))
-                return false;
-
-        return true;
 }
 
 static int target_method_set_feature_enabled(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
@@ -1871,6 +1887,9 @@ static int manager_enumerate_image_class(Manager *m, TargetClass class) {
 
                 if (image_is_host(image))
                         continue; /* We already enroll the host ourselves */
+
+                if (image->type == IMAGE_MSTACK)
+                        continue; /* systemd-sysupdate doesn't support mstack images yet */
 
                 r = target_new(m, class, image->name, image->path, &t);
                 if (r < 0)
