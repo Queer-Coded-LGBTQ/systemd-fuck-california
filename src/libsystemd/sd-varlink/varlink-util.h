@@ -28,6 +28,6 @@ int varlink_server_new(
 
 int varlink_check_privileged_peer(sd_varlink *vl);
 
-int varlink_set_sentinel(sd_varlink *v, const char *error_id);
-
 extern const struct hash_ops varlink_hash_ops;
+
+ssize_t varlink_execute_directory(const char *path, const char *method, sd_json_variant *parameters, bool more, usec_t timeout_usec, sd_varlink_reply_t reply, void *userdata);

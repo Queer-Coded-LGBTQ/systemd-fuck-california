@@ -669,19 +669,22 @@ static int do_shovel(PTYForward *f) {
 
                                 f->stdin_event_source = sd_event_source_unref(f->stdin_event_source);
                         } else {
-                                /* Check if ^] has been pressed three times within one second. If we get this we quite
-                                 * immediately. */
-                                RequestOperation q = look_for_escape(f, f->in_buffer + f->in_buffer_full, k);
-                                f->in_buffer_full += (size_t) k;
-                                if (q < 0)
-                                        return q;
-                                if (q == REQUEST_EXIT)
-                                        return -ECANCELED;
-                                if (q >= REQUEST_HOTKEY_A && q <= REQUEST_HOTKEY_Z && f->hotkey_handler) {
-                                        r = f->hotkey_handler(f, q - REQUEST_HOTKEY_BASE, f->hotkey_userdata);
-                                        if (r < 0)
-                                                return r;
-                                }
+                                if (!FLAGS_SET(f->flags, PTY_FORWARD_TRANSPARENT)) {
+                                        /* Check if ^] has been pressed three times within one second. If we get this we quit
+                                         * immediately. */
+                                        RequestOperation q = look_for_escape(f, f->in_buffer + f->in_buffer_full, k);
+                                        f->in_buffer_full += (size_t) k;
+                                        if (q < 0)
+                                                return q;
+                                        if (q == REQUEST_EXIT)
+                                                return -ECANCELED;
+                                        if (q >= REQUEST_HOTKEY_A && q <= REQUEST_HOTKEY_Z && f->hotkey_handler) {
+                                                r = f->hotkey_handler(f, q - REQUEST_HOTKEY_BASE, f->hotkey_userdata);
+                                                if (r < 0)
+                                                        return r;
+                                        }
+                                } else
+                                        f->in_buffer_full += (size_t) k;
                         }
 
                         did_something = true;
@@ -930,6 +933,24 @@ int pty_forward_new(
 
         assert(master >= 0);
         assert(ret);
+
+        if (!FLAGS_SET(flags, PTY_FORWARD_READ_ONLY)) {
+                /* If stdin isn't actually opened for reading, or refers to the read end of a pipe (or
+                 * socket) whose peer has already hung up, then there's nothing for us to forward — imply
+                 * read-only mode. */
+                r = RET_NERRNO(fcntl(STDIN_FILENO, F_GETFL));
+                if (r < 0 && r != -EBADF)
+                        return log_debug_errno(errno, "Failed to query stdin flags: %m");
+                if (r == -EBADF || (r & O_ACCMODE_STRICT) == O_WRONLY)
+                        flags |= PTY_FORWARD_READ_ONLY;
+                else {
+                        r = pipe_eof(STDIN_FILENO);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to check whether stdin is at EOF, ignoring: %m");
+                        else if (r > 0)
+                                flags |= PTY_FORWARD_READ_ONLY;
+                }
+        }
 
         f = new(PTYForward, 1);
         if (!f)

@@ -7,6 +7,7 @@
 
 #include "conf-parser.h"
 #include "dhcp-protocol.h"
+#include "dhcp-server-internal.h"
 #include "dhcp-server-lease-internal.h"
 #include "dns-domain.h"
 #include "errno-util.h"
@@ -326,6 +327,7 @@ void manager_toggle_dhcp4_server_state(Manager *manager, bool start) {
 
 static int dhcp_server_find_uplink(Link *link, Link **ret) {
         assert(link);
+        assert(ret);
 
         if (link->network->dhcp_server_uplink_name)
                 return link_get_by_name(link->manager, link->network->dhcp_server_uplink_name, ret);
@@ -455,6 +457,9 @@ static int dhcp4_server_parse_dns_server_string_and_warn(
                 struct in_addr **addresses,
                 size_t *n_addresses) {
 
+        assert(addresses);
+        assert(n_addresses);
+
         for (;;) {
                 _cleanup_free_ char *word = NULL, *server_name = NULL;
                 union in_addr_union address;
@@ -563,7 +568,6 @@ static int dhcp_server_set_domain(Link *link) {
 
 static int dhcp4_server_configure(Link *link) {
         bool acquired_uplink = false;
-        sd_dhcp_option *p;
         DHCPStaticLease *static_lease;
         Link *uplink = NULL;
         Address *address;
@@ -717,21 +721,13 @@ static int dhcp4_server_configure(Link *link) {
         else if (r < 0)
                 return log_link_error_errno(link, r, "Failed to set domain name for DHCP server: %m");
 
-        ORDERED_HASHMAP_FOREACH(p, link->network->dhcp_server_send_options) {
-                r = sd_dhcp_server_add_option(link->dhcp_server, p);
-                if (r == -EEXIST)
-                        continue;
-                if (r < 0)
-                        return log_link_error_errno(link, r, "Failed to set DHCPv4 option: %m");
-        }
+        r = dhcp_server_set_extra_options(link->dhcp_server, &link->network->dhcp_server_extra_options);
+        if (r < 0)
+                return log_link_error_errno(link, r, "Failed to set DHCPv4 extra options: %m");
 
-        ORDERED_HASHMAP_FOREACH(p, link->network->dhcp_server_send_vendor_options) {
-                r = sd_dhcp_server_add_vendor_option(link->dhcp_server, p);
-                if (r == -EEXIST)
-                        continue;
-                if (r < 0)
-                        return log_link_error_errno(link, r, "Failed to set DHCPv4 option: %m");
-        }
+        r = dhcp_server_set_vendor_options(link->dhcp_server, &link->network->dhcp_server_vendor_options);
+        if (r < 0)
+                return log_link_error_errno(link, r, "Failed to set DHCPv4 vendor options: %m");
 
         HASHMAP_FOREACH(static_lease, link->network->dhcp_static_leases_by_section) {
                 r = sd_dhcp_server_set_static_lease(

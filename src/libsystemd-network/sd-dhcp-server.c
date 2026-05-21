@@ -16,11 +16,12 @@
 #include "dns-domain.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "hashmap.h"
 #include "in-addr-util.h"
 #include "iovec-util.h"
+#include "iovec-wrapper.h"
 #include "memory-util.h"
 #include "network-common.h"
-#include "ordered-set.h"
 #include "path-util.h"
 #include "siphash24.h"
 #include "socket-util.h"
@@ -118,7 +119,7 @@ int sd_dhcp_server_is_in_relay_mode(sd_dhcp_server *server) {
         return in4_addr_is_set(&server->relay_target);
 }
 
-static sd_dhcp_server *dhcp_server_free(sd_dhcp_server *server) {
+static sd_dhcp_server* dhcp_server_free(sd_dhcp_server *server) {
         assert(server);
 
         sd_dhcp_server_stop(server);
@@ -138,8 +139,8 @@ static sd_dhcp_server *dhcp_server_free(sd_dhcp_server *server) {
         server->static_leases_by_address = hashmap_free(server->static_leases_by_address);
         server->static_leases_by_client_id = hashmap_free(server->static_leases_by_client_id);
 
-        ordered_set_free(server->extra_options);
-        ordered_set_free(server->vendor_options);
+        tlv_unref(server->extra_options);
+        tlv_unref(server->vendor_options);
 
         free(server->agent_circuit_id);
         free(server->agent_remote_id);
@@ -235,7 +236,7 @@ int sd_dhcp_server_detach_event(sd_dhcp_server *server) {
         return 0;
 }
 
-sd_event *sd_dhcp_server_get_event(sd_dhcp_server *server) {
+sd_event* sd_dhcp_server_get_event(sd_dhcp_server *server) {
         assert_return(server, NULL);
 
         return server->event;
@@ -271,7 +272,9 @@ int sd_dhcp_server_set_boot_server_name(sd_dhcp_server *server, const char *name
 int sd_dhcp_server_set_boot_filename(sd_dhcp_server *server, const char *filename) {
         assert_return(server, -EINVAL);
 
-        if (filename && !string_is_safe_ascii(filename))
+        if (isempty(filename))
+                filename = NULL;
+        else if (!string_is_safe(filename, STRING_ASCII|STRING_ALLOW_GLOBS))
                 return -EINVAL;
 
         return free_and_strdup(&server->boot_filename, filename);
@@ -320,6 +323,7 @@ static int dhcp_server_send_unicast_raw(
                 .ll.sll_ifindex = server->ifindex,
                 .ll.sll_halen = hlen,
         };
+        int r;
 
         assert(server);
         assert(server->ifindex > 0);
@@ -334,11 +338,24 @@ static int dhcp_server_send_unicast_raw(
         if (len > UINT16_MAX)
                 return -EOVERFLOW;
 
-        dhcp_packet_append_ip_headers(packet, server->address, DHCP_PORT_SERVER,
-                                      packet->dhcp.yiaddr,
-                                      DHCP_PORT_CLIENT, len, -1);
+        r = dhcp_packet_append_ip_headers(
+                        packet,
+                        server->address,
+                        DHCP_PORT_SERVER,
+                        packet->dhcp.yiaddr,
+                        DHCP_PORT_CLIENT,
+                        len,
+                        /* ip_service_type= */ -1);
+        if (r < 0)
+                return r;
 
-        return dhcp_network_send_raw_socket(server->fd_raw, &link, packet, len);
+        return dhcp_network_send_raw_socket(
+                        server->fd_raw,
+                        &link,
+                        &(struct iovec_wrapper) {
+                                .iovec = &IOVEC_MAKE(packet, len),
+                                .count = 1,
+                        });
 }
 
 static int dhcp_server_send_udp(sd_dhcp_server *server, be32_t destination,
@@ -608,7 +625,6 @@ static int server_send_offer_or_ack(
         };
 
         _cleanup_free_ DHCPPacket *packet = NULL;
-        sd_dhcp_option *j;
         be32_t lease_time;
         size_t offset;
         int r;
@@ -708,18 +724,31 @@ static int server_send_offer_or_ack(
                         return r;
         }
 
-        ORDERED_SET_FOREACH(j, server->extra_options) {
-                r = dhcp_option_append(&packet->dhcp, req->max_optlen, &offset, 0,
-                                       j->option, j->length, j->data);
-                if (r < 0)
-                        return r;
+        if (server->extra_options) {
+                void *key;
+                struct iovec_wrapper *iovw;
+                HASHMAP_FOREACH_KEY(iovw, key, server->extra_options->entries) {
+                        uint32_t tag = PTR_TO_UINT32(key);
+
+                        FOREACH_ARRAY(iov, iovw->iovec, iovw->count) {
+                                r = dhcp_option_append(&packet->dhcp, req->max_optlen, &offset, 0,
+                                                       tag, iov->iov_len, iov->iov_base);
+                                if (r < 0)
+                                        return r;
+                        }
+                }
         }
 
-        if (!ordered_set_isempty(server->vendor_options)) {
+        if (!tlv_isempty(server->vendor_options)) {
+                _cleanup_(iovec_done) struct iovec iov = {};
+                r = tlv_build(server->vendor_options, &iov);
+                if (r < 0)
+                        return r;
+
                 r = dhcp_option_append(
                                 &packet->dhcp, req->max_optlen, &offset, 0,
-                                SD_DHCP_OPTION_VENDOR_SPECIFIC,
-                                /* optlen= */ 0, server->vendor_options);
+                                SD_DHCP_OPTION_VENDOR_SPECIFIC_INFORMATION,
+                                iov.iov_len, iov.iov_base);
                 if (r < 0)
                         return r;
         }
@@ -1601,33 +1630,14 @@ int sd_dhcp_server_set_router(sd_dhcp_server *server, const struct in_addr *rout
         return 0;
 }
 
-int sd_dhcp_server_add_option(sd_dhcp_server *server, sd_dhcp_option *v) {
-        int r;
-
-        assert_return(server, -EINVAL);
-        assert_return(v, -EINVAL);
-
-        r = ordered_set_ensure_put(&server->extra_options, &dhcp_option_hash_ops, v);
-        if (r < 0)
-                return r;
-
-        sd_dhcp_option_ref(v);
-        return 0;
+int dhcp_server_set_extra_options(sd_dhcp_server *server, TLV *options) {
+        assert(server);
+        return unref_and_replace_new_ref(server->extra_options, options, tlv_ref, tlv_unref);
 }
 
-int sd_dhcp_server_add_vendor_option(sd_dhcp_server *server, sd_dhcp_option *v) {
-        int r;
-
-        assert_return(server, -EINVAL);
-        assert_return(v, -EINVAL);
-
-        r = ordered_set_ensure_put(&server->vendor_options, &dhcp_option_hash_ops, v);
-        if (r < 0)
-                return r;
-
-        sd_dhcp_option_ref(v);
-
-        return 1;
+int dhcp_server_set_vendor_options(sd_dhcp_server *server, TLV *options) {
+        assert(server);
+        return unref_and_replace_new_ref(server->vendor_options, options, tlv_ref, tlv_unref);
 }
 
 int sd_dhcp_server_set_callback(sd_dhcp_server *server, sd_dhcp_server_callback_t cb, void *userdata) {
@@ -1641,6 +1651,7 @@ int sd_dhcp_server_set_callback(sd_dhcp_server *server, sd_dhcp_server_callback_
 
 int sd_dhcp_server_set_relay_target(sd_dhcp_server *server, const struct in_addr *address) {
         assert_return(server, -EINVAL);
+        assert_return(address, -EINVAL);
         assert_return(!sd_dhcp_server_is_running(server), -EBUSY);
 
         if (memcmp(address, &server->relay_target, sizeof(struct in_addr)) == 0)

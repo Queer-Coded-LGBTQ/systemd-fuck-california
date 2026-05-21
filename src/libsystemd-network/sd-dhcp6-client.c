@@ -379,6 +379,9 @@ int sd_dhcp6_client_get_information_request(sd_dhcp6_client *client, int *enable
 }
 
 static int be16_compare_func(const be16_t *a, const be16_t *b) {
+        assert(a);
+        assert(b);
+
         return CMP(be16toh(*a), be16toh(*b));
 }
 
@@ -1530,7 +1533,7 @@ sd_event *sd_dhcp6_client_get_event(sd_dhcp6_client *client) {
 int sd_dhcp6_client_attach_device(sd_dhcp6_client *client, sd_device *dev) {
         assert_return(client, -EINVAL);
 
-        return device_unref_and_replace(client->dev, dev);
+        return device_unref_and_replace_new_ref(client->dev, dev);
 }
 
 static sd_dhcp6_client *dhcp6_client_free(sd_dhcp6_client *client) {

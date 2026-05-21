@@ -23,6 +23,7 @@
 #include "alloc-util.h"
 #include "arphrd-util.h"
 #include "bitfield.h"
+#include "device-private.h"
 #include "device-util.h"
 #include "dns-domain.h"
 #include "errno-util.h"
@@ -66,7 +67,6 @@
 #include "networkd-wifi.h"
 #include "networkd-wwan-bus.h"
 #include "ordered-set.h"
-#include "parse-util.h"
 #include "set.h"
 #include "socket-util.h"
 #include "string-table.h"
@@ -288,7 +288,6 @@ static Link* link_free(Link *link) {
         free(link->previous_ssid);
         free(link->driver);
 
-        unlink_and_free(link->lease_file);
         unlink_and_free(link->state_file);
 
         sd_device_unref(link->dev);
@@ -814,6 +813,46 @@ int link_ipv6ll_gained(Link *link) {
         return 0;
 }
 
+int link_ipv6ll_lost(Link *link, const struct in6_addr *dropped_ipv6ll, bool has_replacement) {
+        int ret = 0, r;
+
+        assert(link);
+        assert(dropped_ipv6ll);
+
+        if (!IN_SET(link->state, LINK_STATE_CONFIGURING, LINK_STATE_CONFIGURED))
+                return 0;
+
+        log_link_info(link, "Lost IPv6LL address %s%s.",
+                      IN6_ADDR_TO_STRING(dropped_ipv6ll),
+                      has_replacement ? ", switching to alternate IPv6LL source" : "");
+
+        r = sd_dhcp6_client_stop(link->dhcp6_client);
+        if (r < 0)
+                RET_GATHER(ret, log_link_warning_errno(link, r, "Could not stop DHCPv6 client: %m"));
+
+        /* DHCPv6 must be restarted to switch the client's source address, while NDisc and
+         * RADV can switch to the replacement IPv6LL in link_ipv6ll_gained() without flushing
+         * learned state. Keep link->ndisc_configured as-is in this path. */
+        if (has_replacement)
+                return ret;
+
+        r = ndisc_stop(link);
+        if (r < 0)
+                RET_GATHER(ret, log_link_warning_errno(link, r, "Could not stop IPv6 Router Discovery: %m"));
+        link->ndisc_configured = false;
+        ndisc_flush(link);
+
+        r = sd_radv_stop(link->radv);
+        if (r < 0)
+                RET_GATHER(ret, log_link_warning_errno(link, r, "Could not stop IPv6 Router Advertisement: %m"));
+
+        r = link_request_stacked_netdevs(link, NETDEV_LOCAL_ADDRESS_IPV6LL);
+        if (r < 0)
+                RET_GATHER(ret, log_link_warning_errno(link, r, "Could not reconfigure stacked netdevs after IPv6LL loss: %m"));
+
+        return ret;
+}
+
 int link_handle_bound_to_list(Link *link) {
         bool required_up = false;
         Link *l;
@@ -862,6 +901,7 @@ static int link_put_carrier(Link *link, Link *carrier, Hashmap **h) {
 
         assert(link);
         assert(carrier);
+        assert(h);
 
         if (link == carrier)
                 return 0;
@@ -1334,13 +1374,9 @@ static int link_get_network(Link *link, Network **ret) {
                         continue;
 
                 if (network->match.ifname && link->dev) {
-                        uint8_t name_assign_type = NET_NAME_UNKNOWN;
-                        const char *attr;
-
-                        if (sd_device_get_sysattr_value(link->dev, "name_assign_type", &attr) >= 0)
-                                (void) safe_atou8(attr, &name_assign_type);
-
-                        warn = name_assign_type == NET_NAME_ENUM;
+                        uint8_t name_assign_type;
+                        if (device_get_sysattr_u8(link->dev, "name_assign_type", &name_assign_type) >= 0)
+                                warn = name_assign_type == NET_NAME_ENUM;
                 }
 
                 log_link_full(link, warn ? LOG_WARNING : LOG_DEBUG,
@@ -1677,7 +1713,7 @@ static int link_initialized(Link *link, sd_device *device) {
 
         /* Always replace with the new sd_device object. As the sysname (and possibly other properties
          * or sysattrs) may be outdated. */
-        device_unref_and_replace(link->dev, device);
+        device_unref_and_replace_new_ref(link->dev, device);
 
         r = link_managed_by_us(link);
         if (r <= 0)
@@ -2712,7 +2748,7 @@ static Link *link_drop_or_unref(Link *link) {
 DEFINE_TRIVIAL_CLEANUP_FUNC(Link*, link_drop_or_unref);
 
 static int link_new(Manager *manager, sd_netlink_message *message, Link **ret) {
-        _cleanup_free_ char *ifname = NULL, *kind = NULL, *state_file = NULL, *lease_file = NULL;
+        _cleanup_free_ char *ifname = NULL, *kind = NULL, *state_file = NULL;
         _cleanup_(link_drop_or_unrefp) Link *link = NULL;
         unsigned short iftype;
         int r, ifindex;
@@ -2750,9 +2786,6 @@ static int link_new(Manager *manager, sd_netlink_message *message, Link **ret) {
                 /* Do not update state files when running in test mode. */
                 if (asprintf(&state_file, "/run/systemd/netif/links/%d", ifindex) < 0)
                         return log_oom_debug();
-
-                if (asprintf(&lease_file, "/run/systemd/netif/leases/%d", ifindex) < 0)
-                        return log_oom_debug();
         }
 
         link = new(Link, 1);
@@ -2774,7 +2807,6 @@ static int link_new(Manager *manager, sd_netlink_message *message, Link **ret) {
                 .ipv6ll_address_gen_mode = _IPV6_LINK_LOCAL_ADDRESS_GEN_MODE_INVALID,
 
                 .state_file = TAKE_PTR(state_file),
-                .lease_file = TAKE_PTR(lease_file),
 
                 .n_dns = UINT_MAX,
                 .dns_default_route = -1,
