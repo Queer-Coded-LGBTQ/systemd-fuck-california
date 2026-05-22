@@ -9,48 +9,32 @@
 #include "sd-event.h"
 
 #include "dhcp-server-internal.h"
-#include "hashmap.h"
-#include "siphash24.h"
+#include "dhcp-server-request.h"
+#include "fd-util.h"
 #include "tests.h"
 
-static void test_pool(struct in_addr *address, unsigned size, int ret) {
-        _cleanup_(sd_dhcp_server_unrefp) sd_dhcp_server *server = NULL;
-
-        ASSERT_OK(sd_dhcp_server_new(&server, 1));
-
-        if (ret >= 0)
-                ASSERT_RETURN_IS_CRITICAL(true, ASSERT_OK_EQ(sd_dhcp_server_configure_pool(server, address, 8, 0, size), ret));
-        else
-                ASSERT_RETURN_IS_CRITICAL(false, ASSERT_ERROR(sd_dhcp_server_configure_pool(server, address, 8, 0, size), -ret));
-}
-
-static int test_basic(bool bind_to_interface) {
-        _cleanup_(sd_dhcp_server_unrefp) sd_dhcp_server *server = NULL;
-        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+TEST(basic) {
         struct in_addr address_lo = {
                 .s_addr = htobe32(INADDR_LOOPBACK),
         };
         struct in_addr address_any = {
                 .s_addr = htobe32(INADDR_ANY),
         };
-        int r;
 
-        log_debug("/* %s(bind_to_interface=%s) */", __func__, yes_no(bind_to_interface));
-
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         ASSERT_OK(sd_event_new(&event));
 
-        /* attach to loopback interface */
-        ASSERT_OK(sd_dhcp_server_new(&server, 1));
+        _cleanup_(sd_dhcp_server_unrefp) sd_dhcp_server *server = NULL;
+        ASSERT_OK(sd_dhcp_server_new(&server, 4242));
         ASSERT_NOT_NULL(server);
-        server->bind_to_interface = bind_to_interface;
 
-        ASSERT_OK(sd_dhcp_server_attach_event(server, event, 0));
-        ASSERT_RETURN_EXPECTED(ASSERT_ERROR(sd_dhcp_server_attach_event(server, event, 0), EBUSY));
-        ASSERT_TRUE(sd_dhcp_server_get_event(server) == event); /* ASSERT_EQ() doesn't work here. */
+        ASSERT_OK(sd_dhcp_server_attach_event(server, event, SD_EVENT_PRIORITY_NORMAL));
+        ASSERT_RETURN_EXPECTED(ASSERT_ERROR(sd_dhcp_server_attach_event(server, event, SD_EVENT_PRIORITY_NORMAL), EBUSY));
+        ASSERT_PTR_EQ(sd_dhcp_server_get_event(server), event);
         ASSERT_OK(sd_dhcp_server_detach_event(server));
         ASSERT_NULL(sd_dhcp_server_get_event(server));
-        ASSERT_OK(sd_dhcp_server_attach_event(server, NULL, 0));
-        ASSERT_RETURN_EXPECTED(ASSERT_ERROR(sd_dhcp_server_attach_event(server, NULL, 0), EBUSY));
+        ASSERT_OK(sd_dhcp_server_attach_event(server, NULL, SD_EVENT_PRIORITY_NORMAL));
+        ASSERT_RETURN_EXPECTED(ASSERT_ERROR(sd_dhcp_server_attach_event(server, NULL, SD_EVENT_PRIORITY_NORMAL), EBUSY));
 
         ASSERT_TRUE(sd_dhcp_server_ref(server) == server);
         ASSERT_NULL(sd_dhcp_server_unref(server));
@@ -61,31 +45,24 @@ static int test_basic(bool bind_to_interface) {
         ASSERT_RETURN_EXPECTED(ASSERT_ERROR(sd_dhcp_server_configure_pool(server, &address_lo, 38, 0, 0), ERANGE));
         ASSERT_OK(sd_dhcp_server_configure_pool(server, &address_lo, 8, 0, 0));
         ASSERT_OK(sd_dhcp_server_configure_pool(server, &address_lo, 8, 0, 0));
+        ASSERT_RETURN_EXPECTED(ASSERT_ERROR(sd_dhcp_server_configure_pool(server, &address_any, 8, 0, 1), EINVAL));
+        ASSERT_OK(sd_dhcp_server_configure_pool(server, &address_lo, 8, 0, 1));
 
-        test_pool(&address_any, 1, -EINVAL);
-        test_pool(&address_lo, 1, 0);
+        _cleanup_close_pair_ int socket_fd[2] = EBADF_PAIR;
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, socket_fd));
 
-        r = sd_dhcp_server_start(server);
-        /* skip test if running in an environment with no full networking support, CONFIG_PACKET not
-         * compiled in kernel, nor af_packet module available. */
-        if (IN_SET(r, -EPERM, -EAFNOSUPPORT))
-                return r;
-        ASSERT_OK(r);
+        server->socket_fd = TAKE_FD(socket_fd[0]);
 
+        ASSERT_OK(sd_dhcp_server_start(server));
         ASSERT_OK(sd_dhcp_server_start(server));
         ASSERT_OK(sd_dhcp_server_stop(server));
         ASSERT_OK(sd_dhcp_server_stop(server));
         ASSERT_OK(sd_dhcp_server_start(server));
-
-        return 0;
 }
 
-static void test_message_handler(void) {
-        _cleanup_(sd_dhcp_server_unrefp) sd_dhcp_server *server = NULL;
+TEST(dhcp_server_handle_message) {
         struct {
-                struct {
-                        DHCP_MESSAGE_HEADER_DEFINITION;
-                } _packed_ message;
+                DHCPMessageHeader header;
                 struct {
                         uint8_t code;
                         uint8_t length;
@@ -113,11 +90,11 @@ static void test_message_handler(void) {
                 } _packed_ option_hostname;
                 uint8_t end;
         } _packed_ test = {
-                .message.op = BOOTREQUEST,
-                .message.htype = ARPHRD_ETHER,
-                .message.hlen = ETHER_ADDR_LEN,
-                .message.xid = htobe32(0x12345678),
-                .message.chaddr = { 'A', 'B', 'C', 'D', 'E', 'F' },
+                .header.op = BOOTREQUEST,
+                .header.htype = ARPHRD_ETHER,
+                .header.hlen = ETHER_ADDR_LEN,
+                .header.xid = htobe32(0x12345678),
+                .header.chaddr = { 'A', 'B', 'C', 'D', 'E', 'F' },
                 .option_type.code = SD_DHCP_OPTION_MESSAGE_TYPE,
                 .option_type.length = 1,
                 .option_type.type = DHCP_DISCOVER,
@@ -133,11 +110,15 @@ static void test_message_handler(void) {
                 .s_addr = htobe32(INADDR_LOOPBACK + 42),
         };
         static uint8_t static_lease_client_id[7] = {0x01, 'A', 'B', 'C', 'D', 'E', 'G' };
-        int r;
 
-        log_debug("/* %s */", __func__);
+        _cleanup_close_pair_ int socket_fd[2] = EBADF_PAIR;
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, socket_fd));
 
-        ASSERT_OK(sd_dhcp_server_new(&server, 1));
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        ASSERT_OK(sd_event_new(&event));
+
+        _cleanup_(sd_dhcp_server_unrefp) sd_dhcp_server *server = NULL;
+        ASSERT_OK(sd_dhcp_server_new(&server, 4242));
         ASSERT_OK(sd_dhcp_server_configure_pool(server, &address_lo, 8, 0, 0));
         ASSERT_OK(sd_dhcp_server_set_static_lease(
                         server,
@@ -145,13 +126,11 @@ static void test_message_handler(void) {
                         static_lease_client_id,
                         ELEMENTSOF(static_lease_client_id),
                         /* hostname= */ NULL));
-        ASSERT_OK(sd_dhcp_server_attach_event(server, NULL, 0));
+        ASSERT_OK(sd_dhcp_server_attach_event(server, event, SD_EVENT_PRIORITY_NORMAL));
+        server->socket_fd = TAKE_FD(socket_fd[0]);
         ASSERT_OK(sd_dhcp_server_start(server));
 
-        r = dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL);
-        if (r == -ENETDOWN)
-                return (void) log_tests_skipped("Network is not available");
-        ASSERT_OK_EQ(r, DHCP_OFFER);
+        ASSERT_OK_EQ(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), DHCP_OFFER);
 
         test.end = 0;
         /* TODO, shouldn't this fail? */
@@ -168,19 +147,20 @@ static void test_message_handler(void) {
         test.option_type.type = DHCP_DISCOVER;
         ASSERT_OK_EQ(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), DHCP_OFFER);
 
-        test.message.op = 0;
+        test.header.op = 0;
         ASSERT_OK_ZERO(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL));
-        test.message.op = BOOTREQUEST;
+        test.header.op = BOOTREQUEST;
         ASSERT_OK_EQ(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), DHCP_OFFER);
 
-        test.message.htype = 0;
-        ASSERT_OK_EQ(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), DHCP_OFFER);
-        test.message.htype = ARPHRD_ETHER;
-        ASSERT_OK_EQ(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), DHCP_OFFER);
-
-        test.message.hlen = 0;
+        /* Neither client ID nor hardware type is set. There is no way to manage the bound lease for the request. */
+        test.header.htype = 0;
         ASSERT_ERROR(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), EBADMSG);
-        test.message.hlen = ETHER_ADDR_LEN;
+        test.header.htype = ARPHRD_ETHER;
+        ASSERT_OK_EQ(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), DHCP_OFFER);
+
+        test.header.hlen = 0;
+        ASSERT_ERROR(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), EBADMSG);
+        test.header.hlen = ETHER_ADDR_LEN;
         ASSERT_OK_EQ(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), DHCP_OFFER);
 
         test.option_type.type = DHCP_REQUEST;
@@ -246,7 +226,7 @@ static void test_message_handler(void) {
         ASSERT_OK_EQ(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), DHCP_ACK);
 
         /* release the bound static lease */
-        test.message.ciaddr = htobe32(INADDR_LOOPBACK + 31);
+        test.header.ciaddr = htobe32(INADDR_LOOPBACK + 31);
         test.option_type.type = DHCP_RELEASE;
         ASSERT_OK_ZERO(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL));
 
@@ -261,7 +241,7 @@ static void test_message_handler(void) {
         ASSERT_OK(sd_dhcp_server_start(server));
 
         /* request a new non-static address */
-        test.message.ciaddr = 0;
+        test.header.ciaddr = 0;
         test.option_type.type = DHCP_REQUEST;
         test.option_requested_ip.address = htobe32(INADDR_LOOPBACK + 29);
         ASSERT_OK_EQ(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), DHCP_ACK);
@@ -287,55 +267,9 @@ static void test_message_handler(void) {
         ASSERT_OK_EQ(dhcp_server_handle_message(server, (DHCPMessage*)&test, sizeof(test), NULL), DHCP_ACK);
 }
 
-static uint64_t client_id_hash_helper(sd_dhcp_client_id *id, uint8_t key[HASH_KEY_SIZE]) {
-        struct siphash state;
-
-        siphash24_init(&state, key);
-        client_id_hash_func(id, &state);
-
-        return htole64(siphash24_finalize(&state));
-}
-
-static void test_client_id_hash(void) {
-        sd_dhcp_client_id a = {
-                .size = 4,
-        }, b = {
-                .size = 4,
-        };
-        uint8_t hash_key[HASH_KEY_SIZE] = {
-                '0', '1', '2', '3', '4', '5', '6', '7',
-                '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
-        };
-
-        log_debug("/* %s */", __func__);
-
-        memcpy(a.raw, "abcd", 4);
-        memcpy(b.raw, "abcd", 4);
-
-        ASSERT_EQ(client_id_compare_func(&a, &b), 0);
-        ASSERT_EQ(client_id_hash_helper(&a, hash_key), client_id_hash_helper(&b, hash_key));
-        a.size = 3;
-        ASSERT_NE(client_id_compare_func(&a, &b), 0);
-        a.size = 4;
-        ASSERT_EQ(client_id_compare_func(&a, &b), 0);
-        ASSERT_EQ(client_id_hash_helper(&a, hash_key), client_id_hash_helper(&b, hash_key));
-
-        b.size = 3;
-        ASSERT_NE(client_id_compare_func(&a, &b), 0);
-        b.size = 4;
-        ASSERT_EQ(client_id_compare_func(&a, &b), 0);
-        ASSERT_EQ(client_id_hash_helper(&a, hash_key), client_id_hash_helper(&b, hash_key));
-
-        memcpy(b.raw, "abce", 4);
-        ASSERT_NE(client_id_compare_func(&a, &b), 0);
-}
-
-static void test_static_lease(void) {
+TEST(sd_dhcp_server_set_static_lease) {
         _cleanup_(sd_dhcp_server_unrefp) sd_dhcp_server *server = NULL;
-
-        log_debug("/* %s */", __func__);
-
-        ASSERT_OK(sd_dhcp_server_new(&server, 1));
+        ASSERT_OK(sd_dhcp_server_new(&server, 4242));
 
         ASSERT_OK(sd_dhcp_server_set_static_lease(
                         server,
@@ -411,12 +345,9 @@ static void test_static_lease(void) {
                         /* hostname= */ NULL));
 }
 
-static void test_domain_name(void) {
+TEST(sd_dhcp_server_set_domain_name) {
         _cleanup_(sd_dhcp_server_unrefp) sd_dhcp_server *server = NULL;
-
-        log_debug("/* %s */", __func__);
-
-        ASSERT_OK(sd_dhcp_server_new(&server, 1));
+        ASSERT_OK(sd_dhcp_server_new(&server, 4242));
 
         /* Test setting domain name */
         ASSERT_OK_POSITIVE(sd_dhcp_server_set_domain_name(server, "example.com"));
@@ -449,24 +380,4 @@ static void test_domain_name(void) {
         ASSERT_OK_POSITIVE(sd_dhcp_server_set_domain_name(server, "local"));
 }
 
-int main(int argc, char *argv[]) {
-        int r;
-
-        test_setup_logging(LOG_DEBUG);
-
-        test_client_id_hash();
-        test_static_lease();
-        test_domain_name();
-
-        r = test_basic(true);
-        if (r < 0)
-                return log_tests_skipped_errno(r, "cannot start dhcp server(bound to interface)");
-
-        r = test_basic(false);
-        if (r < 0)
-                return log_tests_skipped_errno(r, "cannot start dhcp server(non-bound to interface)");
-
-        test_message_handler();
-
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_DEBUG);
