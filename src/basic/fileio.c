@@ -16,7 +16,7 @@
 #include "hexdecoct.h"
 #include "io-util.h"
 #include "iovec-util.h"
-#include "label.h"
+#include "label-util.h"
 #include "log.h"
 #include "mkdir.h"
 #include "nulstr-util.h"
@@ -420,15 +420,29 @@ int read_one_line_file_at(int dir_fd, const char *filename, char **ret) {
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
         assert(filename);
         assert(ret);
 
-        r = fopen_unlocked_at(dir_fd, filename, "re", 0, &f);
+        r = fopen_unlocked_at(dir_fd, filename, "re", /* open_flags= */ 0, &f);
         if (r < 0)
                 return r;
 
         return read_line(f, LONG_LINE_MAX, ret);
+}
+
+int read_boolean_file_at(int dir_fd, const char *filename) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
+        assert(filename);
+
+        r = read_one_line_file_at(dir_fd, filename, &s);
+        if (r < 0)
+                return r;
+
+        return parse_boolean(s);
 }
 
 int verify_file_at(int dir_fd, const char *fn, const char *blob, bool accept_extra_nl) {
@@ -1010,13 +1024,19 @@ static int xfopenat_regular(int dir_fd, const char *path, const char *mode, int 
 
         /* A combination of fopen() with openat() */
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
         assert(mode);
         assert(ret);
 
         if (dir_fd == AT_FDCWD && path && open_flags == 0)
                 f = fopen(path, mode);
-        else {
+        else if (dir_fd == XAT_FDROOT && path && open_flags == 0) {
+                _cleanup_free_ char *j = strjoin("/", path);
+                if (!j)
+                        return -ENOMEM;
+
+                f = fopen(j, mode);
+        } else {
                 _cleanup_close_ int fd = -EBADF;
                 int mode_flags;
 
@@ -1051,7 +1071,7 @@ static int xfopenat_unix_socket(int dir_fd, const char *path, const char *bind_n
         FILE *f;
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
         assert(ret);
 
         sk = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
@@ -1099,7 +1119,7 @@ int xfopenat_full(
         FILE *f = NULL;  /* avoid false maybe-uninitialized warning */
         int r;
 
-        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
         assert(mode);
         assert(ret);
 
@@ -1369,6 +1389,8 @@ int read_timestamp_file(const char *fn, usec_t *ret) {
         _cleanup_free_ char *ln = NULL;
         uint64_t t;
         int r;
+
+        assert(ret);
 
         r = read_one_line_file(fn, &ln);
         if (r < 0)
@@ -1682,7 +1704,8 @@ int write_data_file_atomic_at(
         _cleanup_close_ int mfd = -EBADF;
         if (dn) {
                 /* If there's a directory component, readjust our position */
-                r = chaseat(dir_fd,
+                r = chaseat(XAT_FDROOT,
+                            dir_fd,
                             dn,
                             FLAGS_SET(flags, WRITE_DATA_FILE_MKDIR_0755) ? CHASE_MKDIR_0755 : 0,
                             /* ret_path= */ NULL,
@@ -1706,7 +1729,7 @@ int write_data_file_atomic_at(
                         return r;
         }
 
-        r = fchmod_umask(fd, 0644);
+        r = fchmod_umask(fd, FLAGS_SET(flags, WRITE_DATA_FILE_MODE_0400) ? 0400 : 0644);
         if (r < 0)
                 return r;
 
