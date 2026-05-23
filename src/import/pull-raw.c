@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "sd-daemon.h"
 #include "sd-event.h"
 
@@ -11,8 +13,9 @@
 #include "import-common.h"
 #include "import-util.h"
 #include "install-file.h"
+#include "iovec-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "pull-common.h"
 #include "pull-job.h"
 #include "pull-raw.h"
@@ -145,9 +148,6 @@ int raw_pull_new(
                 .glue = TAKE_PTR(g),
                 .offset = UINT64_MAX,
         };
-
-        p->glue->on_finished = pull_job_curl_on_finished;
-        p->glue->userdata = p;
 
         *ret = TAKE_PTR(p);
 
