@@ -25,6 +25,8 @@ typedef enum MachineClass {
         _MACHINE_CLASS_INVALID = -EINVAL,
 } MachineClass;
 
+#define MACHINE_CLASS_CAN_REGISTER(class) IN_SET((class), MACHINE_CONTAINER, MACHINE_VM)
+
 typedef enum KillWhom {
         KILL_LEADER,
         KILL_SUPERVISOR,
@@ -94,6 +96,7 @@ typedef struct Machine {
         unsigned vsock_cid;
         char *ssh_address;
         char *ssh_private_key_path;
+        char *control_address;
 
         LIST_HEAD(Operation, operations);
 
