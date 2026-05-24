@@ -3,17 +3,18 @@
 # Brazilian Portuguese translation for systemd.
 # Enrico Nicoletto <liverig@gmail.com>, 2014.
 # Filipe Brandenburger <filbranden@gmail.com>, 2018.
-# Rafael Fontenelle <rafaelff@gnome.org>, 2015-2020, 2025.
+# Rafael Fontenelle <rafaelff@gnome.org>, 2015-2020, 2025, 2026.
 # Gustavo Costa <xfgusta@gmail.com>, 2021.
 # Tiago Rocha Cunha <tiagocunha.me@gmail.com>, 2024.
 # Gabriel Elyas <gabrielelyas@protonmail.com>, 2024.
 # Fábio Rodrigues Ribeiro <farribeiro@gmail.com>, 2024.
 # "Geraldo S. Simião Kutz" <geraldo.simiao.kutz@gmail.com>, 2024.
+# Weblate Translation Memory <noreply-mt-weblate-translation-memory@weblate.org>, 2026.
 msgid ""
 msgstr ""
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-03-06 03:46+0900\n"
-"PO-Revision-Date: 2025-10-29 18:54+0000\n"
+"POT-Creation-Date: 2026-05-18 12:18+0100\n"
+"PO-Revision-Date: 2026-04-22 10:58+0000\n"
 "Last-Translator: Rafael Fontenelle <rafaelff@gnome.org>\n"
 "Language-Team: Portuguese (Brazil) <https://translate.fedoraproject.org/"
 "projects/systemd/main/pt_BR/>\n"
@@ -22,7 +23,7 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=n > 1;\n"
-"X-Generator: Weblate 5.13.3\n"
+"X-Generator: Weblate 5.17\n"
 
 #: src/core/org.freedesktop.systemd1.policy.in:22
 msgid "Send passphrase back to system"
@@ -910,37 +911,56 @@ msgstr ""
 "contêineres."
 
 #: src/machine/org.freedesktop.machine1.policy:95
+msgid "Inspect local virtual machines and containers"
+msgstr ""
+
+#: src/machine/org.freedesktop.machine1.policy:96
+msgid ""
+"Authentication is required to inspect local virtual machines and containers."
+msgstr ""
+
+#: src/machine/org.freedesktop.machine1.policy:105
 msgid "Create a local virtual machine or container"
 msgstr "Crie uma máquina virtual local ou um contêiner"
 
-#: src/machine/org.freedesktop.machine1.policy:96
+#: src/machine/org.freedesktop.machine1.policy:106
 msgid ""
 "Authentication is required to create a local virtual machine or container."
 msgstr ""
 "É necessária autenticação para criar máquinas virtuais locais e contêineres."
 
-#: src/machine/org.freedesktop.machine1.policy:106
+#: src/machine/org.freedesktop.machine1.policy:116
 msgid "Register a local virtual machine or container"
 msgstr "Registrar uma máquina virtual local ou um contêiner"
 
-#: src/machine/org.freedesktop.machine1.policy:107
+#: src/machine/org.freedesktop.machine1.policy:117
 msgid ""
 "Authentication is required to register a local virtual machine or container."
 msgstr ""
 "É necessária autenticação para registrar máquinas virtuais locais e "
 "contêineres."
 
-#: src/machine/org.freedesktop.machine1.policy:116
+#: src/machine/org.freedesktop.machine1.policy:126
 msgid "Manage local virtual machine and container images"
 msgstr "Gerenciar máquinas virtuais locais e imagens contêineres"
 
-#: src/machine/org.freedesktop.machine1.policy:117
+#: src/machine/org.freedesktop.machine1.policy:127
 msgid ""
 "Authentication is required to manage local virtual machine and container "
 "images."
 msgstr ""
 "É necessária autenticação para gerenciar máquinas virtuais locais e imagens "
 "contêineres."
+
+#: src/machine/org.freedesktop.machine1.policy:137
+msgid "Inspect local virtual machine and container images"
+msgstr ""
+
+#: src/machine/org.freedesktop.machine1.policy:138
+msgid ""
+"Authentication is required to inspect local virtual machine and container "
+"images."
+msgstr ""
 
 #: src/network/org.freedesktop.network1.policy:22
 msgid "Set NTP servers"
@@ -1051,12 +1071,12 @@ msgid "DHCP server sends force renew message"
 msgstr "Servidor DHCP envia mensagem de renovação forçada"
 
 #: src/network/org.freedesktop.network1.policy:144
-#, fuzzy
-#| msgid "Authentication is required to send force renew message."
 msgid ""
 "Authentication is required to send a force renew message from the DHCP "
 "server."
-msgstr "É necessária autenticação para enviar mensagem de renovação forçada."
+msgstr ""
+"É necessária autenticação para enviar uma mensagem de renovação forçada a "
+"partir do servidor DHCP."
 
 #: src/network/org.freedesktop.network1.policy:154
 msgid "Renew dynamic addresses"
@@ -1098,11 +1118,11 @@ msgstr ""
 
 #: src/network/org.freedesktop.network1.policy:198
 msgid "Manage network links"
-msgstr ""
+msgstr "Gerenciar conexões de rede"
 
 #: src/network/org.freedesktop.network1.policy:199
 msgid "Authentication is required to manage network links."
-msgstr ""
+msgstr "A autenticação é necessária para gerenciar conexões de rede."
 
 #: src/portable/org.freedesktop.portable1.policy:13
 msgid "Inspect a portable service image"
