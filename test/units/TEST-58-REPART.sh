@@ -20,6 +20,13 @@ export PAGER=cat
 # Disable use of special glyphs such as →
 export SYSTEMD_UTF8=0
 
+# Sanitizer runs are significantly slower, so give udevadm wait 3 times longer timeouts
+if [[ -v ASAN_OPTIONS || -v UBSAN_OPTIONS ]]; then
+    UDEVADM_WAIT_TIMEOUT=180
+else
+    UDEVADM_WAIT_TIMEOUT=60
+fi
+
 seed=750b6cd5c4ae4012a15e7be3c29e6a47
 
 esp_guid=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
@@ -378,7 +385,9 @@ $imgs/zzz7 : start=     6291416, size=      131072, type=3B8F8425-20E0-4F3B-907F
     fi
 
     loop="$(losetup -P --show --find "$imgs/zzz")"
-    udevadm wait --timeout=60 --settle "${loop:?}p7"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}p7"
+
+    cryptsetup luksDump "${loop}p7" | grep 'Flags:[[:space:]]*allow-discards' >/dev/null
 
     volume="test-repart-$RANDOM"
 
@@ -396,6 +405,50 @@ $imgs/zzz7 : start=     6291416, size=      131072, type=3B8F8425-20E0-4F3B-907F
     PASSWORD="" systemd-dissect "$imgs/zzz" -M "$imgs/mount"
     udevadm info /dev/disk/by-label/schrupfel | grep ID_FS_TYPE=crypto_LUKS >/dev/null
     systemd-dissect -U "$imgs/mount"
+
+    echo "*** 7. Testing Discard=no ***"
+
+    tee "$defs/extra4.conf" <<EOF
+[Partition]
+Type=var
+Label=luks-no-discards
+UUID=329b9db2-dfd9-4f39-8ebf-53b582b05fcd
+Format=ext4
+Encrypt=yes
+CopyFiles=$defs:/def
+SizeMinBytes=48M
+Discard=no
+EOF
+
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --size=auto \
+                   --dry-run=no \
+                   --seed="$seed" \
+                   "$imgs/zzz"
+
+    output=$(sfdisk -d "$imgs/zzz" | grep -v -e 'sector-size' -e '^$')
+
+    assert_eq "$output" "label: gpt
+label-id: 1D2CE291-7CCE-4F7D-BC83-FDB49AD74EBD
+device: $imgs/zzz
+unit: sectors
+first-lba: 2048
+last-lba: 6553566
+$imgs/zzz1 : start=        2048, size=      591856, type=933AC7E1-2EB4-4F13-B844-0E14E2AEF915, uuid=4980595D-D74A-483A-AA9E-9903879A0EE5, name=\"home-first\", attrs=\"GUID:59\"
+$imgs/zzz2 : start=      593904, size=      591856, type=${root_guid}, uuid=${root_uuid}, name=\"root-${architecture}\", attrs=\"GUID:59\"
+$imgs/zzz3 : start=     1185760, size=      591864, type=${root_guid}, uuid=${root_uuid2}, name=\"root-${architecture}-2\", attrs=\"GUID:59\"
+$imgs/zzz4 : start=     1777624, size=      131072, type=0657FD6D-A4AB-43C4-84E5-0933C84B4F4F, uuid=78C92DB8-3D2B-4823-B0DC-792B78F66F1E, name=\"swap\"
+$imgs/zzz5 : start=     1908696, size=     2285568, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=A0A1A2A3-A4A5-A6A7-A8A9-AAABACADAEAF, name=\"custom_label\"
+$imgs/zzz6 : start=     4194264, size=     2097152, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, uuid=2A1D97E1-D0A3-46CC-A26E-ADC643926617, name=\"block-copy\"
+$imgs/zzz7 : start=     6291416, size=      131072, type=3B8F8425-20E0-4F3B-907F-1A25A76F98E8, uuid=7B93D1F2-595D-4CE3-B0B9-837FBD9E63B0, name=\"luks-format-copy\", attrs=\"GUID:59\"
+$imgs/zzz8 : start=     6422488, size=      131072, type=4D21B016-B534-45C2-A9FB-5C16E091FD2D, uuid=329B9DB2-DFD9-4F39-8EBF-53B582B05FCD, name=\"luks-no-discards\", attrs=\"GUID:59\""
+
+    loop="$(losetup -P --show --find "$imgs/zzz")"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}p8"
+
+    cryptsetup luksDump "${loop}p8" | grep 'Flags:[[:space:]]*(no flags)' >/dev/null
+    losetup -d "$loop"
 }
 
 testcase_dropin() {
@@ -895,6 +948,7 @@ EOF
                             --dry-run=no \
                             --empty=create \
                             --size=auto \
+                            --split=yes \
                             --json=pretty \
                             --private-key="$defs/verity.key" \
                             --certificate="$defs/verity.crt" \
@@ -906,6 +960,13 @@ EOF
 
     assert_eq "$drh" "$hrh"
     assert_eq "$hrh" "$srh"
+
+    # The split-out verity signature file should be a valid JSON document (i.e. trailing NUL padding
+    # from the on-disk partition must be trimmed when writing the split file).
+    sig_split=$(jq -r ".[] | select(.type == \"root-${architecture}-verity-sig\") | .split_path" <<<"$output")
+    assert_neq "$sig_split" ""
+    assert_neq "$sig_split" "null"
+    jq . "$sig_split" >/dev/null
 
     # Check that offline signing works and the resulting image is valid
 
@@ -1004,7 +1065,7 @@ EOF
     # shellcheck disable=SC2064
     trap "rm -rf '$defs' '$imgs' ; losetup -d '$loop'" RETURN ERR
 
-    udevadm wait --timeout=60 --settle "${loop:?}p1" "${loop:?}p2"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}p1" "${loop:?}p2"
 
     # Check that the verity block sizes are as expected
     veritysetup dump "${loop}p2" | grep 'Data block size:' | grep '4096' >/dev/null
@@ -1064,7 +1125,7 @@ EOF
     # shellcheck disable=SC2064
     trap "rm -rf '$defs' '$imgs' ; losetup -d '$loop'" RETURN ERR
 
-    udevadm wait --timeout=60 --settle "${loop:?}p1" "${loop:?}p2"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}p1" "${loop:?}p2"
 
     output=$(sfdisk -J "$loop")
 
@@ -1146,7 +1207,7 @@ EOF
     fi
 
     loop=$(losetup -P --show -f "$imgs/zzz")
-    udevadm wait --timeout=60 --settle "${loop:?}p1" "${loop:?}p2"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}p1" "${loop:?}p2"
 
     # Test that /usr/def did not end up in the root partition but other files did.
     mkdir "$imgs/mnt"
@@ -1207,6 +1268,18 @@ CopyFiles=${defs}
 Minimize=guess
 EOF
     done
+
+    if command -v mkfs.btrfs >/dev/null; then
+        for minimize in guess best; do
+            tee "$defs/root-btrfs-${minimize}.conf" <<EOF
+[Partition]
+Type=root-${architecture}
+Format=btrfs
+CopyFiles=${defs}
+Minimize=${minimize}
+EOF
+        done
+    fi
 
     if command -v mksquashfs >/dev/null; then
         tee "$defs/root-squashfs.conf" <<EOF
@@ -1359,7 +1432,7 @@ EOF
 
     truncate -s 100m "$imgs/$sector.img"
     loop=$(losetup -b "$sector" -P --show -f "$imgs/$sector.img" )
-    udevadm wait --timeout=60 --settle "${loop:?}"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}"
 
     systemd-repart --offline="$OFFLINE" \
                    --pretty=yes \
@@ -1742,7 +1815,7 @@ EOF
     # shellcheck disable=SC2064
     trap "umount '$imgs/mount' 2>/dev/null || true; losetup -d '$loop' 2>/dev/null || true; rm -rf '$defs' '$imgs'" RETURN
     echo "Loop device: $loop"
-    udevadm wait --timeout=60 --settle "${loop:?}p1"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}p1"
 
     mkdir -p "$imgs/mount"
     mount -t btrfs "${loop:?}p1" "$imgs/mount"
@@ -1870,7 +1943,7 @@ EOF
                    "$imgs/encint.img"
 
     loop="$(losetup -P --show --find "$imgs/encint.img")"
-    udevadm wait --timeout=60 --settle "${loop:?}p1"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}p1"
 
     volume="test-repart-luksint-$RANDOM"
     dmstatus="$imgs/dmsetup-$RANDOM"
@@ -1975,7 +2048,7 @@ EOF
                    "$imgs/enckeyhash.img"
 
     loop="$(losetup -P --show --find "$imgs/enckeyhash.img")"
-    udevadm wait --timeout=60 --settle "${loop:?}p1"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}p1"
 
     touch "$imgs/empty-password"
 
@@ -2035,7 +2108,7 @@ EOF
                    "$imgs/fstabcrypttabrepart.img"
 
     loop="$(losetup -P --show --find "$imgs/fstabcrypttabrepart.img")"
-    udevadm wait --timeout=60 --settle "${loop:?}p1"
+    udevadm wait --timeout="$UDEVADM_WAIT_TIMEOUT" --settle "${loop:?}p1"
 
     touch "$imgs/empty-password"
 
@@ -2057,6 +2130,97 @@ EOF
     systemd-cryptsetup detach "$volume"
 
     losetup -d "$loop"
+}
+
+testcase_block_device_replace() {
+    if [[ "$OFFLINE" == "yes" ]]; then
+        return 0
+    fi
+
+    if ! command -v btrfs >/dev/null; then
+        echo "btrfs not found, skipping."
+        return 0
+    fi
+
+    if ! command -v mkfs.btrfs >/dev/null; then
+        echo "mkfs.btrfs not found, skipping."
+        return 0
+    fi
+
+    local defs imgs btrfs_mntpoint_plain btrfs_mntpoint_encrypted
+    local loop loop_btrfs_plain loop_btrfs_encrypted
+    local encrypted_device
+
+    btrfs_mntpoint_plain="$(mktemp --directory "/tmp/test-repart.btrfs-mntpoint-plain.XXXXXXXXXX")"
+    btrfs_mntpoint_encrypted="$(mktemp --directory "/tmp/test-repart.btrfs-mntpoint-encrypted.XXXXXXXXXX")"
+    defs="$(mktemp --directory "/tmp/test-repart.defs.XXXXXXXXXX")"
+    imgs="$(mktemp --directory "/var/tmp/test-repart.imgs.XXXXXXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$defs' '$imgs' '$btrfs_mntpoint_plain' '$btrfs_mntpoint_encrypted'" RETURN
+    chmod 0755 "$defs"
+
+    truncate --size 500M "${imgs}/btrfs-plain"
+    mkfs.btrfs "${imgs}/btrfs-plain"
+    loop_btrfs_plain="$(losetup --show --find "$imgs/btrfs-plain")"
+    # shellcheck disable=SC2064
+    trap "losetup -d '${loop_btrfs_plain}'; rm -rf '$defs' '$imgs' '$btrfs_mntpoint_plain' '$btrfs_mntpoint_encrypted'" RETURN
+
+    mount "${loop_btrfs_plain}" "${btrfs_mntpoint_plain}"
+    echo tada >"${btrfs_mntpoint_plain}/magic-plain"
+
+    # shellcheck disable=SC2064
+    trap "umount '${btrfs_mntpoint_plain}'; losetup -d '${loop_btrfs_plain}'; rm -rf '$defs' '$imgs' '$btrfs_mntpoint_plain' '$btrfs_mntpoint_encrypted'" RETURN
+
+    truncate --size 500M "${imgs}/btrfs-encrypted"
+    mkfs.btrfs "${imgs}/btrfs-encrypted"
+    loop_btrfs_encrypted="$(losetup --show --find "$imgs/btrfs-encrypted")"
+    # shellcheck disable=SC2064
+    trap "losetup -d '${loop_btrfs_encrypted}'; umount '${btrfs_mntpoint_plain}'; losetup -d '${loop_btrfs_plain}'; rm -rf '$defs' '$imgs' '$btrfs_mntpoint_plain' '$btrfs_mntpoint_encrypted'" RETURN
+
+    mount "${loop_btrfs_encrypted}" "${btrfs_mntpoint_encrypted}"
+    echo tada >"${btrfs_mntpoint_encrypted}/magic-encrypted"
+
+    # shellcheck disable=SC2064
+    trap "umount '${btrfs_mntpoint_encrypted}'; losetup -d '${loop_btrfs_encrypted}'; umount '${btrfs_mntpoint_plain}'; losetup -d '${loop_btrfs_plain}'; rm -rf '$defs' '$imgs' '$btrfs_mntpoint_plain' '$btrfs_mntpoint_encrypted'" RETURN
+
+    truncate --size 2G "${imgs}/img"
+
+    tee "$defs/01-plain.conf" <<EOF
+[Partition]
+Type=linux-generic
+Label=plain
+BlockDeviceReplace=${btrfs_mntpoint_plain}
+EOF
+
+    tee "$defs/02-encrypted.conf" <<EOF
+[Partition]
+Type=linux-generic
+Label=encrypted
+Encrypt=key-file
+BlockDeviceReplace=${btrfs_mntpoint_encrypted}
+VolumeName=btrfs-replace-encrypted
+EOF
+
+    loop="$(losetup -P --show --find "${imgs}/img")"
+    # shellcheck disable=SC2064
+    trap "umount '${btrfs_mntpoint_encrypted}'; cryptsetup close btrfs-replace-encrypted || true; losetup -d '${loop_btrfs_encrypted}'; umount '${btrfs_mntpoint_plain}'; losetup -d '${loop_btrfs_plain}'; losetup -d '${loop}'; rm -rf '$defs' '$imgs' '$btrfs_mntpoint_plain' '$btrfs_mntpoint_encrypted'" RETURN
+
+    touch "${imgs}/empty-password"
+
+    systemd-repart --offline="$OFFLINE" \
+                   --definitions="$defs" \
+                   --empty=require \
+                   --key-file="${imgs}/empty-password" \
+                   --seed="$seed" \
+                   --dry-run=no \
+                   "${loop}"
+
+    assert_eq "$(findmnt "${btrfs_mntpoint_plain}" -o SOURCE -n)" "${loop}p1"
+    assert_eq "$(findmnt "${btrfs_mntpoint_encrypted}" -o SOURCE -n)" "/dev/mapper/btrfs-replace-encrypted"
+    encrypted_device="/sys/dev/block/$(dmsetup table /dev/mapper/btrfs-replace-encrypted | cut -d" " -f7)"
+    assert_eq "$(udevadm info --query=property --property=DEVNAME --value "${encrypted_device}")" "${loop}p2"
+    grep -q tada "${btrfs_mntpoint_plain}/magic-plain"
+    grep -q tada "${btrfs_mntpoint_encrypted}/magic-encrypted"
 }
 
 OFFLINE="yes"

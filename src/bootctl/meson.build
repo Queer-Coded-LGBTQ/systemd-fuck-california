@@ -3,6 +3,7 @@
 bootctl_sources = files(
         'bootctl.c',
         'bootctl-install.c',
+        'bootctl-link.c',
         'bootctl-random-seed.c',
         'bootctl-reboot-to-firmware.c',
         'bootctl-set-efivar.c',
@@ -23,6 +24,12 @@ executables += [
                 ],
                 'sources' : bootctl_sources,
                 'link_with' : boot_link_with,
-                'dependencies' : [libopenssl],
+                'dependencies' : [libopenssl_cflags],
+        },
+        test_template + {
+                'sources' : files(
+                        'test-bootspec-util.c',
+                        'bootspec-util.c',
+                ),
         },
 ]
