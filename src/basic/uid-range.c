@@ -63,6 +63,10 @@ static void uid_range_coalesce(UIDRange *range) {
                                 break;
 
                         begin = MIN(x->start, y->start);
+
+                        /* Silence static analyzers, overflow is prevented by uid_range_add_internal() */
+                        assert(x->start <= UINT32_MAX - x->nr);
+                        assert(y->start <= UINT32_MAX - y->nr);
                         end = MAX(x->start + x->nr, y->start + y->nr);
 
                         x->start = begin;
@@ -71,7 +75,12 @@ static void uid_range_coalesce(UIDRange *range) {
                         if (range->n_entries > j + 1)
                                 memmove(y, y + 1, sizeof(UIDRangeEntry) * (range->n_entries - j - 1));
 
+                        /* Silence static analyzers, n_entries > 0 since j < n_entries holds in the loop condition */
+                        assert(range->n_entries > 0);
                         range->n_entries--;
+
+                        /* Silence static analyzers, j cannot be 0 here since it starts at i + 1, i.e. >= 1 */
+                        assert(j > 0);
                         j--;
                 }
         }

@@ -84,7 +84,13 @@ int name_to_handle_at_loop(
                 h->handle_bytes = n;
 
                 if (ret_unique_mnt_id) {
-                        uint64_t mnt_id;
+                        /* Here, explicitly initialize mnt_id, otherwise valgrind complains:
+                         *
+                         * ==175708== Conditional jump or move depends on uninitialised value(s)
+                         * ==175708==    at 0x4BC33D1: inode_same_at (stat-util.c:610)
+                         * ==175708==    by 0x4BF1972: inode_same (stat-util.h:86)
+                         */
+                        uint64_t mnt_id = 0;
 
                         /* The kernel will still use this as uint64_t pointer */
                         r = name_to_handle_at(fd, path, h, (int *) &mnt_id, flags|AT_HANDLE_MNT_ID_UNIQUE);
@@ -320,6 +326,8 @@ int path_get_mnt_id_at(int dir_fd, const char *path, int *ret) {
         uint64_t mnt_id;
         int r;
 
+        assert(ret);
+
         r = path_get_mnt_id_at_internal(dir_fd, path, /* unique = */ false, &mnt_id);
         if (r < 0)
                 return r;
@@ -375,6 +383,17 @@ bool fstype_needs_quota(const char *fstype) {
                           "reiserfs",
                           "jfs",
                           "f2fs");
+}
+
+bool fstype_has_internal_quota(const char *fstype) {
+        /* These filesystems have built-in quota support and do not need
+         * external quotacheck/quotaon services - see the "nothing needed"
+         * entries in fstype_needs_quota() above. */
+        return STR_IN_SET(fstype,
+                          "xfs",
+                          "gfs2",
+                          "ocfs2",
+                          "btrfs");
 }
 
 bool fstype_is_api_vfs(const char *fstype) {
@@ -596,6 +615,9 @@ const char* mount_propagation_flag_to_string(unsigned long flags) {
 }
 
 int mount_propagation_flag_from_string(const char *name, unsigned long *ret) {
+
+        POINTER_MAY_BE_NULL(name);
+        assert(ret);
 
         if (isempty(name))
                 *ret = 0;
