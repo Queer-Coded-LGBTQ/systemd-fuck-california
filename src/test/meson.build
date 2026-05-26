@@ -111,7 +111,6 @@ simple_tests += files(
         'test-format-util.c',
         'test-fs-util.c',
         'test-fstab-util.c',
-        'test-getopt.c',
         'test-glob-util.c',
         'test-gpt.c',
         'test-gunicode.c',
@@ -120,7 +119,6 @@ simple_tests += files(
         'test-hmac.c',
         'test-hostname-setup.c',
         'test-hostname-util.c',
-        'test-id128.c',
         'test-image-filter.c',
         'test-image-policy.c',
         'test-import-util.c',
@@ -130,6 +128,7 @@ simple_tests += files(
         'test-install-root.c',
         'test-io-util.c',
         'test-iovec-util.c',
+        'test-iovec-wrapper.c',
         'test-journal-importer.c',
         'test-kbd-util.c',
         'test-label.c',
@@ -141,6 +140,7 @@ simple_tests += files(
         'test-log.c',
         'test-logarithm.c',
         'test-login-util.c',
+        'test-machine-util.c',
         'test-macro.c',
         'test-memfd-util.c',
         'test-memory-util.c',
@@ -179,8 +179,6 @@ simple_tests += files(
         'test-replace-var.c',
         'test-rlimit-util.c',
         'test-rm-rf.c',
-        'test-sd-hwdb.c',
-        'test-sd-path.c',
         'test-secure-bits.c',
         'test-serialize.c',
         'test-set.c',
@@ -225,10 +223,8 @@ simple_tests += files(
 
 common_test_dependencies = [
         libmount_cflags,
-        librt,
         libseccomp_cflags,
         libselinux_cflags,
-        threads,
 ]
 
 executables += [
@@ -257,11 +253,6 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-btrfs.c'),
-                'type' : 'manual',
-        },
-        test_template + {
-                'sources' : files('test-btrfs-physical-offset.c'),
-                'type' : 'manual',
         },
         test_template + {
                 'sources' : files('test-chase-manual.c'),
@@ -288,8 +279,8 @@ executables += [
                 'c_args' : ['-fno-sanitize=all', '-fno-optimize-sibling-calls', '-O1'],
         },
         test_template + {
-                'sources' : files('test-cryptolib.c'),
-                'dependencies' : libopenssl,
+                'sources' : files('test-crypto-util.c'),
+                'dependencies' : libopenssl_cflags,
                 'conditions' : ['HAVE_OPENSSL'],
         },
         test_template + {
@@ -300,21 +291,23 @@ executables += [
                 'sources' : files('test-dlopen-so.c'),
                 'dependencies' : [
                         libblkid_cflags,
+                        libfdisk_cflags,
+                        libgnutls_cflags,
                         libkmod_cflags,
+                        libmicrohttpd_cflags,
                         libmount_cflags,
                         libp11kit_cflags,
                         libseccomp_cflags,
                 ],
         },
         test_template + {
-                # only static linking apart from libdl, to make sure that the
-                # module is linked to all libraries that it uses.
+                # only static linking, to make sure that the module is linked
+                # to all libraries that it uses.
                 'sources' : files('test-dlopen.c'),
                 'link_with' : [
                         libc_wrapper_static,
                         libbasic_static,
                 ],
-                'dependencies' : libdl,
                 'install' : false,
                 'type' : 'manual',
         },
@@ -325,6 +318,11 @@ executables += [
         test_template + {
                 'sources' : files('test-fd-util.c'),
                 'dependencies' : libseccomp_cflags,
+        },
+        test_template + {
+                'sources' : files('test-fdstore.c'),
+                'link_with' : libsystemd,
+                'type' : 'manual',
         },
         test_template + {
                 'sources' : files(
@@ -343,8 +341,12 @@ executables += [
                 'type' : 'unsafe',
         },
         test_template + {
-                'sources' : files('test-json.c'),
-                'dependencies' : libm,
+                'sources' : files('test-kexec.c'),
+                'link_with' : [libshared],
+        },
+        test_template + {
+                'sources' : files('test-curl-util.c'),
+                'conditions' : ['HAVE_LIBCURL'],
         },
         test_template + {
                 'sources' : files('test-libcrypt-util.c'),
@@ -354,22 +356,22 @@ executables += [
         test_template + {
                 'sources' : files('test-libmount.c'),
                 'conditions' : ['HAVE_LIBMOUNT'],
-                'dependencies' : [
-                        libmount_cflags,
-                        threads,
-                ],
+                'dependencies' : libmount_cflags,
         },
         test_template + {
                 'sources' : files('test-loopback.c'),
                 'dependencies' : common_test_dependencies,
         },
         test_template + {
+                'sources' : files('test-luo.c'),
+                'type' : 'manual',
+        },
+        test_template + {
                 'sources' : files('test-math-util.c'),
                 'dependencies' : libm,
         },
         test_template + {
-                'sources' : files('test-mempress.c'),
-                'dependencies' : threads,
+                'sources' : files('test-pressure.c'),
         },
         test_template + {
                 'sources' : files('test-mount-util.c'),
@@ -389,32 +391,22 @@ executables += [
         test_template + {
                 'sources' : files('test-nss-hosts.c'),
                 'extract' : files('nss-test-util.c'),
-                'dependencies' : [
-                        libdl,
-                        libseccomp_cflags,
-                ],
+                'dependencies' : libseccomp_cflags,
                 'conditions' : ['ENABLE_NSS'],
                 'timeout' : 120,
         },
         test_template + {
                 'sources' : files('test-nss-users.c'),
                 'objects' : ['test-nss-hosts'],
-                'dependencies' : libdl,
                 'conditions' : ['ENABLE_NSS'],
         },
         test_template + {
-                'sources' : files('test-openssl.c'),
-                'dependencies' : libopenssl,
-                'conditions' : ['HAVE_OPENSSL'],
-        },
-        test_template + {
                 'sources' : files('test-pkcs7-util.c'),
-                'dependencies' : libopenssl,
+                'dependencies' : libopenssl_cflags,
                 'conditions' : ['HAVE_OPENSSL'],
         },
         test_template + {
                 'sources' : files('test-parse-util.c'),
-                'dependencies' : libm,
         },
         test_template + {
                 'sources' : files('test-shift-uid.c'),
@@ -422,18 +414,23 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-process-util.c'),
-                'dependencies' : threads,
         },
         test_template + {
                 'sources' : files('test-progress-bar.c'),
         },
         test_template + {
+                'sources' : files('test-qmp-client.c'),
+        },
+        test_template + {
+                'sources' : files('test-qmp-client-qemu.c'),
+                'objects' : ['systemd-vmspawn'],
+                'conditions' : ['ENABLE_VMSPAWN'],
+        },
+        test_template + {
                 'sources' : files('test-qrcode-util.c'),
-                'dependencies' : libdl,
         },
         test_template + {
                 'sources' : files('test-random-util.c'),
-                'dependencies' : libm,
                 'timeout' : 120,
         },
         test_template + {
@@ -459,7 +456,6 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-set-disable-mempool.c'),
-                'dependencies' : threads,
         },
         test_template + {
                 'sources' : files('test-sizeof.c'),
@@ -478,20 +474,30 @@ executables += [
         },
         test_template + {
                 'sources' : files('test-tpm2.c'),
-                'dependencies' : libopenssl,
+                'dependencies' : libopenssl_cflags,
                 'timeout' : 120,
         },
         test_template + {
                 'sources' : files('test-utmp.c'),
                 'conditions' : ['ENABLE_UTMP'],
         },
-        test_template + {
-                'sources' : files('test-varlink.c'),
-                'dependencies' : threads,
+        core_test_template + {
+                'sources' : files('test-varlink-idl-job.c'),
+        },
+        core_test_template + {
+                'sources' : files('test-varlink-idl-manager.c'),
+        },
+        core_test_template + {
+                'sources' : files('test-varlink-idl-unit.c'),
         },
         test_template + {
-                'sources' : files('test-varlink-idl.c'),
-                'dependencies' : threads,
+                'sources' : files('test-varlink-idl-machine.c'),
+                'objects' : ['systemd-machined'],
+                'conditions' : ['ENABLE_MACHINED'],
+        },
+        test_template + {
+                'sources' : files('test-varlink-idl-login.c'),
+                'objects' : ['systemd-logind'],
         },
         test_template + {
                 'sources' : files('test-watchdog.c'),
@@ -531,8 +537,13 @@ executables += [
                 'dependencies' : common_test_dependencies,
         },
         core_test_template + {
+                'sources' : files('test-bpf-restrict-fsaccess.c'),
+                'dependencies' : common_test_dependencies,
+                'type' : 'manual',
+        },
+        core_test_template + {
                 'sources' : files('test-bpf-token.c'),
-                'dependencies' : common_test_dependencies + libbpf,
+                'dependencies' : common_test_dependencies + libbpf_cflags,
                 'conditions' : ['BPF_FRAMEWORK'],
                 'type' : 'manual',
         },
@@ -580,8 +591,7 @@ executables += [
                 'dependencies' : common_test_dependencies,
         },
         core_test_template + {
-                'sources' : files('test-loop-block.c'),
-                'dependencies' : [threads],
+                'sources' : files('test-loop-util.c'),
                 'parallel' : false,
         },
         core_test_template + {
@@ -589,10 +599,7 @@ executables += [
         },
         core_test_template + {
                 'sources' : files('test-namespace.c'),
-                'dependencies' : [
-                        threads,
-                        libmount_cflags,
-                ],
+                'dependencies' : libmount_cflags,
         },
         core_test_template + {
                 'sources' : files('test-ns.c'),
@@ -610,7 +617,6 @@ executables += [
         },
         core_test_template + {
                 'sources' : files('test-socket-bind.c'),
-                'dependencies' : libdl,
                 'conditions' : ['BPF_FRAMEWORK'],
         },
         core_test_template + {
@@ -644,7 +650,6 @@ executables += [
                         libbasic_static,
                         libsystemd,
                 ],
-                'dependencies' : threads,
         },
         test_template + {
                 'sources' : files('../libudev/test-udev-device-thread.c'),
@@ -653,7 +658,6 @@ executables += [
                         libbasic_static,
                         libudev,
                 ],
-                'dependencies' : threads,
         },
         test_template + {
                 'sources' : files('../libudev/test-libudev.c'),

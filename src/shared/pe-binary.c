@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "crypto-util.h"
 #include "hexdecoct.h"
 #include "log.h"
 #include "pe-binary.h"
@@ -199,7 +200,7 @@ int pe_read_section_data(
 
         size_t n = le32toh(section->VirtualSize);
         if (n > MIN(max_size, (size_t) SSIZE_MAX))
-                return -E2BIG;
+                return -EBADMSG;
 
         _cleanup_free_ void *data = malloc(n+1);
         if (!data)
@@ -209,7 +210,7 @@ int pe_read_section_data(
         if (ss < 0)
                 return -errno;
         if ((size_t) ss != n)
-                return -EIO;
+                return -EBADMSG;
 
         if (ret_size)
                 *ret_size = n;
@@ -325,7 +326,7 @@ static int hash_file(int fd, EVP_MD_CTX *md_ctx, uint64_t offset, uint64_t size)
                 if ((size_t) n != m)
                         return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Short read while hashing.");
 
-                if (EVP_DigestUpdate(md_ctx, buffer, m) != 1)
+                if (sym_EVP_DigestUpdate(md_ctx, buffer, m) != 1)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Unable to hash data.");
 
                 offset += m;
@@ -358,6 +359,10 @@ int pe_hash(int fd,
         assert(ret_hash_size);
         assert(ret_hash);
 
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
         if (fstat(fd, &st) < 0)
                 return log_debug_errno(errno, "Failed to stat file: %m");
         r = stat_verify_regular(&st);
@@ -376,11 +381,11 @@ int pe_hash(int fd,
         if (!certificate_table)
                 return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "File lacks certificate table.");
 
-        mdctx = EVP_MD_CTX_new();
+        mdctx = sym_EVP_MD_CTX_new();
         if (!mdctx)
                 return log_oom_debug();
 
-        if (EVP_DigestInit_ex(mdctx, md, NULL) != 1)
+        if (sym_EVP_DigestInit_ex(mdctx, md, NULL) != 1)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to allocate message digest.");
 
         /* Everything from beginning of file to CheckSum field in PE header */
@@ -421,18 +426,18 @@ int pe_hash(int fd,
         if ((uint64_t) st.st_size > p) {
 
                 if ((uint64_t) st.st_size - p < le32toh(certificate_table->Size))
-                        return log_debug_errno(errno, "No space for certificate table, refusing.");
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "No space for certificate table, refusing.");
 
-                r = hash_file(fd, mdctx, p, st.st_size - p - le32toh(certificate_table->Size));
+                r = hash_file(fd, mdctx, p, (uint64_t) st.st_size - p - le32toh(certificate_table->Size));
                 if (r < 0)
                         return r;
 
                 /* If the file size is not a multiple of 8 bytes, pad the hash with zero bytes. */
-                if (st.st_size % 8 != 0 && EVP_DigestUpdate(mdctx, (const uint8_t[8]) {}, 8 - (st.st_size % 8)) != 1)
+                if (st.st_size % 8 != 0 && sym_EVP_DigestUpdate(mdctx, (const uint8_t[8]) {}, 8 - (st.st_size % 8)) != 1)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Unable to hash data.");
         }
 
-        int hsz = EVP_MD_CTX_size(mdctx);
+        int hsz = sym_EVP_MD_CTX_get_size(mdctx);
         if (hsz < 0)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to get hash size.");
 
@@ -441,7 +446,7 @@ int pe_hash(int fd,
         if (!hash)
                 return log_oom_debug();
 
-        if (EVP_DigestFinal_ex(mdctx, hash, &hash_size) != 1)
+        if (sym_EVP_DigestFinal_ex(mdctx, hash, &hash_size) != 1)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to finalize hash function.");
 
         assert(hash_size == (unsigned) hsz);
@@ -482,7 +487,8 @@ int pe_checksum(int fd, uint32_t *ret) {
                         return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Short read from PE file");
 
                 for (size_t i = 0; i < (size_t) n / 2; i++) {
-                        if (off + i >= checksum_offset && off + i < checksum_offset + sizeof(pe_header->optional.CheckSum))
+                        size_t pos = off + i * sizeof(uint16_t);
+                        if (pos >= checksum_offset && pos < checksum_offset + sizeof(pe_header->optional.CheckSum))
                                 continue;
 
                         uint16_t val = le16toh(buf[i]);
@@ -525,6 +531,10 @@ int uki_hash(int fd,
         assert(ret_hashes);
         assert(ret_hash_size);
 
+        r = dlopen_libcrypto(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
         r = pe_load_headers(fd, &dos_header, &pe_header);
         if (r < 0)
                 return r;
@@ -533,7 +543,7 @@ int uki_hash(int fd,
         if (r < 0)
                 return r;
 
-        int hsz = EVP_MD_size(md);
+        int hsz = sym_EVP_MD_get_size(md);
         if (hsz < 0)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to get hash size.");
 
@@ -553,11 +563,11 @@ int uki_hash(int fd,
                 if (hashes[i])
                         return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Duplicate section");
 
-                mdctx = EVP_MD_CTX_new();
+                mdctx = sym_EVP_MD_CTX_new();
                 if (!mdctx)
                         return log_oom_debug();
 
-                if (EVP_DigestInit_ex(mdctx, md, NULL) != 1)
+                if (sym_EVP_DigestInit_ex(mdctx, md, NULL) != 1)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to allocate message digest.");
 
                 r = hash_file(fd, mdctx, le32toh(section->PointerToRawData), MIN(le32toh(section->VirtualSize), le32toh(section->SizeOfRawData)));
@@ -571,7 +581,7 @@ int uki_hash(int fd,
                         while (remaining > 0) {
                                 size_t sz = MIN(sizeof(zeroes), remaining);
 
-                                if (EVP_DigestUpdate(mdctx, zeroes, sz) != 1)
+                                if (sym_EVP_DigestUpdate(mdctx, zeroes, sz) != 1)
                                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Unable to hash data.");
 
                                 remaining -= sz;
@@ -583,7 +593,7 @@ int uki_hash(int fd,
                         return log_oom_debug();
 
                 unsigned hash_size = (unsigned) hsz;
-                if (EVP_DigestFinal_ex(mdctx, hashes[i], &hash_size) != 1)
+                if (sym_EVP_DigestFinal_ex(mdctx, hashes[i], &hash_size) != 1)
                         return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to finalize hash function.");
 
                 assert(hash_size == (unsigned) hsz);
@@ -592,7 +602,7 @@ int uki_hash(int fd,
                         _cleanup_free_ char *hs = NULL;
 
                         hs = hexmem(hashes[i], hsz);
-                        log_debug("Section %s with %s is %s.", n, EVP_MD_name(md), strna(hs));
+                        log_debug("Section %s with %s is %s.", n, sym_EVP_MD_get0_name(md), strna(hs));
                 }
         }
 
