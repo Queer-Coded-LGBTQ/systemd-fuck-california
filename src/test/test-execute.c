@@ -1027,11 +1027,6 @@ static void test_exec_dynamicuser(Manager *m) {
                 return;
         }
 
-        if (strstr_ptr(ci_environment(), "github-actions")) {
-                log_notice("%s: skipping test on GH Actions because of systemd/systemd#10337", __func__);
-                return;
-        }
-
         int status = can_unshare ? 0 : EXIT_NAMESPACE;
 
         test(m, "exec-dynamicuser-fixeduser.service", status, CLD_EXITED);
@@ -1435,7 +1430,7 @@ static void run_tests(RuntimeScope scope, char **patterns) {
         ASSERT_OK(r);
 
         m->defaults.std_output = EXEC_OUTPUT_INHERIT; /* don't rely on host journald */
-        ASSERT_OK(manager_startup(m, NULL, NULL, NULL));
+        ASSERT_OK(manager_startup(m, NULL, NULL, NULL, NULL));
 
         /* Uncomment below if you want to make debugging logs stored to journal. */
         //manager_override_log_target(m, LOG_TARGET_AUTO);
@@ -1633,7 +1628,7 @@ static int intro(void) {
         if (path_is_read_only_fs("/sys") > 0)
                 return log_tests_skipped("/sys is mounted read-only");
 
-        r = dlopen_libmount();
+        r = dlopen_libmount(LOG_DEBUG);
         if (r < 0)
                 return log_tests_skipped("libmount not available.");
 
