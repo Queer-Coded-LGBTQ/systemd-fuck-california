@@ -2,7 +2,8 @@
 #pragma once
 
 #include "basic-forward.h"
-#include "strv-fundamental.h"   /* IWYU pragma: export */
+
+#include "../fundamental/strv.h"   /* IWYU pragma: export */
 
 char* strv_find(char * const *l, const char *name) _pure_;
 char* strv_find_case(char * const *l, const char *name) _pure_;
@@ -102,10 +103,6 @@ char** strv_new_ap(const char *x, va_list ap);
 
 static inline const char* STRV_IFNOTNULL(const char *x) {
         return x ?: STRV_IGNORE;
-}
-
-static inline bool strv_isempty(char * const *l) {
-        return !l || !*l;
 }
 
 int strv_split_full(char ***t, const char *s, const char *separators, ExtractFlags flags);
