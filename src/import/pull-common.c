@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "sd-id128.h"
 
 #include "alloc-util.h"
@@ -8,6 +10,7 @@
 #include "fd-util.h"
 #include "hexdecoct.h"
 #include "io-util.h"
+#include "iovec-util.h"
 #include "log.h"
 #include "memory-util.h"
 #include "os-util.h"
@@ -528,7 +531,6 @@ int pull_verify(ImportVerify verify,
                 PullJob *verity_job) {
 
         _cleanup_free_ char *fn = NULL;
-        VerificationStyle style;
         PullJob *verify_job;
         int r;
 
@@ -576,11 +578,6 @@ int pull_verify(ImportVerify verify,
                 return 0;
 
         assert(verify_job);
-
-        r = verification_style_from_url(verify_job->url, &style);
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine verification style from URL '%s': %m", verify_job->url);
-
         assert(signature_job);
         assert(signature_job->state == PULL_JOB_DONE);
 
@@ -622,6 +619,7 @@ int pull_job_restart_with_sha256sum(PullJob *j, char **ret) {
         int r;
 
         assert(j);
+        assert(ret);
 
         /* Generic implementation of a PullJobNotFound handler, that restarts the job requesting SHA256SUMS */
 
@@ -675,6 +673,7 @@ int pull_job_restart_with_signature(PullJob *j, char **ret) {
         int r;
 
         assert(j);
+        assert(ret);
 
         /* Generic implementation of a PullJobNotFound handler, that restarts the job requesting a different
          * signature file. After the initial file, additional *.sha256.gpg, SHA256SUMS.gpg and SHA256SUMS.asc
