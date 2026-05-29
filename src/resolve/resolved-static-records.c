@@ -10,8 +10,6 @@
 #include "dns-question.h"
 #include "dns-rr.h"
 #include "errno-util.h"
-#include "fd-util.h"
-#include "fileio.h"
 #include "hashmap.h"
 #include "json-util.h"
 #include "log.h"
@@ -29,7 +27,7 @@
  * serializations of DNS RRs. Also note the semantics are different from DNS zone file format, for example
  * regarding delegation (i.e. the RRs defined here have no effect on subdomains), which is probably nicer for
  * one-off mappings of domains to specific resources. Or in other words, this is supposed to be a drop-in
- * based alternative to /etc/hosts, not a one to DNS zone files. (The JSON format is also a lot more
+ * based alternative to /etc/hosts, not one to DNS zone files. (The JSON format is also a lot more
  * extensible to us, for example we could teach it to map certain lookups to specific DNS errors, or extend
  * it so that subdomains always get NXDOMAIN or similar).
  *
@@ -49,6 +47,8 @@ DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
 
 static int load_static_record_file_item(sd_json_variant *rj, Hashmap **records) {
         int r;
+
+        assert(records);
 
         _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
         r = dns_resource_record_from_json(rj, &rr);
@@ -94,16 +94,9 @@ static int load_static_record_file(const ConfFile *cf, Hashmap **records, Set **
         if (set_ensure_consume(stats, &inode_unmodified_hash_ops, TAKE_PTR(st_copy)) < 0)
                 return log_oom();
 
-        _cleanup_fclose_ FILE *f = NULL;
-        r = xfopenat(cf->fd, /* path= */ NULL, "re", /* open_flags= */ 0, &f);
-        if (r < 0) {
-                log_warning_errno(r, "Failed to open '%s', skipping: %m", cf->result);
-                return 0;
-        }
-
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
         unsigned line = 0, column = 0;
-        r = sd_json_parse_file(f, cf->result, /* flags= */ 0, &j, &line, &column);
+        r = sd_json_parse_fd(cf->result, cf->fd, SD_JSON_PARSE_REOPEN_FD, &j, &line, &column);
         if (r < 0) {
                 if (line > 0)
                         log_syntax(/* unit= */ NULL, LOG_WARNING, cf->result, line, r, "Failed to parse JSON, skipping: %m");
@@ -145,7 +138,7 @@ static int manager_static_records_read(Manager *m) {
 
         ConfFile **files = NULL;
         size_t n_files = 0;
-        CLEANUP_ARRAY(files, n_files, conf_file_free_many);
+        CLEANUP_ARRAY(files, n_files, conf_file_free_array);
 
         r = conf_files_list_nulstr_full(
                         ".rr",
@@ -222,5 +215,4 @@ void manager_static_records_flush(Manager *m) {
 
         m->static_records = hashmap_free(m->static_records);
         m->static_records_stat = set_free(m->static_records_stat);
-        m->static_records_last = USEC_INFINITY;
 }

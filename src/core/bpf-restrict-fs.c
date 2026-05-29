@@ -15,9 +15,9 @@
 
 #if BPF_FRAMEWORK
 /* libbpf, clang and llc compile time dependencies are satisfied */
-#include "bpf-dlopen.h"
+#include "bpf-util.h"
 #include "bpf-link.h"
-#include "bpf/restrict-fs/restrict-fs-skel.h"
+#include "restrict-fs-skel.h"
 
 #define CGROUP_HASH_SIZE_MAX 2048
 
@@ -29,19 +29,6 @@ static struct restrict_fs_bpf *restrict_fs_bpf_free(struct restrict_fs_bpf *obj)
 }
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(struct restrict_fs_bpf *, restrict_fs_bpf_free);
-
-static bool bpf_can_link_lsm_program(struct bpf_program *prog) {
-        _cleanup_(bpf_link_freep) struct bpf_link *link = NULL;
-
-        assert(prog);
-
-        link = sym_bpf_program__attach_lsm(prog);
-
-        /* If bpf_program__attach_lsm fails the resulting value stores libbpf error code instead of memory
-         * pointer. That is the case when the helper is called on architectures where BPF trampoline (hence
-         * BPF_LSM_MAC attach type) is not supported. */
-        return bpf_get_error_translated(link) == 0;
-}
 
 static int prepare_restrict_fs_bpf(struct restrict_fs_bpf **ret_obj) {
         _cleanup_(restrict_fs_bpf_freep) struct restrict_fs_bpf *obj = NULL;
@@ -91,7 +78,7 @@ bool bpf_restrict_fs_supported(bool initialize) {
         if (!initialize)
                 return false;
 
-        if (dlopen_bpf_full(LOG_WARNING) < 0)
+        if (dlopen_bpf(LOG_WARNING) < 0)
                 return (supported = false);
 
         r = lsm_supported("bpf");
