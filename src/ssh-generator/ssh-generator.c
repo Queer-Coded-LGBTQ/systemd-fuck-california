@@ -238,8 +238,8 @@ static int add_vsock_socket(
                         "sshd-vsock.socket",
                         "vsock::22",
                         "AF_VSOCK",
-                        "ExecStartPost=-/usr/lib/systemd/systemd-ssh-issue --make-vsock\n"
-                        "ExecStopPre=-/usr/lib/systemd/systemd-ssh-issue --rm-vsock\n",
+                        "ExecStartPost=-/usr/lib/systemd/systemd-ssh-issue make-vsock\n"
+                        "ExecStopPre=-/usr/lib/systemd/systemd-ssh-issue rm-vsock\n",
                         /* with_ssh_access_target_dependency= */ true);
         if (r < 0)
                 return r;
@@ -338,7 +338,7 @@ static int add_export_unix_socket(
                 return r;
 
         log_debug("Binding SSH to AF_UNIX socket /run/host/unix-export/ssh\n"
-                  "→ connect via 'ssh unix/run/systemd/nspawn/unix-export/\?\?\?/ssh' from host");
+                  "→ connect via 'ssh unix/run/systemd/nspawn/\?\?\?/unix-export/ssh' from host");
 
         return 0;
 }

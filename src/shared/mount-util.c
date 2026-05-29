@@ -21,7 +21,7 @@
 #include "hashmap.h"
 #include "libmount-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
@@ -451,7 +451,7 @@ int bind_remount_one_with_mountinfo(
 
         rewind(proc_self_mountinfo);
 
-        r = dlopen_libmount();
+        r = dlopen_libmount(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -900,7 +900,7 @@ int mount_option_mangle(
          * The validity of options stored in '*ret_remaining_options' is not checked.
          * If 'options' is NULL, this just copies 'mount_flags' to *ret_mount_flags. */
 
-        r = dlopen_libmount();
+        r = dlopen_libmount(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1748,14 +1748,7 @@ static void sub_mount_clear(SubMount *s) {
         s->mount_fd = safe_close(s->mount_fd);
 }
 
-void sub_mount_array_free(SubMount *s, size_t n) {
-        assert(s || n == 0);
-
-        for (size_t i = 0; i < n; i++)
-                sub_mount_clear(s + i);
-
-        free(s);
-}
+DEFINE_ARRAY_FREE_FUNC(sub_mount_array_free, SubMount, sub_mount_clear);
 
 #if HAVE_LIBMOUNT
 static int sub_mount_compare(const SubMount *a, const SubMount *b) {
@@ -1988,10 +1981,19 @@ int fsmount_credentials_fs(int *ret_fsfd) {
         if (fsconfig(fs_fd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) < 0)
                 return -errno;
 
-        int mfd = fsmount(fs_fd, FSMOUNT_CLOEXEC,
-                          ms_flags_to_mount_attr(credentials_fs_mount_flags(/* ro= */ false)));
+        unsigned mount_attrs = ms_flags_to_mount_attr(credentials_fs_mount_flags(/* ro = */ false));
+
+        int mfd = RET_NERRNO(fsmount(fs_fd, FSMOUNT_CLOEXEC, mount_attrs));
+        if (mfd == -EINVAL) {
+                /* MS_NOSYMFOLLOW was added in kernel 5.10, but the new mount API counterpart was missing
+                 * until 5.14 (c.f. https://github.com/torvalds/linux/commit/dd8b477f9a3d8edb136207acb3652e1a34a661b7).
+                 *
+                 * TODO: drop this once our baseline is raised to 5.14 */
+                assert(FLAGS_SET(mount_attrs, MOUNT_ATTR_NOSYMFOLLOW));
+                mfd = RET_NERRNO(fsmount(fs_fd, FSMOUNT_CLOEXEC, mount_attrs & ~MOUNT_ATTR_NOSYMFOLLOW));
+        }
         if (mfd < 0)
-                return -errno;
+                return mfd;
 
         if (ret_fsfd)
                 *ret_fsfd = TAKE_FD(fs_fd);
@@ -2058,7 +2060,7 @@ int make_fsmount(
 
                 r = extract_first_word(&p, &word, ",", EXTRACT_KEEP_QUOTE);
                 if (r < 0)
-                        return log_full_errno(error_log_level, r, "Failed to parse mount option string \"%s\": %m", o);
+                        return log_full_errno(error_log_level, r, "Failed to parse mount option string \"%s\": %m", strempty(o));
                 if (r == 0)
                         break;
 
