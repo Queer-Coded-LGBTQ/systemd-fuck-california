@@ -3,8 +3,10 @@
 
 #include "shared-forward.h"
 
-int dlopen_dw(void);
-int dlopen_elf(void);
+int dlopen_dw(int log_level);
+int dlopen_elf(int log_level);
+
+bool dlopen_dw_has_dwfl_set_sysroot(void);
 
 /* Parse an ELF object in a forked process, so that errors while iterating over
  * untrusted and potentially malicious data do not propagate to the main caller's process.
