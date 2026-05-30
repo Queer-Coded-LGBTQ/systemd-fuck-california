@@ -10,12 +10,21 @@ executables += [
                         'HAVE_TPM2',
                 ],
                 'dependencies' : [
-                        libopenssl,
+                        libopenssl_cflags,
                 ],
         },
         libexec_template + {
                 'name' : 'systemd-tpm2-clear',
                 'sources' : files('tpm2-clear.c'),
+                'conditions' : [
+                        'ENABLE_BOOTLOADER',
+                        'HAVE_OPENSSL',
+                        'HAVE_TPM2',
+                ],
+        },
+        libexec_template + {
+                'name' : 'systemd-tpm2-swtpm',
+                'sources' : files('tpm2-swtpm.c'),
                 'conditions' : [
                         'ENABLE_BOOTLOADER',
                         'HAVE_OPENSSL',
@@ -36,6 +45,7 @@ executables += [
 if conf.get('ENABLE_BOOTLOADER') == 1 and conf.get('HAVE_OPENSSL') == 1 and conf.get('HAVE_TPM2') == 1
         nvpcrs = [ 'cryptsetup',
                    'hardware',
+                   'login',
                    'verity']
         foreach n : nvpcrs
                 custom_target(

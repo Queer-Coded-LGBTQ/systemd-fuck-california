@@ -87,6 +87,12 @@ bool _log_message_dummy = false; /* Always false */
                 }                                                       \
         } while (false)
 
+void log_prefix_swap(const char **prefix) {
+        assert(prefix);
+
+        SWAP_TWO(log_prefix, *prefix);
+}
+
 static void log_close_console(void) {
         /* See comment in log_close_journal() */
         (void) safe_close_above_stdio(TAKE_FD(console_fd));
@@ -557,7 +563,7 @@ static int write_to_syslog(
                 if (!syslog_is_stream)
                         break;
 
-                if (iovec_increment(iovec, ELEMENTSOF(iovec), n))
+                if (iovec_inc_many(iovec, ELEMENTSOF(iovec), n))
                         break;
         }
 
@@ -949,6 +955,9 @@ int log_format_iovec(
                 int error,
                 const char *format,
                 va_list ap) {
+
+        assert(iovec);
+        assert(n);
 
         while (format && *n + 1 < iovec_len) {
                 va_list aq;

@@ -13,6 +13,7 @@
 #include "format-table.h"
 #include "glyph-util.h"
 #include "iovec-util.h"
+#include "locale-util.h"
 #include "plymouth-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -22,8 +23,6 @@
 #ifndef FIDO_ERR_UV_BLOCKED
 #define FIDO_ERR_UV_BLOCKED 0x3c
 #endif
-
-static void *libfido2_dl = NULL;
 
 DLSYM_PROTOTYPE(fido_assert_allow_cred) = NULL;
 DLSYM_PROTOTYPE(fido_assert_free) = NULL;
@@ -80,8 +79,9 @@ static void fido_log_propagate_handler(const char *s) {
 
 #endif
 
-int dlopen_libfido2(void) {
+int dlopen_libfido2(int log_level) {
 #if HAVE_LIBFIDO2
+        static void *libfido2_dl = NULL;
         int r;
 
         SD_ELF_NOTE_DLOPEN(
@@ -91,7 +91,7 @@ int dlopen_libfido2(void) {
                         "libfido2.so.1");
 
         r = dlopen_many_sym_or_warn(
-                        &libfido2_dl, "libfido2.so.1", LOG_DEBUG,
+                        &libfido2_dl, "libfido2.so.1", log_level,
                         DLSYM_ARG(fido_assert_allow_cred),
                         DLSYM_ARG(fido_assert_free),
                         DLSYM_ARG(fido_assert_hmac_secret_len),
@@ -148,7 +148,8 @@ int dlopen_libfido2(void) {
 
         return 0;
 #else
-        return -EOPNOTSUPP;
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libfido2 support is not compiled in.");
 #endif
 }
 
@@ -360,7 +361,7 @@ static int fido2_is_cred_in_specific_token(
         /* According to CTAP 2.1 specification, to do pre-flight we need to set up option to false
          * with optionally pinUvAuthParam in assertion[1]. But for authenticator that doesn't support
          * user presence, once up option is present, the authenticator may return CTAP2_ERR_UNSUPPORTED_OPTION[2].
-         * So we simplely omit the option in that case.
+         * So we simply omit the option in that case.
          * Reference:
          * 1: https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#pre-flight
          * 2: https://fidoalliance.org/specs/fido-v2.0-ps-20190130/fido-client-to-authenticator-protocol-v2.0-ps-20190130.html#authenticatorGetAssertion (in step 5)
@@ -493,7 +494,7 @@ static int fido2_use_hmac_hash_specific_token(
                         log_notice("%s%sPlease confirm presence on security token to unlock.",
                                    emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
-                        plymouth_start_interaction("Please confirm presence on security token to unlock.", &plymouth_displayed);
+                        plymouth_start_interaction(_("Please confirm presence on security token to unlock."), &plymouth_displayed);
                 }
         }
 
@@ -509,7 +510,7 @@ static int fido2_use_hmac_hash_specific_token(
                         log_notice("%s%sPlease verify user on security token to unlock.",
                                    emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                    emoji_enabled() ? " " : "");
-                        plymouth_start_interaction("Please verify user on security token to unlock.", &plymouth_displayed);
+                        plymouth_start_interaction(_("Please verify user on security token to unlock."), &plymouth_displayed);
                 }
         }
 
@@ -550,7 +551,7 @@ static int fido2_use_hmac_hash_specific_token(
                                 log_notice("%s%sPlease confirm presence on security to unlock.",
                                            emoji_enabled() ? glyph(GLYPH_TOUCH) : "",
                                            emoji_enabled() ? " " : "");
-                                plymouth_start_interaction("Please confirm presence on security token to unlock.", &plymouth_displayed);
+                                plymouth_start_interaction(_("Please confirm presence on security token to unlock."), &plymouth_displayed);
                                 retry_with_up = true;
                         }
 
@@ -658,9 +659,9 @@ int fido2_use_hmac_hash(
         fido_dev_info_t *di = NULL;
         int r;
 
-        r = dlopen_libfido2();
+        r = dlopen_libfido2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "FIDO2 support is not installed.");
+                return r;
 
         if (device) {
                 r = fido2_is_cred_in_specific_token(device, rp_id, cid, cid_size, required);
@@ -784,9 +785,9 @@ int fido2_generate_hmac_hash(
         assert((lock_with & ~(FIDO2ENROLL_PIN|FIDO2ENROLL_UP|FIDO2ENROLL_UV)) == 0);
         assert(iovec_is_set(salt));
 
-        r = dlopen_libfido2();
+        r = dlopen_libfido2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "FIDO2 token support is not installed.");
+                return r;
 
         d = sym_fido_dev_new();
         if (!d)
@@ -922,7 +923,7 @@ int fido2_generate_hmac_hash(
                         _cleanup_strv_free_erase_ char **pin = NULL;
                         AskPasswordRequest req = {
                                 .tty_fd = -EBADF,
-                                .message = "Please enter security token PIN:",
+                                .message = _("Please enter security token PIN:"),
                                 .icon = askpw_icon,
                                 .keyring = "fido2-pin",
                                 .credential = askpw_credential,
@@ -1153,6 +1154,12 @@ static int check_device_is_fido2_with_hmac_secret(
         _cleanup_(fido_dev_free_wrapper) fido_dev_t *d = NULL;
         int r;
 
+        assert(ret_has_rk);
+        assert(ret_has_client_pin);
+        assert(ret_has_up);
+        assert(ret_has_uv);
+        assert(ret_has_always_uv);
+
         d = sym_fido_dev_new();
         if (!d)
                 return log_oom();
@@ -1182,9 +1189,9 @@ int fido2_list_devices(void) {
         fido_dev_info_t *di = NULL;
         int r;
 
-        r = dlopen_libfido2();
+        r = dlopen_libfido2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "FIDO2 token support is not installed.");
+                return r;
 
         di = sym_fido_dev_info_new(allocated);
         if (!di)
@@ -1241,11 +1248,9 @@ int fido2_list_devices(void) {
                 }
         }
 
-        r = table_print(t, stdout);
-        if (r < 0) {
-                log_error_errno(r, "Failed to show device table: %m");
+        r = table_print_or_warn(t);
+        if (r < 0)
                 goto finish;
-        }
 
         if (!table_isempty(t))
                 printf("\n"
@@ -1278,9 +1283,9 @@ int fido2_find_device_auto(char **ret) {
         const char *path;
         int r;
 
-        r = dlopen_libfido2();
+        r = dlopen_libfido2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "FIDO2 token support is not installed.");
+                return r;
 
         di = sym_fido_dev_info_new(di_size);
         if (!di)
@@ -1355,9 +1360,9 @@ int fido2_have_device(const char *device) {
 
         /* Return == 0 if not devices are found, > 0 if at least one is found */
 
-        r = dlopen_libfido2();
+        r = dlopen_libfido2(LOG_ERR);
         if (r < 0)
-                return log_error_errno(r, "FIDO2 support is not installed.");
+                return r;
 
         if (device) {
                 if (access(device, F_OK) < 0) {
