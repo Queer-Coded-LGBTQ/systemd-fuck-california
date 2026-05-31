@@ -222,6 +222,8 @@ static void setup_unreferenced_data(void) {
 static void mkdtemp_chdir_chattr(const char *template, char **ret) {
         _cleanup_(rm_rf_physical_and_freep) char *path = NULL;
 
+        assert(ret);
+
         ASSERT_OK(mkdtemp_malloc(template, &path));
         ASSERT_OK_ERRNO(chdir(path));
 
@@ -564,7 +566,7 @@ static void test_sequence_numbers_one(void) {
         if (sd_id128_get_machine(NULL) >= 0) {
                 two = journal_file_offline_close(two);
 
-                /* restart server */
+                /* emulate a system restart */
                 seqnum = 0;
 
                 ASSERT_OK(journal_file_open(-EBADF, "two.journal", O_RDWR, JOURNAL_COMPRESS, 0,
@@ -591,6 +593,8 @@ TEST(sequence_numbers) {
 }
 
 static int expected_result(uint64_t needle, const uint64_t *candidates, const uint64_t *offset, size_t n, direction_t direction, uint64_t *ret) {
+        assert(ret);
+
         switch (direction) {
         case DIRECTION_DOWN:
                 for (size_t i = 0; i < n; i++) {
@@ -625,6 +629,8 @@ static int expected_result(uint64_t needle, const uint64_t *candidates, const ui
 }
 
 static int expected_result_next(uint64_t needle, const uint64_t *candidates, const uint64_t *offset, size_t n, direction_t direction, uint64_t *ret) {
+        assert(ret);
+
         switch (direction) {
         case DIRECTION_DOWN:
                 for (size_t i = 0; i < n; i++)
