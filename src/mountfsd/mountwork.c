@@ -158,16 +158,10 @@ static int validate_image_fd(int fd, MountImageParameters *p) {
         assert(fd >= 0);
         assert(p);
 
-        struct stat st;
-        if (fstat(fd, &st) < 0)
-                return -errno;
-        /* Only support regular files and block devices. Let's use stat_verify_regular() here for the nice
-         * error numbers it generates. */
-        if (!S_ISBLK(st.st_mode)) {
-                r = stat_verify_regular(&st);
-                if (r < 0)
-                        return r;
-        }
+        /* Only support regular files and block devices. */
+        r = fd_verify_regular_or_block(fd);
+        if (r < 0)
+                return r;
 
         fl = fd_verify_safe_flags_full(fd, O_NONBLOCK);
         if (fl < 0)
@@ -248,7 +242,7 @@ static int verify_trusted_image_fd_by_path(int fd) {
                         if (!filename_is_valid(e))
                                 continue;
 
-                        r = chaseat(dir_fd, e, CHASE_SAFE|CHASE_TRIGGER_AUTOFS, NULL, &inode_fd);
+                        r = chaseat(XAT_FDROOT, dir_fd, e, CHASE_SAFE|CHASE_TRIGGER_AUTOFS, NULL, &inode_fd);
                         if (r < 0)
                                 return log_error_errno(r, "Couldn't verify that specified image '%s' is in search path '%s': %m", p, s);
 
@@ -521,7 +515,7 @@ static int vl_method_mount_image(
 
         r = loop_device_make(
                         image_fd,
-                        p.read_only > 0 ? O_RDONLY : O_RDWR,
+                        p.read_only > 0 ? O_RDONLY : -1,
                         0,
                         UINT64_MAX,
                         UINT32_MAX,
@@ -754,7 +748,7 @@ static int vl_method_mount_image(
 
                 r = sd_json_variant_append_arraybo(
                                 &aj,
-                                SD_JSON_BUILD_PAIR_STRING("designator", partition_designator_to_string(d)),
+                                JSON_BUILD_PAIR_ENUM("designator", partition_designator_to_string(d)),
                                 SD_JSON_BUILD_PAIR_BOOLEAN("writable", pp->rw),
                                 SD_JSON_BUILD_PAIR_BOOLEAN("growFileSystem", pp->growfs),
                                 SD_JSON_BUILD_PAIR_CONDITION(pp->partno > 0, "partitionNumber", SD_JSON_BUILD_INTEGER(pp->partno)),
@@ -1368,7 +1362,7 @@ static int vl_method_make_directory(
 
         struct stat parent_stat;
         if (fstat(parent_fd, &parent_stat) < 0)
-                return r;
+                return log_debug_errno(errno, "Failed to fstat parent directory fd: %m");
 
         r = stat_verify_directory(&parent_stat);
         if (r < 0)
