@@ -305,6 +305,48 @@ static void test_sd_device_one(sd_device *d) {
                 ASSERT_OK(r = device_get_sysattr_unsigned(d, "nsid", &x));
                 ASSERT_EQ(x > 0, r > 0);
         }
+
+        const char *uevent;
+        if (sd_device_get_sysattr_value(d, "uevent", &uevent) >= 0) {
+                const char *uevent_safe;
+                ASSERT_OK(device_get_sysattr_safe_string(d, "uevent", &uevent_safe));
+                ASSERT_STREQ(uevent, uevent_safe);
+        }
+
+        if (sd_device_get_ifindex(d, &ifindex) >= 0) {
+                int i;
+                ASSERT_OK_POSITIVE(device_get_sysattr_int(d, "ifindex", &i));
+                ASSERT_EQ(i, ifindex);
+
+                unsigned u;
+                ASSERT_OK_POSITIVE(device_get_sysattr_unsigned(d, "ifindex", &u));
+                ASSERT_EQ(u, (unsigned) ifindex);
+
+                uint64_t u64;
+                ASSERT_OK_POSITIVE(device_get_sysattr_u64(d, "ifindex", &u64));
+                ASSERT_EQ(u64, (uint64_t) ifindex);
+
+                uint32_t u32;
+                ASSERT_OK_POSITIVE(device_get_sysattr_u32(d, "ifindex", &u32));
+                ASSERT_EQ(u32, (uint32_t) ifindex);
+
+                if (ifindex <= UINT16_MAX) {
+                        uint16_t u16;
+                        ASSERT_OK_POSITIVE(device_get_sysattr_u16(d, "ifindex", &u16));
+                        ASSERT_EQ(u16, (uint16_t) ifindex);
+                }
+
+                if (ifindex <= UINT8_MAX) {
+                        uint8_t u8;
+                        ASSERT_OK_POSITIVE(device_get_sysattr_u8(d, "ifindex", &u8));
+                        ASSERT_EQ(u8, (uint8_t) ifindex);
+                }
+
+                const char *s;
+                ASSERT_OK(sd_device_get_sysattr_value(d, "ifindex", &s));
+                ASSERT_OK_POSITIVE(device_get_sysattr_streq(d, "ifindex", s));
+                ASSERT_OK_ZERO(device_get_sysattr_streq(d, "ifindex", "hoge"));
+        }
 }
 
 static void exclude_problematic_devices(sd_device_enumerator *e) {
@@ -350,6 +392,9 @@ static void test_sd_device_enumerator_filter_subsystem_one(
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
         unsigned n_new_dev = 0, n_removed_dev = 0;
         sd_device *dev;
+
+        assert(ret_n_new_dev);
+        assert(ret_n_removed_dev);
 
         ASSERT_OK(sd_device_enumerator_new(&e));
         ASSERT_OK(sd_device_enumerator_add_match_subsystem(e, subsystem, true));
@@ -895,7 +940,7 @@ static int intro(void) {
         if (path_is_mount_point("/sys") <= 0)
                 return log_tests_skipped("/sys/ is not mounted");
 
-        r = dlopen_libmount();
+        r = dlopen_libmount(LOG_DEBUG);
         if (r < 0)
                 return log_tests_skipped("libmount not available.");
 
