@@ -20,6 +20,7 @@ typedef enum TableDataType {
         TABLE_VERSION,             /* just like TABLE_STRING, but uses version comparison when sorting */
         TABLE_BOOLEAN,
         TABLE_BOOLEAN_CHECKMARK,
+        TABLE_TRISTATE,
         TABLE_TIMESTAMP,
         TABLE_TIMESTAMP_UTC,
         TABLE_TIMESTAMP_RELATIVE,
@@ -100,6 +101,7 @@ Table* table_new_vertical(void);
 Table* table_unref(Table *t);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Table*, table_unref);
+static inline DEFINE_POINTER_ARRAY_CLEAR_FUNC(Table*, table_unref);
 
 int table_add_cell_full(Table *t, TableCell **ret_cell, TableDataType dt, const void *data, size_t minimum_width, size_t maximum_width, unsigned weight, unsigned align_percent, unsigned ellipsize_percent);
 static inline int table_add_cell(Table *t, TableCell **ret_cell, TableDataType dt, const void *data) {
@@ -144,9 +146,15 @@ int table_hide_column_from_display_internal(Table *t, ...);
 int table_data_requested_width(Table *table, size_t column, size_t *ret);
 
 int table_set_column_width(Table *t, size_t column, size_t width);
-int table_sync_column_width(Table *a, size_t column_a, Table *b, size_t column_b);
+int _table_sync_column_widths(size_t column, Table *a, ...);
+#define table_sync_column_widths(column, a, ...) _table_sync_column_widths(column, a, __VA_ARGS__, NULL)
 
-int table_print(Table *t, FILE *f);
+int table_print_full(Table *t, FILE *f, bool flush);
+static inline int table_print(Table *t) {
+        return table_print_full(t, /* f= */ NULL, /* flush= */ false);
+}
+int table_print_or_warn(Table *t);
+
 int table_format(Table *t, char **ret);
 
 static inline TableCell* TABLE_HEADER_CELL(size_t i) {

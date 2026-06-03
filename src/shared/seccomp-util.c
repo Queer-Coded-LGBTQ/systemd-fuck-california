@@ -34,8 +34,6 @@
 #include "strv.h"
 
 #if HAVE_SECCOMP
-static void *libseccomp_dl = NULL;
-
 DLSYM_PROTOTYPE(seccomp_api_get) = NULL;
 DLSYM_PROTOTYPE(seccomp_arch_add) = NULL;
 DLSYM_PROTOTYPE(seccomp_arch_exist) = NULL;
@@ -49,32 +47,6 @@ DLSYM_PROTOTYPE(seccomp_rule_add_array) = NULL;
 DLSYM_PROTOTYPE(seccomp_rule_add_exact) = NULL;
 DLSYM_PROTOTYPE(seccomp_syscall_resolve_name) = NULL;
 DLSYM_PROTOTYPE(seccomp_syscall_resolve_num_arch) = NULL;
-
-int dlopen_libseccomp(void) {
-        SD_ELF_NOTE_DLOPEN(
-                        "seccomp",
-                        "Support for Seccomp Sandboxes",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED,
-                        "libseccomp.so.2");
-
-        return dlopen_many_sym_or_warn(
-                        &libseccomp_dl,
-                        "libseccomp.so.2",
-                        LOG_DEBUG,
-                        DLSYM_ARG(seccomp_api_get),
-                        DLSYM_ARG(seccomp_arch_add),
-                        DLSYM_ARG(seccomp_arch_exist),
-                        DLSYM_ARG(seccomp_arch_native),
-                        DLSYM_ARG(seccomp_arch_remove),
-                        DLSYM_ARG(seccomp_attr_set),
-                        DLSYM_ARG(seccomp_init),
-                        DLSYM_ARG(seccomp_load),
-                        DLSYM_ARG(seccomp_release),
-                        DLSYM_ARG(seccomp_rule_add_array),
-                        DLSYM_ARG(seccomp_rule_add_exact),
-                        DLSYM_ARG(seccomp_syscall_resolve_name),
-                        DLSYM_ARG(seccomp_syscall_resolve_num_arch));
-}
 
 /* This array will be modified at runtime as seccomp_restrict_archs is called. */
 uint32_t seccomp_local_archs[] = {
@@ -278,10 +250,12 @@ int seccomp_init_for_arch(scmp_filter_ctx *ret, uint32_t arch, uint32_t default_
         _cleanup_(seccomp_releasep) scmp_filter_ctx seccomp = NULL;
         int r;
 
+        assert(ret);
+
         /* Much like seccomp_init(), but initializes the filter for one specific architecture only, without affecting
          * any others. Also, turns off the NNP fiddling. */
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -341,7 +315,7 @@ bool is_seccomp_available(void) {
         static int cached_enabled = -1;
 
         if (cached_enabled < 0) {
-                if (dlopen_libseccomp() < 0)
+                if (dlopen_libseccomp(LOG_DEBUG) < 0)
                         return (cached_enabled = false);
 
                 int b = secure_getenv_bool("SYSTEMD_SECCOMP");
@@ -1091,7 +1065,7 @@ int seccomp_add_syscall_filter_item(
         } else {
                 int id, r;
 
-                r = dlopen_libseccomp();
+                r = dlopen_libseccomp(LOG_DEBUG);
                 if (r < 0)
                         return r;
 
@@ -1171,7 +1145,7 @@ int seccomp_load_syscall_filter_set(uint32_t default_action, const SyscallFilter
         /* The one-stop solution: allocate a seccomp object, add the specified filter to it, and apply it. Once for
          * each local arch. */
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1237,7 +1211,7 @@ int seccomp_load_syscall_filter_set_raw(uint32_t default_action, Hashmap* filter
         if (hashmap_isempty(filter) && default_action == SCMP_ACT_ALLOW)
                 return 0;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1360,12 +1334,12 @@ int seccomp_parse_syscall_filter(
         } else {
                 int id;
 
-                r = dlopen_libseccomp();
+                r = dlopen_libseccomp(LOG_DEBUG);
                 if (r < 0) {
                         if (!FLAGS_SET(flags, SECCOMP_PARSE_PERMISSIVE))
                                 return r;
 
-                        log_syntax(unit, FLAGS_SET(flags, SECCOMP_PARSE_LOG) ? LOG_WARNING : LOG_DEBUG, filename, line, r,
+                        log_syntax(unit, FLAGS_SET(flags, SECCOMP_PARSE_LOG) ? LOG_INFO : LOG_DEBUG, filename, line, r,
                                    "System call %s cannot be resolved as libseccomp is not available, ignoring: %m", name);
                         return 0;
                 }
@@ -1418,7 +1392,7 @@ int seccomp_restrict_namespaces(unsigned long retain) {
         if (FLAGS_SET(retain, NAMESPACE_FLAGS_ALL))
                 return 0;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1546,7 +1520,7 @@ int seccomp_protect_sysctl(void) {
         uint32_t arch;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1598,7 +1572,7 @@ int seccomp_protect_syslog(void) {
         uint32_t arch;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1635,7 +1609,7 @@ int seccomp_restrict_address_families(Set *address_families, bool allow_list) {
         uint32_t arch;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1821,7 +1795,7 @@ int seccomp_restrict_realtime_full(int error_code) {
 
         assert(error_code > 0);
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1926,7 +1900,7 @@ int seccomp_memory_deny_write_execute(void) {
         unsigned loaded = 0;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2046,7 +2020,7 @@ int seccomp_restrict_archs(Set *archs) {
         int r;
         bool blocked_new = false;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2139,7 +2113,7 @@ int seccomp_filter_set_add_by_name(Hashmap *filter, bool add, const char *name) 
         assert(filter);
         assert(name);
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2188,7 +2162,7 @@ int seccomp_lock_personality(unsigned long personality) {
         if (personality >= PERSONALITY_INVALID)
                 return -EINVAL;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2226,7 +2200,7 @@ int seccomp_protect_hostname(void) {
         uint32_t arch;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2442,7 +2416,7 @@ int seccomp_restrict_suid_sgid(void) {
         uint32_t arch;
         int r, k;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2569,7 +2543,7 @@ int seccomp_suppress_sync(void) {
          *
          * Additionally, O_SYNC/O_DSYNC are masked. */
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2625,6 +2599,35 @@ int seccomp_suppress_sync(void) {
 }
 
 #endif
+
+int dlopen_libseccomp(int log_level) {
+#if HAVE_SECCOMP
+        static void *libseccomp_dl = NULL;
+
+        LIBSECCOMP_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
+
+        return dlopen_many_sym_or_warn(
+                        &libseccomp_dl,
+                        "libseccomp.so.2",
+                        log_level,
+                        DLSYM_ARG(seccomp_api_get),
+                        DLSYM_ARG(seccomp_arch_add),
+                        DLSYM_ARG(seccomp_arch_exist),
+                        DLSYM_ARG(seccomp_arch_native),
+                        DLSYM_ARG(seccomp_arch_remove),
+                        DLSYM_ARG(seccomp_attr_set),
+                        DLSYM_ARG(seccomp_init),
+                        DLSYM_ARG(seccomp_load),
+                        DLSYM_ARG(seccomp_release),
+                        DLSYM_ARG(seccomp_rule_add_array),
+                        DLSYM_ARG(seccomp_rule_add_exact),
+                        DLSYM_ARG(seccomp_syscall_resolve_name),
+                        DLSYM_ARG(seccomp_syscall_resolve_num_arch));
+#else
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libseccomp support is not compiled in.");
+#endif
+}
 
 bool seccomp_errno_or_action_is_valid(int n) {
         return n == SECCOMP_ERROR_NUMBER_KILL || errno_is_valid(n);
