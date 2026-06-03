@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <getopt.h>
+#include <linux/dm-ioctl.h>
+#include <linux/magic.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -25,6 +26,7 @@
 #include "conf-parser.h"
 #include "constants.h"
 #include "copy.h"
+#include "crypto-util.h"
 #include "cryptsetup-util.h"
 #include "device-util.h"
 #include "devnum-util.h"
@@ -49,6 +51,7 @@
 #include "initrd-util.h"
 #include "install-file.h"
 #include "io-util.h"
+#include "iso9660.h"
 #include "json-util.h"
 #include "libmount-util.h"
 #include "list.h"
@@ -59,7 +62,7 @@
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "nulstr-util.h"
-#include "openssl-util.h"
+#include "options.h"
 #include "parse-argument.h"
 #include "parse-helpers.h"
 #include "parse-util.h"
@@ -213,6 +216,10 @@ static char *arg_generate_crypttab = NULL;
 static Set *arg_verity_settings = NULL;
 static bool arg_relax_copy_block_security = false;
 static bool arg_varlink = false;
+static bool arg_eltorito = false;
+static char *arg_eltorito_system = NULL;
+static char *arg_eltorito_volume = NULL;
+static char *arg_eltorito_publisher = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_node, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
@@ -237,11 +244,15 @@ STATIC_DESTRUCTOR_REGISTER(arg_make_ddi, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_generate_fstab, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_generate_crypttab, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_verity_settings, set_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_eltorito_system, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_eltorito_volume, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_eltorito_publisher, freep);
 
 typedef enum ProgressPhase {
         PROGRESS_LOADING_DEFINITIONS,
         PROGRESS_LOADING_TABLE,
         PROGRESS_OPENING_COPY_BLOCK_SOURCES,
+        PROGRESS_OPENING_BLOCK_DEVICE_REPLACE_SOURCES,
         PROGRESS_ACQUIRING_PARTITION_LABELS,
         PROGRESS_MINIMIZING,
         PROGRESS_PLACING,
@@ -252,6 +263,7 @@ typedef enum ProgressPhase {
         PROGRESS_ADJUSTING_PARTITION,
         PROGRESS_WRITING_TABLE,
         PROGRESS_REREADING_TABLE,
+        PROGRESS_REPLACING_DEVICE,
         _PROGRESS_PHASE_MAX,
         _PROGRESS_PHASE_INVALID = -EINVAL,
 } ProgressPhase;
@@ -281,6 +293,14 @@ typedef enum IntegrityAlg {
         _INTEGRITY_ALG_MAX,
         _INTEGRITY_ALG_INVALID = -EINVAL,
 } IntegrityAlg;
+
+typedef enum EncryptKDF {
+        ENCRYPT_KDF_ARGON2ID,
+        ENCRYPT_KDF_PBKDF2,
+        ENCRYPT_KDF_MINIMAL,
+        _ENCRYPT_KDF_MAX,
+        _ENCRYPT_KDF_INVALID = -EINVAL,
+} EncryptKDF;
 
 typedef enum VerityMode {
         VERITY_OFF,
@@ -407,6 +427,27 @@ DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(subvolume_hash_ops, char, path_has
 
 typedef struct Context Context;
 
+typedef struct {
+        uint64_t devid;
+        int mountpoint_fd;
+        int source_fd;
+        char *source_path;
+        uint64_t source_size;
+        bool done;
+} BtrfsReplacement;
+
+static BtrfsReplacement* btrfs_replacement_free(BtrfsReplacement *b) {
+        if (!b)
+                return NULL;
+
+        safe_close(b->mountpoint_fd);
+        safe_close(b->source_fd);
+        free(b->source_path);
+        return mfree(b);
+}
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(BtrfsReplacement*, btrfs_replacement_free);
+
 typedef struct Partition {
         Context *context;
 
@@ -452,6 +493,9 @@ typedef struct Partition {
         uint64_t copy_blocks_done;
 
         char *format;
+        char *block_device_replace;
+        BtrfsReplacement *btrfs_replaced;
+        char *volume_name;
         char **exclude_files_source;
         char **exclude_files_target;
         char **make_directories;
@@ -464,6 +508,7 @@ typedef struct Partition {
         size_t tpm2_n_hash_pcr_values;
         IntegrityMode integrity;
         IntegrityAlg integrity_alg;
+        EncryptKDF encrypt_kdf;
         VerityMode verity;
         char *verity_match_key;
         MinimizeMode minimize;
@@ -472,6 +517,7 @@ typedef struct Partition {
         char *compression;
         char *compression_level;
         uint64_t fs_sector_size;
+        int discard;
 
         int add_validatefs;
         CopyFiles *copy_files;
@@ -526,6 +572,7 @@ struct Context {
         uint64_t start, end, total;
 
         struct fdisk_context *fdisk_context;
+        int fdisk_context_fd;
         uint64_t sector_size, grain_size, default_fs_sector_size;
 
         sd_id128_t seed;
@@ -549,6 +596,8 @@ struct Context {
         bool defer_partitions_factory_reset;
 
         sd_varlink *link; /* If 'more' is used on the Varlink call, we'll send progress info over this link */
+
+        bool needs_rescan;
 };
 
 static const char *empty_mode_table[_EMPTY_MODE_MAX] = {
@@ -589,6 +638,12 @@ static const char *integrity_alg_table[_INTEGRITY_ALG_MAX] = {
         [INTEGRITY_ALG_HMAC_SHA512] = "hmac-sha512",
 };
 
+static const char *encrypt_kdf_table[_ENCRYPT_KDF_MAX] = {
+        [ENCRYPT_KDF_ARGON2ID] = "argon2id",
+        [ENCRYPT_KDF_PBKDF2]   = "pbkdf2",
+        [ENCRYPT_KDF_MINIMAL]  = "minimal",
+};
+
 static const char *verity_mode_table[_VERITY_MODE_MAX] = {
         [VERITY_OFF]  = "off",
         [VERITY_DATA] = "data",
@@ -603,19 +658,21 @@ static const char *minimize_mode_table[_MINIMIZE_MODE_MAX] = {
 };
 
 static const char *progress_phase_table[_PROGRESS_PHASE_MAX] = {
-        [PROGRESS_LOADING_DEFINITIONS]        = "loading-definitions",
-        [PROGRESS_LOADING_TABLE]              = "loading-table",
-        [PROGRESS_OPENING_COPY_BLOCK_SOURCES] = "opening-copy-block-sources",
-        [PROGRESS_ACQUIRING_PARTITION_LABELS] = "acquiring-partition-labels",
-        [PROGRESS_MINIMIZING]                 = "minimizing",
-        [PROGRESS_PLACING]                    = "placing",
-        [PROGRESS_WIPING_DISK]                = "wiping-disk",
-        [PROGRESS_WIPING_PARTITION]           = "wiping-partition",
-        [PROGRESS_COPYING_PARTITION]          = "copying-partition",
-        [PROGRESS_FORMATTING_PARTITION]       = "formatting-partition",
-        [PROGRESS_ADJUSTING_PARTITION]        = "adjusting-partition",
-        [PROGRESS_WRITING_TABLE]              = "writing-table",
-        [PROGRESS_REREADING_TABLE]            = "rereading-table",
+        [PROGRESS_LOADING_DEFINITIONS]                  = "loading-definitions",
+        [PROGRESS_LOADING_TABLE]                        = "loading-table",
+        [PROGRESS_OPENING_COPY_BLOCK_SOURCES]           = "opening-copy-block-sources",
+        [PROGRESS_OPENING_BLOCK_DEVICE_REPLACE_SOURCES] = "opening-block-device-replace-sources",
+        [PROGRESS_ACQUIRING_PARTITION_LABELS]           = "acquiring-partition-labels",
+        [PROGRESS_MINIMIZING]                           = "minimizing",
+        [PROGRESS_PLACING]                              = "placing",
+        [PROGRESS_WIPING_DISK]                          = "wiping-disk",
+        [PROGRESS_WIPING_PARTITION]                     = "wiping-partition",
+        [PROGRESS_COPYING_PARTITION]                    = "copying-partition",
+        [PROGRESS_FORMATTING_PARTITION]                 = "formatting-partition",
+        [PROGRESS_ADJUSTING_PARTITION]                  = "adjusting-partition",
+        [PROGRESS_WRITING_TABLE]                        = "writing-table",
+        [PROGRESS_REREADING_TABLE]                      = "rereading-table",
+        [PROGRESS_REPLACING_DEVICE]                     = "replacing-device",
 };
 
 static uint64_t determine_grain_size(uint64_t sector_size) {
@@ -627,6 +684,7 @@ DEFINE_PRIVATE_STRING_TABLE_LOOKUP(append_mode, AppendMode);
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING_WITH_BOOLEAN(encrypt_mode, EncryptMode, ENCRYPT_KEY_FILE);
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING_WITH_BOOLEAN(integrity_mode, IntegrityMode, INTEGRITY_INLINE);
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(integrity_alg, IntegrityAlg);
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(encrypt_kdf, EncryptKDF);
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(verity_mode, VerityMode);
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING_WITH_BOOLEAN(minimize_mode, MinimizeMode, MINIMIZE_BEST);
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(progress_phase, ProgressPhase);
@@ -651,6 +709,8 @@ static int calculate_verity_hash_size(
                 uint64_t hash_block_size,
                 uint64_t data_block_size,
                 uint64_t *ret_bytes) {
+
+        assert(ret_bytes);
 
         /* The calculation here is based on the documented on-disk format of the dm-verity
          * https://docs.kernel.org/admin-guide/device-mapper/verity.html#hash-tree
@@ -726,6 +786,8 @@ static Partition *partition_new(Context *c) {
                 .last_percent = UINT_MAX,
                 .progress_ratelimit = { 100 * USEC_PER_MSEC, 1 },
                 .fs_sector_size = UINT64_MAX,
+                .discard = -1,
+                .encrypt_kdf = _ENCRYPT_KDF_INVALID,
         };
 
         return p;
@@ -764,9 +826,9 @@ static Partition* partition_free(Partition *p) {
         strv_free(p->drop_in_files);
 
         if (p->current_partition)
-                fdisk_unref_partition(p->current_partition);
+                sym_fdisk_unref_partition(p->current_partition);
         if (p->new_partition)
-                fdisk_unref_partition(p->new_partition);
+                sym_fdisk_unref_partition(p->new_partition);
 
         if (p->copy_blocks_path_is_our_file)
                 unlink_and_free(p->copy_blocks_path);
@@ -775,6 +837,9 @@ static Partition* partition_free(Partition *p) {
         safe_close(p->copy_blocks_fd);
 
         free(p->format);
+        free(p->block_device_replace);
+        btrfs_replacement_free(p->btrfs_replaced);
+        free(p->volume_name);
         strv_free(p->exclude_files_source);
         strv_free(p->exclude_files_target);
         strv_free(p->make_directories);
@@ -819,6 +884,9 @@ static void partition_foreignize(Partition *p) {
         p->copy_blocks_root = NULL;
 
         p->format = mfree(p->format);
+        p->block_device_replace = mfree(p->block_device_replace);
+        p->btrfs_replaced = btrfs_replacement_free(p->btrfs_replaced);
+        p->volume_name = mfree(p->volume_name);
         p->exclude_files_source = strv_free(p->exclude_files_source);
         p->exclude_files_target = strv_free(p->exclude_files_target);
         p->make_directories = strv_free(p->make_directories);
@@ -849,6 +917,7 @@ static void partition_foreignize(Partition *p) {
         p->verity = VERITY_OFF;
         p->add_validatefs = false;
         p->fs_sector_size = UINT64_MAX;
+        p->discard = -1;
 
         partition_mountpoint_free_many(p->mountpoints, p->n_mountpoints);
         p->mountpoints = NULL;
@@ -918,6 +987,7 @@ static Context* context_new(
                 .empty = empty,
                 .dry_run = dry_run,
                 .backing_fd = -EBADF,
+                .fdisk_context_fd = -EBADF,
         };
 
         return context;
@@ -946,7 +1016,8 @@ static Context* context_free(Context *context) {
         context_free_free_areas(context);
 
         if (context->fdisk_context)
-                fdisk_unref_context(context->fdisk_context);
+                sym_fdisk_unref_context(context->fdisk_context);
+        safe_close(context->fdisk_context_fd);
 
         safe_close(context->backing_fd);
         if (context->node_is_our_file)
@@ -955,9 +1026,11 @@ static Context* context_free(Context *context) {
                 free(context->node);
 
 #if HAVE_OPENSSL
-        X509_free(context->certificate);
+        if (context->certificate)
+                sym_X509_free(context->certificate);
         openssl_ask_password_ui_free(context->ui);
-        EVP_PKEY_free(context->private_key);
+        if (context->private_key)
+                sym_EVP_PKEY_free(context->private_key);
 #endif
 
         context->link = sd_varlink_unref(context->link);
@@ -1103,7 +1176,7 @@ static uint64_t partition_min_size(const Context *context, const Partition *p) {
          * exists the current size is what we really need. If it doesn't exist yet refuse to allocate less
          * than 4K.
          *
-         * DEFAULT_MIN_SIZE is the default SizeMin= we configure if nothing else is specified. */
+         * DEFAULT_MIN_SIZE is the default SizeMinBytes= we configure if nothing else is specified. */
 
         if (PARTITION_IS_FOREIGN(p)) {
                 /* Don't allow changing size of partitions not managed by us */
@@ -1120,16 +1193,18 @@ static uint64_t partition_min_size(const Context *context, const Partition *p) {
                 uint64_t d = 0;
 
                 if (p->encrypt != ENCRYPT_OFF)
-                        d += round_up_size(LUKS2_METADATA_KEEP_FREE, context->grain_size);
+                        assert_se(INC_SAFE(&d, round_up_size(LUKS2_METADATA_KEEP_FREE, context->grain_size)));
 
                 if (p->copy_blocks_size != UINT64_MAX)
-                        d += round_up_size(p->copy_blocks_size, context->grain_size);
+                        assert_se(INC_SAFE(&d, round_up_size(p->copy_blocks_size, context->grain_size)));
+                else if (p->btrfs_replaced)
+                        assert_se(INC_SAFE(&d, round_up_size(p->btrfs_replaced->source_size, context->grain_size)));
                 else if (p->format || p->encrypt != ENCRYPT_OFF) {
                         uint64_t f;
 
                         /* If we shall synthesize a file system, take minimal fs size into account (assumed to be 4K if not known) */
                         f = partition_fstype_min_size(context, p);
-                        d += f == UINT64_MAX ? context->grain_size : round_up_size(f, context->grain_size);
+                        assert_se(INC_SAFE(&d, f == UINT64_MAX ? context->grain_size : round_up_size(f, context->grain_size)));
                 }
 
                 if (d > sz)
@@ -1234,6 +1309,8 @@ static uint64_t free_area_current_end(Context *context, const FreeArea *a) {
 
         assert(a->after->offset != UINT64_MAX);
         assert(a->after->current_size != UINT64_MAX);
+        /* Silence static analyzers */
+        assert(a->after->current_size <= UINT64_MAX - a->after->offset);
 
         /* Calculate where the free area ends, based on the offset of the partition preceding it. */
         return round_up_size(a->after->offset + a->after->current_size, context->grain_size) + free_area_available(a);
@@ -1264,6 +1341,8 @@ static uint64_t free_area_available_for_new_partitions(Context *context, const F
 }
 
 static int free_area_compare(FreeArea *const *a, FreeArea *const*b, Context *context) {
+        assert(a);
+        assert(b);
         assert(context);
 
         return CMP(free_area_available_for_new_partitions(context, *a),
@@ -2674,6 +2753,8 @@ static int parse_key_file(const char *filename, struct iovec *key) {
         size_t n = 0;
         int r;
 
+        assert(key);
+
         r = read_full_file_full(
                         AT_FDCWD, filename,
                         /* offset= */ UINT64_MAX,
@@ -2716,6 +2797,7 @@ static int config_parse_key_file(
 
 static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_integrity, integrity_mode, IntegrityMode, INTEGRITY_OFF);
 static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_integrity_alg, integrity_alg, IntegrityAlg, INTEGRITY_ALG_HMAC_SHA256);
+static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_encrypt_kdf, encrypt_kdf, EncryptKDF, _ENCRYPT_KDF_INVALID);
 
 static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_verity, verity_mode, VerityMode, VERITY_OFF);
 static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_minimize, minimize_mode, MinimizeMode, MINIMIZE_OFF);
@@ -2818,11 +2900,15 @@ static int context_notify(
         if (c->link) {
                 r = sd_varlink_notifybo(
                                 c->link,
-                                SD_JSON_BUILD_PAIR("phase", JSON_BUILD_STRING_UNDERSCORIFY(progress_phase_to_string(phase))),
+                                JSON_BUILD_PAIR_ENUM("phase", progress_phase_to_string(phase)),
                                 JSON_BUILD_PAIR_STRING_NON_EMPTY("object", object),
                                 JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("progress", percent, UINT_MAX));
                 if (r < 0)
                         log_debug_errno(r, "Failed to send varlink notify progress notification, ignoring: %m");
+
+                r = sd_varlink_flush(c->link);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to flush varlink notify progress notification, ignoring: %m");
         }
 
         return 0;
@@ -2873,11 +2959,15 @@ static int partition_read_definition(
                 { "Partition", "KeyFile",                  config_parse_key_file,          0,                                  p                           },
                 { "Partition", "Integrity",                config_parse_integrity,         0,                                  &p->integrity               },
                 { "Partition", "IntegrityAlgorithm",       config_parse_integrity_alg,     0,                                  &p->integrity_alg           },
+                { "Partition", "EncryptKDF",               config_parse_encrypt_kdf,       0,                                  &p->encrypt_kdf             },
                 { "Partition", "Compression",              config_parse_string,            CONFIG_PARSE_STRING_SAFE_AND_ASCII, &p->compression             },
                 { "Partition", "CompressionLevel",         config_parse_string,            CONFIG_PARSE_STRING_SAFE_AND_ASCII, &p->compression_level       },
                 { "Partition", "SupplementFor",            config_parse_string,            0,                                  &p->supplement_for_name     },
                 { "Partition", "AddValidateFS",            config_parse_tristate,          0,                                  &p->add_validatefs          },
                 { "Partition", "FileSystemSectorSize",     config_parse_fs_sector_size,    0,                                  &p->fs_sector_size          },
+                { "Partition", "Discard",                  config_parse_tristate,          0,                                  &p->discard                 },
+                { "Partition", "BlockDeviceReplace",       config_parse_path,              0,                                  &p->block_device_replace    },
+                { "Partition", "VolumeName",               config_parse_string,            CONFIG_PARSE_STRING_SAFE,           &p->volume_name             },
                 {}
         };
         _cleanup_free_ char *filename = NULL;
@@ -2928,6 +3018,34 @@ static int partition_read_definition(
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                   "Format=/CopyFiles=/MakeDirectories=/MakeSymlinks= and CopyBlocks= cannot be combined, refusing.");
 
+        if (p->block_device_replace && (p->format || partition_needs_populate(p)))
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "Format=/CopyFiles=/MakeDirectories=/MakeSymlinks= and BlockDeviceReplace= cannot be combined, refusing.");
+
+        if ((p->copy_blocks_path || p->copy_blocks_auto) && p->block_device_replace)
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "CopyBlocks= and BlockDeviceReplace= cannot be combined, refusing.");
+
+        if (p->block_device_replace && arg_offline == 1)
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "BlockDeviceReplace= is incompatible with --offline=yes, refusing.");
+
+        if (p->volume_name && !filename_is_valid(p->volume_name))
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "VolumeName= has an invalid filename value, refusing.");
+
+        if (p->volume_name && strlen(p->volume_name) > (DM_NAME_LEN - 1))
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "VolumeName= is too long, refusing.");
+
+        if (p->volume_name && p->encrypt == ENCRYPT_OFF)
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "VolumeName= requires Encrypt= to be enabled, refusing.");
+
+        if (p->volume_name && !p->block_device_replace)
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "VolumeName= requires BlockDeviceReplace= to be set, refusing.");
+
         if (partition_needs_populate(p) && streq_ptr(p->format, "swap"))
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                   "Format=swap and CopyFiles=/MakeDirectories=/MakeSymlinks= cannot be combined, refusing.");
@@ -2937,7 +3055,7 @@ static int partition_read_definition(
 
                 if (p->type.designator == PARTITION_SWAP)
                         format = "swap";
-                else if (partition_needs_populate(p) || (p->encrypt != ENCRYPT_OFF && !(p->copy_blocks_path || p->copy_blocks_auto)))
+                else if (partition_needs_populate(p) || (p->encrypt != ENCRYPT_OFF && !(p->copy_blocks_path || p->copy_blocks_auto || p->block_device_replace)))
                         /* Pick "vfat" as file system for esp and xbootldr partitions, otherwise default to "ext4". */
                         format = IN_SET(p->type.designator, PARTITION_ESP, PARTITION_XBOOTLDR) ? "vfat" : "ext4";
 
@@ -2951,7 +3069,7 @@ static int partition_read_definition(
         if (streq_ptr(p->format, "empty")) {
                 p->format = mfree(p->format);
 
-                if (p->no_auto < 0)
+                if (p->no_auto < 0 && gpt_partition_type_knows_no_auto(p->type))
                         p->no_auto = true;
 
                 if (!p->new_label) {
@@ -2965,9 +3083,13 @@ static int partition_read_definition(
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                   "Minimize= can only be enabled if Format= or Verity=hash are set.");
 
-        if (p->minimize == MINIMIZE_BEST && (p->format && !fstype_is_ro(p->format)) && p->verity != VERITY_HASH)
+        if (p->minimize == MINIMIZE_BEST &&
+                p->format &&
+                !fstype_is_ro(p->format) &&
+                !streq(p->format, "btrfs") &&
+                p->verity != VERITY_HASH)
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
-                                  "Minimize=best can only be used with read-only filesystems or Verity=hash.");
+                                  "Minimize=best can only be used with read-only filesystems, btrfs, or Verity=hash.");
 
         if (partition_needs_populate(p) && !mkfs_supports_root_option(p->format) && geteuid() != 0)
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EPERM),
@@ -2979,7 +3101,7 @@ static int partition_read_definition(
                                   "Cannot format %s filesystem without source files, refusing.", p->format);
 
         if (p->verity != VERITY_OFF || p->encrypt != ENCRYPT_OFF) {
-                r = dlopen_cryptsetup();
+                r = DLOPEN_CRYPTSETUP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
                 if (r < 0)
                         return log_syntax(NULL, LOG_ERR, path, 1, r,
                                           "libcryptsetup not found, Verity=/Encrypt= are not supported: %m");
@@ -2994,10 +3116,20 @@ static int partition_read_definition(
                                   "VerityMatchKey= can only be set if Verity= is not \"%s\".",
                                   verity_mode_to_string(p->verity));
 
-        if (IN_SET(p->verity, VERITY_HASH, VERITY_SIG) && (p->copy_blocks_path || p->copy_blocks_auto || p->format || partition_needs_populate(p)))
-                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
-                                  "CopyBlocks=/CopyFiles=/Format=/MakeDirectories=/MakeSymlinks= cannot be used with Verity=%s.",
-                                  verity_mode_to_string(p->verity));
+        if (IN_SET(p->verity, VERITY_HASH, VERITY_SIG)) {
+                if (p->format || partition_needs_populate(p))
+                        return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                          "CopyFiles=/Format=/MakeDirectories=/MakeSymlinks= cannot be used with Verity=%s.",
+                                          verity_mode_to_string(p->verity));
+
+                /* Later we check that the same CopyBlocks= type (auto vs path) is used for the entire verity set.
+                 * So we assume that CopyBlocks=auto is going to be correct and just path based blocks might result in
+                 * a broken setup */
+                if (p->copy_blocks_path)
+                        log_syntax(NULL, LOG_DEBUG, path, 1, 0,
+                                   "CopyBlocks= with Verity=%s bypasses dm-verity hash/signature computation; repart cannot verify the resulting setup is correct.",
+                                   verity_mode_to_string(p->verity));
+        }
 
         if (p->verity != VERITY_OFF && p->encrypt != ENCRYPT_OFF)
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
@@ -3027,6 +3159,18 @@ static int partition_read_definition(
                         return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                           "SupplementFor= cannot be combined with CopyBlocks=/Encrypt=/Verity=");
         }
+
+        if (p->encrypt == ENCRYPT_OFF && p->discard > 0)
+                log_syntax(NULL, LOG_WARNING, path, 1, 0,
+                           "Discard=yes has no effect with Encrypt=off.");
+
+        if (p->encrypt == ENCRYPT_OFF && p->encrypt_kdf >= 0)
+                log_syntax(NULL, LOG_WARNING, path, 1, 0,
+                           "EncryptKDF= has no effect with Encrypt=off.");
+
+        if (p->encrypt != ENCRYPT_OFF && p->integrity == INTEGRITY_INLINE && p->discard > 0)
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "Integrity=inline is incompatible with Discard=yes.");
 
         /* Verity partitions are read only, let's imply the RO flag hence, unless explicitly configured otherwise. */
         if ((partition_designator_is_verity_hash(p->type.designator) ||
@@ -3095,16 +3239,17 @@ static int find_verity_sibling(Context *context, Partition *p, VerityMode mode, 
         return 0;
 }
 
-static int context_open_and_lock_backing_fd(const char *node, int operation, int *backing_fd) {
+static int context_open_and_lock_backing_fd(const char *node, int operation, int mode, int *backing_fd) {
         _cleanup_close_ int fd = -EBADF;
 
         assert(node);
         assert(backing_fd);
+        assert(IN_SET(mode, O_RDONLY, O_RDWR));
 
         if (*backing_fd >= 0)
                 return 0;
 
-        fd = open(node, O_RDONLY|O_CLOEXEC);
+        fd = open(node, mode|O_CLOEXEC);
         if (fd < 0)
                 return log_error_errno(errno, "Failed to open device '%s': %m", node);
 
@@ -3133,31 +3278,31 @@ static int determine_current_padding(
         assert(p);
         assert(ret);
 
-        if (!fdisk_partition_has_end(p))
+        if (!sym_fdisk_partition_has_end(p))
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Partition has no end.");
 
-        offset = fdisk_partition_get_end(p);
+        offset = sym_fdisk_partition_get_end(p);
         assert(offset < UINT64_MAX);
         offset++; /* The end is one sector before the next partition or padding. */
         assert(offset < UINT64_MAX / secsz);
         offset *= secsz;
 
-        n_partitions = fdisk_table_get_nents(t);
+        n_partitions = sym_fdisk_table_get_nents(t);
         for (size_t i = 0; i < n_partitions; i++) {
                 struct fdisk_partition *q;
                 uint64_t start;
 
-                q = fdisk_table_get_partition(t, i);
+                q = sym_fdisk_table_get_partition(t, i);
                 if (!q)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read partition metadata.");
 
-                if (fdisk_partition_is_used(q) <= 0)
+                if (sym_fdisk_partition_is_used(q) <= 0)
                         continue;
 
-                if (!fdisk_partition_has_start(q))
+                if (!sym_fdisk_partition_has_start(q))
                         continue;
 
-                start = fdisk_partition_get_start(q);
+                start = sym_fdisk_partition_get_start(q);
                 assert(start < UINT64_MAX / secsz);
                 start *= secsz;
 
@@ -3167,7 +3312,7 @@ static int determine_current_padding(
 
         if (next == UINT64_MAX) {
                 /* No later partition? In that case check the end of the usable area */
-                next = fdisk_get_last_lba(c);
+                next = sym_fdisk_get_last_lba(c);
                 assert(next < UINT64_MAX);
                 next++; /* The last LBA is one sector before the end */
 
@@ -3186,26 +3331,6 @@ static int determine_current_padding(
         return 0;
 }
 
-static int verify_regular_or_block(int fd) {
-        struct stat st;
-
-        assert(fd >= 0);
-
-        if (fstat(fd, &st) < 0)
-                return -errno;
-
-        if (S_ISDIR(st.st_mode))
-                return -EISDIR;
-
-        if (S_ISLNK(st.st_mode))
-                return -ELOOP;
-
-        if (!S_ISREG(st.st_mode) && !S_ISBLK(st.st_mode))
-                return -EBADFD;
-
-        return 0;
-}
-
 static int context_copy_from_one(Context *context, const char *src) {
         _cleanup_close_ int fd = -EBADF;
         _cleanup_(fdisk_unref_contextp) struct fdisk_context *c = NULL;
@@ -3217,33 +3342,33 @@ static int context_copy_from_one(Context *context, const char *src) {
 
         assert(src);
 
-        r = context_open_and_lock_backing_fd(src, LOCK_SH, &fd);
+        r = context_open_and_lock_backing_fd(src, LOCK_SH, O_RDONLY, &fd);
         if (r < 0)
                 return r;
 
-        r = verify_regular_or_block(fd);
+        r = fd_verify_regular_or_block(fd);
         if (r < 0)
-                return log_error_errno(r, "%s is not a file nor a block device: %m", src);
+                return log_error_errno(r, "'%s' is not a file nor a block device: %m", src);
 
         r = fdisk_new_context_at(fd, /* path= */ NULL, /* read_only= */ true, /* sector_size= */ UINT32_MAX, &c);
         if (r < 0)
                 return log_error_errno(r, "Failed to create fdisk context: %m");
 
-        secsz = fdisk_get_sector_size(c);
-        grainsz = fdisk_get_grain_size(c);
+        secsz = sym_fdisk_get_sector_size(c);
+        grainsz = sym_fdisk_get_grain_size(c);
 
         /* Insist on a power of two, and that it's a multiple of 512, i.e. the traditional sector size. */
         if (secsz < 512 || !ISPOWEROF2(secsz))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Sector size %lu is not a power of two larger than 512? Refusing.", secsz);
 
-        if (!fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
+        if (!sym_fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
                 return log_error_errno(SYNTHETIC_ERRNO(EHWPOISON), "Cannot copy from disk %s with no GPT disk label.", src);
 
-        r = fdisk_get_partitions(c, &t);
+        r = sym_fdisk_get_partitions(c, &t);
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire partition table: %m");
 
-        n_partitions = fdisk_table_get_nents(t);
+        n_partitions = sym_fdisk_table_get_nents(t);
         for (size_t i = 0; i < n_partitions; i++) {
                 _cleanup_(partition_freep) Partition *np = NULL;
                 _cleanup_free_ char *label_copy = NULL;
@@ -3253,16 +3378,16 @@ static int context_copy_from_one(Context *context, const char *src) {
                 sd_id128_t ptid, id;
                 GptPartitionType type;
 
-                p = fdisk_table_get_partition(t, i);
+                p = sym_fdisk_table_get_partition(t, i);
                 if (!p)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read partition metadata.");
 
-                if (fdisk_partition_is_used(p) <= 0)
+                if (sym_fdisk_partition_is_used(p) <= 0)
                         continue;
 
-                if (fdisk_partition_has_start(p) <= 0 ||
-                    fdisk_partition_has_size(p) <= 0 ||
-                    fdisk_partition_has_partno(p) <= 0)
+                if (sym_fdisk_partition_has_start(p) <= 0 ||
+                    sym_fdisk_partition_has_size(p) <= 0 ||
+                    sym_fdisk_partition_has_partno(p) <= 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Found a partition without a position, size or number.");
 
                 r = fdisk_partition_get_type_as_id128(p, &ptid);
@@ -3275,18 +3400,18 @@ static int context_copy_from_one(Context *context, const char *src) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to query partition UUID: %m");
 
-                label = fdisk_partition_get_name(p);
+                label = sym_fdisk_partition_get_name(p);
                 if (!isempty(label)) {
                         label_copy = strdup(label);
                         if (!label_copy)
                                 return log_oom();
                 }
 
-                sz = fdisk_partition_get_size(p);
+                sz = sym_fdisk_partition_get_size(p);
                 assert(sz <= UINT64_MAX/secsz);
                 sz *= secsz;
 
-                start = fdisk_partition_get_start(p);
+                start = sym_fdisk_partition_get_start(p);
                 assert(start <= UINT64_MAX/secsz);
                 start *= secsz;
 
@@ -3321,8 +3446,8 @@ static int context_copy_from_one(Context *context, const char *src) {
                 if (!np->copy_blocks_path)
                         return log_oom();
 
-                np->copy_blocks_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
-                if (np->copy_blocks_fd < 0)
+                np->copy_blocks_fd = r = RET_NERRNO(fcntl(fd, F_DUPFD_CLOEXEC, 3));
+                if (r < 0)
                         return log_error_errno(r, "Failed to duplicate file descriptor of %s: %m", src);
 
                 np->copy_blocks_offset = start;
@@ -3491,6 +3616,27 @@ static int context_read_definitions(Context *context) {
         }
 
         LIST_FOREACH(partitions, p, context->partitions) {
+                if (!IN_SET(p->verity, VERITY_HASH, VERITY_SIG))
+                        continue;
+
+                /* We check all verity siblings up until our current type and ensure that if we are using CopyBlocks=
+                 * the previous ones are using the same type of CopyBlocks=. */
+                for (VerityMode mode = VERITY_DATA; mode < p->verity; mode++) {
+                        Partition *q = ASSERT_PTR(p->siblings[mode]);
+
+                        if (p->copy_blocks_auto && !q->copy_blocks_auto)
+                                return log_syntax(NULL, LOG_ERR, p->definition_path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                                  "CopyBlocks=auto set with Verity=%s but Verity=%s partition does not set CopyBlocks=auto.",
+                                                  verity_mode_to_string(p->verity), verity_mode_to_string(mode));
+
+                        if (p->copy_blocks_path && !q->copy_blocks_path)
+                                return log_syntax(NULL, LOG_ERR, p->definition_path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                                  "CopyBlocks= set with Verity=%s but Verity=%s partition does not set CopyBlocks=.",
+                                                  verity_mode_to_string(p->verity), verity_mode_to_string(mode));
+                }
+        }
+
+        LIST_FOREACH(partitions, p, context->partitions) {
                 Partition *dp;
 
                 if (p->verity != VERITY_HASH)
@@ -3540,14 +3686,14 @@ static int fdisk_ask_cb(struct fdisk_context *c, struct fdisk_ask *ask, void *da
         _cleanup_free_ char *ids = NULL;
         int r;
 
-        if (fdisk_ask_get_type(ask) != FDISK_ASKTYPE_STRING)
+        if (sym_fdisk_ask_get_type(ask) != FDISK_ASKTYPE_STRING)
                 return -EINVAL;
 
         ids = new(char, SD_ID128_UUID_STRING_MAX);
         if (!ids)
                 return -ENOMEM;
 
-        r = fdisk_ask_string_set_result(ask, sd_id128_to_uuid_string(*(sd_id128_t*) data, ids));
+        r = sym_fdisk_ask_string_set_result(ask, sd_id128_to_uuid_string(*(sd_id128_t*) data, ids));
         if (r < 0)
                 return r;
 
@@ -3558,15 +3704,15 @@ static int fdisk_ask_cb(struct fdisk_context *c, struct fdisk_ask *ask, void *da
 static int fdisk_set_disklabel_id_by_uuid(struct fdisk_context *c, sd_id128_t id) {
         int r;
 
-        r = fdisk_set_ask(c, fdisk_ask_cb, &id);
+        r = sym_fdisk_set_ask(c, fdisk_ask_cb, &id);
         if (r < 0)
                 return r;
 
-        r = fdisk_set_disklabel_id(c);
+        r = sym_fdisk_set_disklabel_id(c);
         if (r < 0)
                 return r;
 
-        return fdisk_set_ask(c, NULL, NULL);
+        return sym_fdisk_set_ask(c, NULL, NULL);
 }
 
 static int derive_uuid(sd_id128_t base, const char *token, sd_id128_t *ret) {
@@ -3606,7 +3752,12 @@ static int context_load_fallback_metrics(Context *context) {
         return 1; /* Starting from scratch */
 }
 
+static int context_open_mode(Context *context) {
+        return ASSERT_PTR(context)->dry_run ? O_RDONLY : O_RDWR;
+}
+
 static int context_load_partition_table(Context *context) {
+        _cleanup_close_ int fd = -EBADF;
         _cleanup_(fdisk_unref_contextp) struct fdisk_context *c = NULL;
         _cleanup_(fdisk_unref_tablep) struct fdisk_table *t = NULL;
         uint64_t left_boundary = UINT64_MAX, first_lba, last_lba, nsectors;
@@ -3620,6 +3771,7 @@ static int context_load_partition_table(Context *context) {
         assert(context);
         assert(context->node);
         assert(!context->fdisk_context);
+        assert(context->fdisk_context_fd < 0);
         assert(!context->free_areas);
         assert(context->start == UINT64_MAX);
         assert(context->end == UINT64_MAX);
@@ -3627,13 +3779,13 @@ static int context_load_partition_table(Context *context) {
 
         context_notify(context, PROGRESS_LOADING_TABLE, /* object= */ NULL, UINT_MAX);
 
-        c = fdisk_new_context();
+        c = sym_fdisk_new_context();
         if (!c)
                 return log_oom();
 
         if (arg_sector_size > 0) {
                 fs_secsz = arg_sector_size;
-                r = fdisk_save_user_sector_size(c, /* phy= */ 0, arg_sector_size);
+                r = sym_fdisk_save_user_sector_size(c, /* phy= */ 0, arg_sector_size);
         } else {
                 uint32_t ssz;
                 struct stat st;
@@ -3641,6 +3793,7 @@ static int context_load_partition_table(Context *context) {
                 r = context_open_and_lock_backing_fd(
                                 context->node,
                                 context->dry_run ? LOCK_SH : LOCK_EX,
+                                context_open_mode(context),
                                 &context->backing_fd);
                 if (r < 0)
                         return r;
@@ -3666,16 +3819,20 @@ static int context_load_partition_table(Context *context) {
                         }
                 }
 
-                r = fdisk_save_user_sector_size(c, /* phy= */ 0, ssz);
+                r = sym_fdisk_save_user_sector_size(c, /* phy= */ 0, ssz);
         }
         if (r < 0)
                 return log_error_errno(r, "Failed to set sector size: %m");
 
-        /* libfdisk doesn't have an API to operate on arbitrary fds, hence reopen the fd going via the
-         * /proc/self/fd/ magic path if we have an existing fd. Open the original file otherwise. */
-        r = fdisk_assign_device(
+        if (context->backing_fd < 0) {
+                fd = open(context->node, context_open_mode(context)|O_CLOEXEC);
+                if (fd < 0)
+                        return log_error_errno(errno, "Failed to open backing node '%s': %m", context->node);
+        }
+        r = sym_fdisk_assign_device_by_fd(
                         c,
-                        context->backing_fd >= 0 ? FORMAT_PROC_FD_PATH(context->backing_fd) : context->node,
+                        context->backing_fd >= 0 ? context->backing_fd : fd,
+                        context->node,
                         context->dry_run);
         if (r == -EINVAL && arg_size_auto) {
                 struct stat st;
@@ -3684,7 +3841,7 @@ static int context_load_partition_table(Context *context) {
                  * it if automatic sizing is requested. */
 
                 if (context->backing_fd < 0)
-                        r = stat(context->node, &st);
+                        r = fstat(fd, &st);
                 else
                         r = fstat(context->backing_fd, &st);
                 if (r < 0)
@@ -3692,7 +3849,7 @@ static int context_load_partition_table(Context *context) {
 
                 if (S_ISREG(st.st_mode) && st.st_size == 0) {
                         /* Use the fallback values if we have no better idea */
-                        context->sector_size = fdisk_get_sector_size(c);
+                        context->sector_size = sym_fdisk_get_sector_size(c);
                         context->default_fs_sector_size = fs_secsz;
                         context->grain_size = determine_grain_size(context->sector_size);
                         return /* from_scratch= */ true;
@@ -3705,8 +3862,9 @@ static int context_load_partition_table(Context *context) {
 
         if (context->backing_fd < 0) {
                 /* If we have no fd referencing the device yet, make a copy of the fd now, so that we have one */
-                r = context_open_and_lock_backing_fd(FORMAT_PROC_FD_PATH(fdisk_get_devfd(c)),
+                r = context_open_and_lock_backing_fd(FORMAT_PROC_FD_PATH(sym_fdisk_get_devfd(c)),
                                                      context->dry_run ? LOCK_SH : LOCK_EX,
+                                                     context_open_mode(context),
                                                      &context->backing_fd);
                 if (r < 0)
                         return r;
@@ -3717,7 +3875,7 @@ static int context_load_partition_table(Context *context) {
          * it for all our needs. Note that the values we use ourselves always are in bytes though, thus mean
          * the same thing universally. Also note that regardless what kind of sector size is in use we'll
          * place partitions at multiples of 4K. */
-        unsigned long secsz = fdisk_get_sector_size(c);
+        unsigned long secsz = sym_fdisk_get_sector_size(c);
 
         /* Insist on a power of two, and that it's a multiple of 512, i.e. the traditional sector size. */
         if (secsz < 512 || !ISPOWEROF2(secsz))
@@ -3733,14 +3891,14 @@ static int context_load_partition_table(Context *context) {
 
         case EMPTY_REFUSE:
                 /* Refuse empty disks, insist on an existing GPT partition table */
-                if (!fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
+                if (!sym_fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
                         return log_notice_errno(SYNTHETIC_ERRNO(EHWPOISON), "Disk %s has no GPT disk label, not repartitioning.", context->node);
 
                 break;
 
         case EMPTY_REQUIRE:
                 /* Require an empty disk, refuse any existing partition table */
-                r = fdisk_has_label(c);
+                r = sym_fdisk_has_label(c);
                 if (r < 0)
                         return log_error_errno(r, "Failed to determine whether disk %s has a disk label: %m", context->node);
                 if (r > 0)
@@ -3751,11 +3909,11 @@ static int context_load_partition_table(Context *context) {
 
         case EMPTY_ALLOW:
                 /* Allow both an empty disk and an existing partition table, but only GPT */
-                r = fdisk_has_label(c);
+                r = sym_fdisk_has_label(c);
                 if (r < 0)
                         return log_error_errno(r, "Failed to determine whether disk %s has a disk label: %m", context->node);
                 if (r > 0) {
-                        if (!fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
+                        if (!sym_fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
                                 return log_notice_errno(SYNTHETIC_ERRNO(EHWPOISON), "Disk %s has non-GPT disk label, not repartitioning.", context->node);
                 } else
                         from_scratch = true;
@@ -3773,7 +3931,7 @@ static int context_load_partition_table(Context *context) {
         }
 
         if (from_scratch) {
-                r = fdisk_create_disklabel(c, "gpt");
+                r = sym_fdisk_create_disklabel(c, "gpt");
                 if (r < 0)
                         return log_error_errno(r, "Failed to create GPT disk label: %m");
 
@@ -3788,7 +3946,7 @@ static int context_load_partition_table(Context *context) {
                 goto add_initial_free_area;
         }
 
-        r = fdisk_get_disklabel_id(c, &disk_uuid_string);
+        r = sym_fdisk_get_disklabel_id(c, &disk_uuid_string);
         if (r < 0)
                 return log_error_errno(r, "Failed to get current GPT disk label UUID: %m");
 
@@ -3798,17 +3956,17 @@ static int context_load_partition_table(Context *context) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to acquire disk GPT uuid: %m");
 
-                r = fdisk_set_disklabel_id(c);
+                r = sym_fdisk_set_disklabel_id(c);
                 if (r < 0)
                         return log_error_errno(r, "Failed to set GPT disk label: %m");
         } else if (r < 0)
                 return log_error_errno(r, "Failed to parse current GPT disk label UUID: %m");
 
-        r = fdisk_get_partitions(c, &t);
+        r = sym_fdisk_get_partitions(c, &t);
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire partition table: %m");
 
-        n_partitions = fdisk_table_get_nents(t);
+        n_partitions = sym_fdisk_table_get_nents(t);
         for (size_t i = 0; i < n_partitions; i++) {
                 _cleanup_free_ char *label_copy = NULL;
                 Partition *last = NULL;
@@ -3819,16 +3977,16 @@ static int context_load_partition_table(Context *context) {
                 sd_id128_t ptid, id;
                 size_t partno;
 
-                p = fdisk_table_get_partition(t, i);
+                p = sym_fdisk_table_get_partition(t, i);
                 if (!p)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read partition metadata.");
 
-                if (fdisk_partition_is_used(p) <= 0)
+                if (sym_fdisk_partition_is_used(p) <= 0)
                         continue;
 
-                if (fdisk_partition_has_start(p) <= 0 ||
-                    fdisk_partition_has_size(p) <= 0 ||
-                    fdisk_partition_has_partno(p) <= 0)
+                if (sym_fdisk_partition_has_start(p) <= 0 ||
+                    sym_fdisk_partition_has_size(p) <= 0 ||
+                    sym_fdisk_partition_has_partno(p) <= 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Found a partition without a position, size or number.");
 
                 r = fdisk_partition_get_type_as_id128(p, &ptid);
@@ -3839,22 +3997,22 @@ static int context_load_partition_table(Context *context) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to query partition UUID: %m");
 
-                label = fdisk_partition_get_name(p);
+                label = sym_fdisk_partition_get_name(p);
                 if (!isempty(label)) {
                         label_copy = strdup(label);
                         if (!label_copy)
                                 return log_oom();
                 }
 
-                sz = fdisk_partition_get_size(p);
+                sz = sym_fdisk_partition_get_size(p);
                 assert(sz <= UINT64_MAX/secsz);
                 sz *= secsz;
 
-                start = fdisk_partition_get_start(p);
+                start = sym_fdisk_partition_get_start(p);
                 assert(start <= UINT64_MAX/secsz);
                 start *= secsz;
 
-                partno = fdisk_partition_get_partno(p);
+                partno = sym_fdisk_partition_get_partno(p);
 
                 if (left_boundary == UINT64_MAX || left_boundary > start)
                         left_boundary = start;
@@ -3875,7 +4033,7 @@ static int context_load_partition_table(Context *context) {
                                 pp->current_label = TAKE_PTR(label_copy);
 
                                 pp->current_partition = p;
-                                fdisk_ref_partition(p);
+                                sym_fdisk_ref_partition(p);
 
                                 r = determine_current_padding(c, t, p, secsz, grainsz, &pp->current_padding);
                                 if (r < 0)
@@ -3908,7 +4066,7 @@ static int context_load_partition_table(Context *context) {
                         np->current_label = TAKE_PTR(label_copy);
 
                         np->current_partition = p;
-                        fdisk_ref_partition(p);
+                        sym_fdisk_ref_partition(p);
 
                         r = determine_current_padding(c, t, p, secsz, grainsz, &np->current_padding);
                         if (r < 0)
@@ -3930,15 +4088,15 @@ static int context_load_partition_table(Context *context) {
                         p->supplement_for->suppressing = NULL;
 
 add_initial_free_area:
-        nsectors = fdisk_get_nsectors(c);
+        nsectors = sym_fdisk_get_nsectors(c);
         assert(nsectors <= UINT64_MAX/secsz);
         nsectors *= secsz;
 
-        first_lba = fdisk_get_first_lba(c);
+        first_lba = sym_fdisk_get_first_lba(c);
         assert(first_lba <= UINT64_MAX/secsz);
         first_lba *= secsz;
 
-        last_lba = fdisk_get_last_lba(c);
+        last_lba = sym_fdisk_get_last_lba(c);
         assert(last_lba < UINT64_MAX);
         last_lba++;
         assert(last_lba <= UINT64_MAX/secsz);
@@ -3979,6 +4137,7 @@ add_initial_free_area:
         context->default_fs_sector_size = fs_secsz;
         context->grain_size = grainsz;
         context->fdisk_context = TAKE_PTR(c);
+        context->fdisk_context_fd = TAKE_FD(fd);
 
         return from_scratch;
 }
@@ -4006,12 +4165,12 @@ static void context_unload_partition_table(Context *context) {
                 p->offset = UINT64_MAX;
 
                 if (p->current_partition) {
-                        fdisk_unref_partition(p->current_partition);
+                        sym_fdisk_unref_partition(p->current_partition);
                         p->current_partition = NULL;
                 }
 
                 if (p->new_partition) {
-                        fdisk_unref_partition(p->new_partition);
+                        sym_fdisk_unref_partition(p->new_partition);
                         p->new_partition = NULL;
                 }
 
@@ -4032,15 +4191,18 @@ static void context_unload_partition_table(Context *context) {
         context->total = UINT64_MAX;
 
         if (context->fdisk_context) {
-                fdisk_unref_context(context->fdisk_context);
+                sym_fdisk_unref_context(context->fdisk_context);
                 context->fdisk_context = NULL;
         }
+        context->fdisk_context_fd = safe_close(context->fdisk_context_fd);
 
         context_free_free_areas(context);
 }
 
 static int format_size_change(uint64_t from, uint64_t to, char **ret) {
         char *t;
+
+        assert(ret);
 
         if (from != UINT64_MAX) {
                 if (from == to || to == UINT64_MAX)
@@ -4167,7 +4329,7 @@ static int context_dump_partitions(Context *context) {
                         activity = "resize";
 
                 label = partition_label(p);
-                partname = p->partno != UINT64_MAX ? fdisk_partname(context->node, p->partno+1) : NULL;
+                partname = p->partno != UINT64_MAX ? sym_fdisk_partname(context->node, p->partno+1) : NULL;
 
                 r = format_size_change(p->current_size, p->new_size, &size_change);
                 if (r < 0)
@@ -4320,6 +4482,8 @@ static int partition_hint(const Partition *p, const char *node, char **ret) {
         const char *label;
         sd_id128_t id;
 
+        assert(ret);
+
         /* Tries really hard to find a suitable description for this partition */
 
         if (p->definition_path)
@@ -4332,7 +4496,7 @@ static int partition_hint(const Partition *p, const char *node, char **ret) {
         }
 
         if (p->partno != UINT64_MAX) {
-                buf = fdisk_partname(node, p->partno+1);
+                buf = sym_fdisk_partname(node, p->partno+1);
                 goto done;
         }
 
@@ -4544,16 +4708,16 @@ static int context_wipe_range(Context *context, uint64_t offset, uint64_t size) 
         assert(offset != UINT64_MAX);
         assert(size != UINT64_MAX);
 
-        r = dlopen_libblkid();
+        r = DLOPEN_LIBBLKID(LOG_ERR, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
         if (r < 0)
-                return log_error_errno(r, "Failed to load libblkid: %m");
+                return r;
 
         probe = sym_blkid_new_probe();
         if (!probe)
                 return log_oom();
 
         errno = 0;
-        r = sym_blkid_probe_set_device(probe, fdisk_get_devfd(context->fdisk_context), offset, size);
+        r = sym_blkid_probe_set_device(probe, sym_fdisk_get_devfd(context->fdisk_context), offset, size);
         if (r < 0)
                 return log_error_errno(errno ?: SYNTHETIC_ERRNO(EIO), "Failed to allocate device probe for wiping.");
 
@@ -4617,7 +4781,7 @@ static int context_discard_range(
         if (size <= 0)
                 return 0;
 
-        assert_se((fd = fdisk_get_devfd(context->fdisk_context)) >= 0);
+        assert_se((fd = sym_fdisk_get_devfd(context->fdisk_context)) >= 0);
 
         if (fstat(fd, &st) < 0)
                 return -errno;
@@ -4714,7 +4878,7 @@ static int context_discard_gap_after(Context *context, Partition *p) {
                  * existing partitions may be before that so ensure the gap
                  * starts at the first actually usable lba
                  */
-                gap = fdisk_get_first_lba(context->fdisk_context) * context->sector_size;
+                gap = sym_fdisk_get_first_lba(context->fdisk_context) * context->sector_size;
 
         LIST_FOREACH(partitions, q, context->partitions) {
                 if (q->dropped)
@@ -4731,7 +4895,7 @@ static int context_discard_gap_after(Context *context, Partition *p) {
         }
 
         if (next == UINT64_MAX) {
-                next = (fdisk_get_last_lba(context->fdisk_context) + 1) * context->sector_size;
+                next = (sym_fdisk_get_last_lba(context->fdisk_context) + 1) * context->sector_size;
                 if (gap > next)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO), "Partition end beyond disk end.");
         }
@@ -4828,6 +4992,7 @@ typedef struct DecryptedPartitionTarget {
         int fd;
         char *dm_name;
         char *volume;
+        bool keep;
         struct crypt_device *device;
 } DecryptedPartitionTarget;
 
@@ -4840,11 +5005,14 @@ static DecryptedPartitionTarget* decrypted_partition_target_free(DecryptedPartit
 
         safe_close(t->fd);
 
-        /* udev or so might access out block device in the background while we are done. Let's hence
-         * force detach the volume. We sync'ed before, hence this should be safe. */
-        r = sym_crypt_deactivate_by_name(t->device, t->dm_name, CRYPT_DEACTIVATE_FORCE);
-        if (r < 0)
-                log_warning_errno(r, "Failed to deactivate LUKS device, ignoring: %m");
+        if (!t->keep) {
+                /* udev or so might access our block device in the background while we are done. Let's hence
+                 * force detach the volume. We sync'ed before, hence this should be safe. */
+                r = sym_crypt_deactivate_by_name(t->device, t->dm_name, CRYPT_DEACTIVATE_FORCE);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to deactivate LUKS device, ignoring: %m");
+        } else
+                log_debug("Keeping encrypted device '%s' open.", t->dm_name);
 
         sym_crypt_free(t->device);
         free(t->dm_name);
@@ -4854,8 +5022,30 @@ static DecryptedPartitionTarget* decrypted_partition_target_free(DecryptedPartit
         return NULL;
 }
 
+/* BlockPartition represents partitions that have been created with BLKPG */
+typedef struct {
+        int fd;
+        int whole_fd; /* not owned */
+        int nr;
+        uint64_t offset;
+        uint64_t size;
+        char *node;
+} BlockPartition;
+
+static BlockPartition* block_partition_free(BlockPartition *p) {
+        if (!p)
+                return NULL;
+
+        safe_close(p->fd);
+        free(p->node);
+        return mfree(p);
+}
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(BlockPartition*, block_partition_free);
+
 typedef struct {
         LoopDevice *loop;
+        BlockPartition *block_partition;
         int fd;
         char *path;
         int whole_fd;
@@ -4864,13 +5054,16 @@ typedef struct {
 
 static int partition_target_fd(PartitionTarget *t) {
         assert(t);
-        assert(t->loop || t->fd >= 0 || t->whole_fd >= 0);
+        assert(t->loop || t->fd >= 0 || t->whole_fd >= 0 || t->block_partition);
 
         if (t->decrypted)
                 return t->decrypted->fd;
 
         if (t->loop)
                 return t->loop->fd;
+
+        if (t->block_partition)
+                return t->block_partition->fd;
 
         if (t->fd >= 0)
                 return t->fd;
@@ -4880,13 +5073,16 @@ static int partition_target_fd(PartitionTarget *t) {
 
 static const char* partition_target_path(PartitionTarget *t) {
         assert(t);
-        assert(t->loop || t->path);
+        assert(t->loop || t->path || t->block_partition);
 
         if (t->decrypted)
                 return t->decrypted->volume;
 
         if (t->loop)
                 return t->loop->node;
+
+        if (t->block_partition)
+                return t->block_partition->node;
 
         return t->path;
 }
@@ -4899,6 +5095,7 @@ static PartitionTarget* partition_target_free(PartitionTarget *t) {
         loop_device_unref(t->loop);
         safe_close(t->fd);
         unlink_and_free(t->path);
+        block_partition_free(t->block_partition);
 
         return mfree(t);
 }
@@ -4928,7 +5125,7 @@ static int prepare_temporary_file(Context *context, PartitionTarget *t, uint64_t
                 return log_error_errno(fd, "Failed to create temporary file: %m");
 
         if (context->fdisk_context) {
-                r = read_attr_fd(fdisk_get_devfd(context->fdisk_context), &attrs);
+                r = read_attr_fd(sym_fdisk_get_devfd(context->fdisk_context), &attrs);
                 if (r < 0 && !ERRNO_IS_NEG_NOT_SUPPORTED(r))
                         log_warning_errno(r, "Failed to read file attributes of %s, ignoring: %m", context->node);
 
@@ -4969,7 +5166,7 @@ static int partition_target_prepare(
         assert(p);
         assert(ret);
 
-        assert_se((whole_fd = fdisk_get_devfd(context->fdisk_context)) >= 0);
+        assert_se((whole_fd = sym_fdisk_get_devfd(context->fdisk_context)) >= 0);
 
         t = new(PartitionTarget, 1);
         if (!t)
@@ -4988,20 +5185,85 @@ static int partition_target_prepare(
                 return 0;
         }
 
-        /* Loopback block devices are not only useful to turn regular files into block devices, but
-         * also to cut out sections of block devices into new block devices. */
-
         if (arg_offline <= 0) {
-                r = loop_device_make(whole_fd, O_RDWR, p->offset, size, context->sector_size, 0, LOCK_EX, &d);
-                if (r < 0 && loop_device_error_is_fatal(p, r))
-                        return log_error_errno(r, "Failed to make loopback device of future partition %" PRIu64 ": %m", p->partno);
-                if (r >= 0) {
-                        t->loop = TAKE_PTR(d);
+                r = blockdev_partscan_enabled_fd(whole_fd);
+                if (r > 0) {
+                        _cleanup_close_ int dev_fd = -EBADF;
+                        _cleanup_free_ char *part_node = NULL;
+                        _cleanup_(block_partition_freep) BlockPartition *b = NULL;
+                        int nr;
+
+                        /* blkpg takes int for partition numbers */
+                        if (p->partno >= INT_MAX)
+                                return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "Partition number %" PRIu64 " is too large for blkpg.", p->partno);
+                        nr = p->partno + 1;
+
+                        part_node = sym_fdisk_partname(context->node, p->partno + 1);
+                        if (!part_node)
+                                return log_oom();
+
+                        /* There is no corresponding call to block_device_remove_partition because we want to
+                         * keep them alive if we succeed, and the rescan will remove them if possible if
+                         * there is an error before writing the partition table.
+                         */
+                        log_debug("Adding partition '%s' (nr=%i, offset=%" PRIu64 " [align=%" PRIu64 "], size=%" PRIu64 " [align=%" PRIu64 "])",
+                                  part_node, nr,
+                                  p->offset, NATURAL_ALIGNMENT(p->offset),
+                                  size, NATURAL_ALIGNMENT(size));
+                        r = block_device_add_partition(whole_fd, nr, p->offset, size);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to create new partition '%s': %m", part_node);
+
+                        context->needs_rescan = true;
+
+                        dev_fd = open(part_node, O_RDWR|O_CLOEXEC|O_NOCTTY);
+                        if (dev_fd < 0) {
+                                r = -errno;
+                                int q = block_device_remove_partition(whole_fd, nr);
+                                if (q < 0)
+                                        log_warning_errno(q, "Error while removing block device partition '%s', ignoring: %m", part_node);
+                                return log_error_errno(r, "Failed to open new partition '%s': %m", part_node);
+                        }
+
+                        /* No need to flock for udev, the whole disk fd is already locked. */
+
+                        b = new(BlockPartition, 1);
+                        if (!b) {
+                                r = block_device_remove_partition(whole_fd, nr);
+                                if (r < 0)
+                                        log_warning_errno(r, "Error while removing block device partition '%s', ignoring: %m", part_node);
+
+                                return log_oom();
+                        }
+
+                        *b = (BlockPartition) {
+                                .fd = TAKE_FD(dev_fd),
+                                .whole_fd = whole_fd,
+                                .nr = nr,
+                                .offset = p->offset,
+                                .size = size,
+                                .node = TAKE_PTR(part_node),
+                        };
+
+                        t->block_partition = TAKE_PTR(b);
                         *ret = TAKE_PTR(t);
                         return 0;
-                }
+                } else {
+                        if (!IN_SET(r, 0, -ENOTBLK))
+                                log_warning_errno(r, "Could not detect whether the device can be partitioned, assuming it cannot be: %m");
+                        /* Loopback block devices are not only useful to turn regular files into block devices, but
+                         * also to cut out sections of block devices into new block devices. */
+                        r = loop_device_make(whole_fd, O_RDWR, p->offset, size, context->sector_size, /* loop_flags= */ 0, LOCK_EX, &d);
+                        if (r < 0 && loop_device_error_is_fatal(p, r))
+                                return log_error_errno(r, "Failed to make loopback device of future partition %" PRIu64 ": %m", p->partno);
+                        if (r >= 0) {
+                                t->loop = TAKE_PTR(d);
+                                *ret = TAKE_PTR(t);
+                                return 0;
+                        }
 
-                log_debug_errno(r, "No access to loop devices, falling back to a regular file");
+                        log_debug_errno(r, "No access to loop devices, falling back to a regular file");
+                }
         }
 
         /* If we can't allocate a loop device, let's write to a regular file that we copy into the final
@@ -5028,6 +5290,11 @@ static int partition_target_grow(PartitionTarget *t, uint64_t size) {
                 r = loop_device_refresh_size(t->loop, UINT64_MAX, size);
                 if (r < 0)
                         return log_error_errno(r, "Failed to refresh loopback device size: %m");
+        } else if (t->block_partition) {
+                r = block_device_resize_partition(t->block_partition->whole_fd, t->block_partition->nr, t->block_partition->offset, size);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to resize partition %d: %m", t->block_partition->nr);
+                t->block_partition->size = size;
         } else if (t->fd >= 0) {
                 if (ftruncate(t->fd, size) < 0)
                         return log_error_errno(errno, "Failed to grow '%s' to %s by truncation: %m",
@@ -5044,7 +5311,7 @@ static int partition_target_sync(Context *context, Partition *p, PartitionTarget
         assert(p);
         assert(t);
 
-        assert_se((whole_fd = fdisk_get_devfd(context->fdisk_context)) >= 0);
+        assert_se((whole_fd = sym_fdisk_get_devfd(context->fdisk_context)) >= 0);
 
         log_info("Syncing future partition %"PRIu64" contents to disk.", p->partno);
 
@@ -5055,6 +5322,9 @@ static int partition_target_sync(Context *context, Partition *p, PartitionTarget
                 r = loop_device_sync(t->loop);
                 if (r < 0)
                         return log_error_errno(r, "Failed to sync loopback device: %m");
+        } else if (t->block_partition) {
+                if (fsync(t->block_partition->fd) < 0)
+                        return log_error_errno(errno, "Failed to sync blkpg partition: %m");
         } else if (t->fd >= 0) {
                 struct stat st;
 
@@ -5113,7 +5383,7 @@ static size_t dmcrypt_proper_key_size(Partition *p) {
         }
 }
 
-static int partition_encrypt(Context *context, Partition *p, PartitionTarget *target, bool offline) {
+static int partition_encrypt(Context *context, Partition *p, PartitionTarget *target, bool offline, bool temporary) {
 #if HAVE_LIBCRYPTSETUP
 #if HAVE_TPM2
         _cleanup_(erase_and_freep) char *base64_encoded = NULL;
@@ -5130,9 +5400,9 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
         assert(p);
         assert(p->encrypt != ENCRYPT_OFF);
 
-        r = dlopen_cryptsetup();
+        r = DLOPEN_CRYPTSETUP(LOG_ERR, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
         if (r < 0)
-                return log_error_errno(r, "libcryptsetup not found, cannot encrypt: %m");
+                return r;
 
         log_info("Encrypting future partition %" PRIu64 "...", p->partno);
 
@@ -5175,7 +5445,13 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
                 if (ftruncate(fileno(h), luks_params.sector_size) < 0)
                         return log_error_errno(errno, "Failed to grow temporary LUKS header file: %m");
         } else {
-                if (asprintf(&dm_name, "luks-repart-%08" PRIx64, random_u64()) < 0)
+                if (!temporary && p->volume_name)
+                        dm_name = strdup(p->volume_name);
+                else if (!temporary && filename_is_valid(vl))
+                        dm_name = strdup(vl);
+                else
+                        dm_name = asprintf_safe("luks-repart-%08" PRIx64, random_u64());
+                if (!dm_name)
                         return log_oom();
 
                 vol = path_join("/dev/mapper/", dm_name);
@@ -5183,7 +5459,7 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
                         return log_oom();
         }
 
-        _cleanup_(sym_crypt_freep) struct crypt_device *cd = NULL;
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         r = sym_crypt_init(&cd, offline ? hp : node);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate libcryptsetup context for %s: %m", hp);
@@ -5218,6 +5494,46 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
                         &luks_params);
         if (r < 0)
                 return log_error_errno(r, "Failed to LUKS2 format future partition: %m");
+
+        /* If an explicit KDF is configured, apply it before adding any keyslots. */
+        if (p->encrypt_kdf >= 0) {
+                if (p->encrypt_kdf == ENCRYPT_KDF_MINIMAL) {
+                        /* Minimal PBKDF2 with sha512, 1000 iterations, no benchmarking — appropriate
+                         * for high-entropy keys where the KDF only satisfies the LUKS2 format requirement
+                         * (e.g. kdump with crashkernel=512MB). */
+                        r = cryptsetup_set_minimal_pbkdf(cd);
+                } else {
+                        /* For argon2id or pbkdf2, set the type and let libcryptsetup benchmark
+                         * and determine the parameters. */
+                        static const struct crypt_pbkdf_type argon2id_pbkdf = {
+                                .type = "argon2id",
+                        };
+                        static const struct crypt_pbkdf_type pbkdf2_pbkdf = {
+                                .type = "pbkdf2",
+                        };
+
+                        r = sym_crypt_set_pbkdf_type(cd, p->encrypt_kdf == ENCRYPT_KDF_ARGON2ID ?
+                                                     &argon2id_pbkdf : &pbkdf2_pbkdf);
+                }
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set KDF type: %m");
+        }
+
+        bool allow_discards = p->integrity != INTEGRITY_INLINE && (arg_discard ? p->discard != 0 : p->discard > 0);
+        if (allow_discards) {
+                uint32_t flags;
+
+                r = sym_crypt_persistent_flags_get(cd, CRYPT_FLAGS_ACTIVATION, &flags);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get persistent activation flags for %s: %m", node);
+
+                if (!FLAGS_SET(flags, CRYPT_ACTIVATE_ALLOW_DISCARDS)) {
+                        flags |= CRYPT_ACTIVATE_ALLOW_DISCARDS;
+                        r = sym_crypt_persistent_flags_set(cd, CRYPT_FLAGS_ACTIVATION, flags);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to set persistent activation flags for %s: %m", node);
+                }
+        }
 
         if (p->encrypted_volume && p->encrypted_volume->fixate_volume_key) {
                 _cleanup_free_ char *key_id = NULL, *hash_option = NULL;
@@ -5537,7 +5853,7 @@ static int partition_encrypt(Context *context, Partition *p, PartitionTarget *ta
                                 dm_name,
                                 NULL,
                                 /* volume_key_size= */ volume_key_size,
-                                (arg_discard && p->integrity != INTEGRITY_INLINE ? CRYPT_ACTIVATE_ALLOW_DISCARDS : 0) | CRYPT_ACTIVATE_PRIVATE);
+                                (allow_discards ? CRYPT_ACTIVATE_ALLOW_DISCARDS : 0) | CRYPT_ACTIVATE_PRIVATE);
                 if (r < 0)
                         return log_error_errno(r, "Failed to activate LUKS superblock: %m");
 
@@ -5599,7 +5915,7 @@ static int partition_format_verity_hash(
 #if HAVE_LIBCRYPTSETUP
         Partition *dp;
         _cleanup_(partition_target_freep) PartitionTarget *t = NULL;
-        _cleanup_(sym_crypt_freep) struct crypt_device *cd = NULL;
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         _cleanup_free_ char *hint = NULL;
         int r;
 
@@ -5614,7 +5930,7 @@ static int partition_format_verity_hash(
         if (PARTITION_EXISTS(p)) /* Never format existing partitions */
                 return 0;
 
-        /* Minimized partitions will use the copy blocks logic so skip those here. */
+        /* Either we are minimizing the partition or we were instructed to copy an existing hash block directly. */
         if (p->copy_blocks_fd >= 0)
                 return 0;
 
@@ -5623,9 +5939,9 @@ static int partition_format_verity_hash(
 
         (void) partition_hint(p, node, &hint);
 
-        r = dlopen_cryptsetup();
+        r = DLOPEN_CRYPTSETUP(LOG_ERR, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
         if (r < 0)
-                return log_error_errno(r, "libcryptsetup not found, cannot setup verity: %m");
+                return r;
 
         if (!node) {
                 r = partition_target_prepare(context, p, p->new_size, /* need_path= */ true, &t);
@@ -5716,7 +6032,7 @@ static int sign_verity_roothash(
         _cleanup_(PKCS7_freep) PKCS7 *p7 = NULL;
         _cleanup_free_ char *hex = NULL;
         _cleanup_free_ uint8_t *sig = NULL;
-        int sigsz;
+        int sigsz, r;
 
         assert(context);
         assert(context->certificate);
@@ -5725,23 +6041,27 @@ static int sign_verity_roothash(
         assert(iovec_is_set(roothash));
         assert(ret_signature);
 
+        r = DLOPEN_LIBCRYPTO(LOG_ERR, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
+        if (r < 0)
+                return r;
+
         hex = hexmem(roothash->iov_base, roothash->iov_len);
         if (!hex)
                 return log_oom();
 
-        rb = BIO_new_mem_buf(hex, -1);
+        rb = sym_BIO_new_mem_buf(hex, -1);
         if (!rb)
                 return log_oom();
 
-        p7 = PKCS7_sign(context->certificate, context->private_key, NULL, rb, PKCS7_DETACHED|PKCS7_NOATTR|PKCS7_BINARY);
+        p7 = sym_PKCS7_sign(context->certificate, context->private_key, NULL, rb, PKCS7_DETACHED|PKCS7_NOATTR|PKCS7_BINARY);
         if (!p7)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to calculate PKCS7 signature: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
 
-        sigsz = i2d_PKCS7(p7, &sig);
+        sigsz = sym_i2d_PKCS7(p7, &sig);
         if (sigsz < 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to convert PKCS7 signature to DER: %s",
-                                       ERR_error_string(ERR_get_error(), NULL));
+                                       sym_ERR_error_string(sym_ERR_get_error(), NULL));
 
         *ret_signature = IOVEC_MAKE(TAKE_PTR(sig), sigsz);
 
@@ -5751,21 +6071,41 @@ static int sign_verity_roothash(
 #endif
 }
 
-static const VeritySettings *lookup_verity_settings_by_uuid_pair(sd_id128_t data_uuid, sd_id128_t hash_uuid) {
-        uint8_t root_hash_key[sizeof(sd_id128_t) * 2];
+static int iovec_roothash_from_uuid_pair(
+                sd_id128_t data_uuid,
+                sd_id128_t hash_uuid,
+                struct iovec *ret_roothash) {
+
+        uint8_t roothash_bytes[sizeof(sd_id128_t) * 2];
+
+        assert(ret_roothash);
 
         if (sd_id128_is_null(data_uuid) || sd_id128_is_null(hash_uuid))
-                return NULL;
+                return -EINVAL;
 
         /* As per the https://uapi-group.org/specifications/specs/discoverable_partitions_specification/ the
          * UUIDs of the data and verity partitions are respectively the first and second halves of the
          * dm-verity roothash, so we can use them to match the signature to the right partition. */
 
-        memcpy(root_hash_key, data_uuid.bytes, sizeof(sd_id128_t));
-        memcpy(root_hash_key + sizeof(sd_id128_t), hash_uuid.bytes, sizeof(sd_id128_t));
+        memcpy(roothash_bytes, data_uuid.bytes, sizeof(sd_id128_t));
+        memcpy(roothash_bytes + sizeof(sd_id128_t), hash_uuid.bytes, sizeof(sd_id128_t));
+
+        if (!iovec_memdup(&IOVEC_MAKE(roothash_bytes, sizeof(roothash_bytes)), ret_roothash))
+                return -ENOMEM;
+
+        return 0;
+}
+
+static const VeritySettings *lookup_verity_settings_by_uuid_pair(sd_id128_t data_uuid, sd_id128_t hash_uuid) {
+        _cleanup_(iovec_done) struct iovec roothash = {};
+        int r;
+
+        r = iovec_roothash_from_uuid_pair(data_uuid, hash_uuid, &roothash);
+        if (r < 0)
+                return NULL;
 
         VeritySettings key = {
-                .root_hash = IOVEC_MAKE(root_hash_key, sizeof(root_hash_key)),
+                .root_hash = roothash,
         };
 
         return set_get(arg_verity_settings, &key);
@@ -5788,10 +6128,22 @@ static int partition_format_verity_sig(Context *context, Partition *p) {
         if (PARTITION_EXISTS(p))
                 return 0;
 
+        /* We were instructed to copy an existing signature block directly */
+        if (p->copy_blocks_fd >= 0)
+                return 0;
+
         assert_se(hp = p->siblings[VERITY_HASH]);
         assert(!hp->dropped);
         assert_se(rp = p->siblings[VERITY_DATA]);
         assert(!rp->dropped);
+
+        /* Currently only set while formatting the hash partition. But if this is skipped via CopyBlocks=
+         * we just derive the roothash from the UUIDs from the data + hash partition. */
+        if (!iovec_is_set(&hp->roothash)) {
+                r = iovec_roothash_from_uuid_pair(rp->new_uuid, hp->new_uuid, &hp->roothash);
+                if (r < 0)
+                        return log_error_errno(r, "Unable to derive roothash: %m");
+        }
 
         verity_settings = lookup_verity_settings_by_uuid_pair(rp->current_uuid, hp->current_uuid);
 
@@ -5812,7 +6164,7 @@ static int partition_format_verity_sig(Context *context, Partition *p) {
 
         (void) partition_hint(p, context->node, &hint);
 
-        assert_se((whole_fd = fdisk_get_devfd(context->fdisk_context)) >= 0);
+        assert_se((whole_fd = sym_fdisk_get_devfd(context->fdisk_context)) >= 0);
 
         _cleanup_(iovec_done) struct iovec sig_free = {};
         const struct iovec *roothash, *sig;
@@ -5957,8 +6309,8 @@ static int context_copy_blocks(Context *context) {
                 if (r < 0)
                         return r;
 
-                if (p->encrypt != ENCRYPT_OFF && t->loop) {
-                        r = partition_encrypt(context, p, t, /* offline= */ false);
+                if (p->encrypt != ENCRYPT_OFF && (t->loop || t->block_partition)) {
+                        r = partition_encrypt(context, p, t, /* offline= */ false, /* temporary= */ true);
                         if (r < 0)
                                 return r;
                 }
@@ -5981,8 +6333,8 @@ static int context_copy_blocks(Context *context) {
 
                 log_info("Copying in of '%s' on block level completed.", p->copy_blocks_path);
 
-                if (p->encrypt != ENCRYPT_OFF && !t->loop) {
-                        r = partition_encrypt(context, p, t, /* offline= */ true);
+                if (p->encrypt != ENCRYPT_OFF && !t->loop && !t->block_partition) {
+                        r = partition_encrypt(context, p, t, /* offline= */ true, /* temporary= */ true);
                         if (r < 0)
                                 return r;
                 }
@@ -6776,7 +7128,7 @@ static int partition_populate_filesystem(Context *context, Partition *p, const c
          * appear in the host namespace. Hence we fork a child that has its own file system namespace and
          * detached mount propagation. */
 
-        (void) dlopen_libmount();
+        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
 
         r = pidref_safe_fork(
                         "(sd-copy)",
@@ -6907,10 +7259,109 @@ static int finalize_extra_mkfs_options(const Partition *p, const char *root, cha
                         if (r < 0)
                                 return r;
                 }
+
+                if (p->minimize != MINIMIZE_OFF && strv_extend(&sv, "--shrink") < 0)
+                        return log_oom();
         }
 
         *ret = TAKE_PTR(sv);
         return 0;
+}
+
+static int context_block_device_replace(Context *context) {
+        int r;
+
+        assert(context);
+
+        LIST_FOREACH(partitions, p, context->partitions) {
+                _cleanup_(partition_target_freep) PartitionTarget *t = NULL;
+
+                if (p->dropped)
+                        continue;
+
+                if (PARTITION_EXISTS(p))
+                        continue;
+
+                if (!p->btrfs_replaced)
+                        continue;
+
+                if (partition_defer(context, p))
+                        continue;
+
+                assert(!p->btrfs_replaced->done);
+
+                (void) context_notify(context, PROGRESS_REPLACING_DEVICE, p->definition_path, UINT_MAX);
+
+                assert(p->offset != UINT64_MAX);
+                assert(p->new_size != UINT64_MAX);
+
+                r = partition_target_prepare(context, p,
+                                             p->new_size,
+                                             /* need_path= */ true,
+                                             &t);
+                if (r < 0)
+                        return r;
+
+                if (p->encrypt != ENCRYPT_OFF) {
+                        r = partition_encrypt(context, p, t, /* offline= */ false, /* temporary= */ false);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to encrypt device: %m");
+                }
+
+                log_info("Replacing partition %" PRIu64 ".", p->partno);
+
+                /* btrfs_replace calls a synchronous ioctl and will return when replace is finished */
+                r = btrfs_replace(p->btrfs_replaced->mountpoint_fd, p->btrfs_replaced->devid, partition_target_path(t));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to replace btrfs device on partition %" PRIu64 ": %m", p->partno);
+
+                p->btrfs_replaced->done = true;
+
+                if (t->decrypted)
+                        t->decrypted->keep = true;
+
+                log_info("Successfully replaced partition %" PRIu64 ".", p->partno);
+        }
+
+        return 0;
+}
+
+static void context_btrfs_replace_resize(Context *context) {
+        int r;
+
+        assert(context);
+
+        LIST_FOREACH(partitions, p, context->partitions) {
+                if (!p->btrfs_replaced)
+                        continue;
+
+                if (!p->btrfs_replaced->done)
+                        continue;
+
+                r = btrfs_resize_max(p->btrfs_replaced->mountpoint_fd, p->btrfs_replaced->devid);
+                if (r < 0)
+                        log_warning_errno(r, "Could not resize btrfs filesystem moved to partition %" PRIu64 ", proceeding without resizing: %m", p->partno);
+                else
+                        log_info("Successfully resized partition %" PRIu64 ".", p->partno);
+        }
+}
+
+static void context_btrfs_replace_back(Context *context) {
+        int r;
+
+        assert(context);
+
+        LIST_FOREACH(partitions, p, context->partitions) {
+                if (!p->btrfs_replaced)
+                        continue;
+
+                if (!p->btrfs_replaced->done)
+                        continue;
+
+                r = btrfs_replace(p->btrfs_replaced->mountpoint_fd, p->btrfs_replaced->devid, p->btrfs_replaced->source_path);
+                if (r < 0)
+                        log_warning_errno(r, "Could not move back btrfs filesystem from partition %" PRIu64 ", leaving it on new device: %m", p->partno);
+        }
 }
 
 static int context_mkfs(Context *context) {
@@ -6960,12 +7411,12 @@ static int context_mkfs(Context *context) {
                 if (r < 0)
                         return r;
 
-                if (p->encrypt != ENCRYPT_OFF && t->loop) {
+                if (p->encrypt != ENCRYPT_OFF && (t->loop || t->block_partition)) {
                         r = partition_target_grow(t, p->new_size);
                         if (r < 0)
                                 return r;
 
-                        r = partition_encrypt(context, p, t, /* offline= */ false);
+                        r = partition_encrypt(context, p, t, /* offline= */ false, /* temporary= */ true);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to encrypt device: %m");
                 }
@@ -6977,10 +7428,10 @@ static int context_mkfs(Context *context) {
                  * we need to set up the final directory tree beforehand. */
 
                 if (partition_needs_populate(p) &&
-                    (!t->loop || fstype_is_ro(p->format) || (streq_ptr(p->format, "btrfs") && p->compression))) {
+                    ((!t->loop && !t->block_partition) || fstype_is_ro(p->format) || (streq_ptr(p->format, "btrfs") && p->compression))) {
                         if (!mkfs_supports_root_option(p->format))
                                 return log_error_errno(SYNTHETIC_ERRNO(ENODEV),
-                                                        "Loop device access is required to populate %s filesystems.",
+                                                        "Loop device or block partition access is required to populate %s filesystems.",
                                                         p->format);
 
                         r = partition_populate_directory(context, p, &root);
@@ -7010,7 +7461,7 @@ static int context_mkfs(Context *context) {
                  * on a loop device, so open the file again to make sure our file descriptor points to actual
                  * new file. */
 
-                if (t->fd >= 0 && t->path && !t->loop) {
+                if (t->fd >= 0 && t->path && !t->loop && !t->block_partition) {
                         safe_close(t->fd);
                         t->fd = open(t->path, O_RDWR|O_CLOEXEC);
                         if (t->fd < 0)
@@ -7019,21 +7470,21 @@ static int context_mkfs(Context *context) {
 
                 log_info("Successfully formatted future partition %" PRIu64 ".", p->partno);
 
-                /* If we're writing to a loop device, we can now mount the empty filesystem and populate it. */
+                /* If we're writing to a loop device or BLKPG partition, we can now mount the empty filesystem and populate it. */
                 if (partition_needs_populate(p) && !root) {
-                        assert(t->loop);
+                        assert(t->loop || t->block_partition);
 
                         r = partition_populate_filesystem(context, p, partition_target_path(t));
                         if (r < 0)
                                 return r;
                 }
 
-                if (p->encrypt != ENCRYPT_OFF && !t->loop) {
+                if (p->encrypt != ENCRYPT_OFF && !t->loop && !t->block_partition) {
                         r = partition_target_grow(t, p->new_size);
                         if (r < 0)
                                 return r;
 
-                        r = partition_encrypt(context, p, t, /* offline= */ true);
+                        r = partition_encrypt(context, p, t, /* offline= */ true, /* temporary= */ true);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to encrypt device: %m");
                 }
@@ -7279,7 +7730,7 @@ static int set_gpt_flags(struct fdisk_partition *q, uint64_t flags) {
                         return r;
         }
 
-        return fdisk_partition_set_attrs(q, strempty(a));
+        return sym_fdisk_partition_set_attrs(q, strempty(a));
 }
 
 static uint64_t partition_merge_flags(Partition *p) {
@@ -7352,11 +7803,11 @@ static int context_mangle_partitions(Context *context) {
                                 assert(p->new_size >= p->current_size);
                                 assert(p->new_size % context->sector_size == 0);
 
-                                r = fdisk_partition_size_explicit(p->current_partition, true);
+                                r = sym_fdisk_partition_size_explicit(p->current_partition, true);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to enable explicit sizing: %m");
 
-                                r = fdisk_partition_set_size(p->current_partition, p->new_size / context->sector_size);
+                                r = sym_fdisk_partition_set_size(p->current_partition, p->new_size / context->sector_size);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to grow partition: %m");
 
@@ -7365,7 +7816,7 @@ static int context_mangle_partitions(Context *context) {
                         }
 
                         if (!sd_id128_equal(p->new_uuid, p->current_uuid)) {
-                                r = fdisk_partition_set_uuid(p->current_partition, SD_ID128_TO_UUID_STRING(p->new_uuid));
+                                r = sym_fdisk_partition_set_uuid(p->current_partition, SD_ID128_TO_UUID_STRING(p->new_uuid));
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to set partition UUID: %m");
 
@@ -7374,7 +7825,7 @@ static int context_mangle_partitions(Context *context) {
                         }
 
                         if (!streq_ptr(p->new_label, p->current_label)) {
-                                r = fdisk_partition_set_name(p->current_partition, strempty(p->new_label));
+                                r = sym_fdisk_partition_set_name(p->current_partition, strempty(p->new_label));
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to set partition label: %m");
 
@@ -7385,7 +7836,7 @@ static int context_mangle_partitions(Context *context) {
                         if (changed) {
                                 assert(!PARTITION_IS_FOREIGN(p)); /* never touch foreign partitions */
 
-                                r = fdisk_set_partition(context->fdisk_context, p->partno, p->current_partition);
+                                r = sym_fdisk_set_partition(context->fdisk_context, p->partno, p->current_partition);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to update partition: %m");
                         }
@@ -7398,43 +7849,43 @@ static int context_mangle_partitions(Context *context) {
                         assert(p->new_size % context->sector_size == 0);
                         assert(p->new_label);
 
-                        t = fdisk_new_parttype();
+                        t = sym_fdisk_new_parttype();
                         if (!t)
                                 return log_oom();
 
-                        r = fdisk_parttype_set_typestr(t, SD_ID128_TO_UUID_STRING(p->type.uuid));
+                        r = sym_fdisk_parttype_set_typestr(t, SD_ID128_TO_UUID_STRING(p->type.uuid));
                         if (r < 0)
                                 return log_error_errno(r, "Failed to initialize partition type: %m");
 
-                        q = fdisk_new_partition();
+                        q = sym_fdisk_new_partition();
                         if (!q)
                                 return log_oom();
 
-                        r = fdisk_partition_set_type(q, t);
+                        r = sym_fdisk_partition_set_type(q, t);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set partition type: %m");
 
-                        r = fdisk_partition_size_explicit(q, true);
+                        r = sym_fdisk_partition_size_explicit(q, true);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to enable explicit sizing: %m");
 
-                        r = fdisk_partition_set_start(q, p->offset / context->sector_size);
+                        r = sym_fdisk_partition_set_start(q, p->offset / context->sector_size);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to position partition: %m");
 
-                        r = fdisk_partition_set_size(q, p->new_size / context->sector_size);
+                        r = sym_fdisk_partition_set_size(q, p->new_size / context->sector_size);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to grow partition: %m");
 
-                        r = fdisk_partition_set_partno(q, p->partno);
+                        r = sym_fdisk_partition_set_partno(q, p->partno);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set partition number: %m");
 
-                        r = fdisk_partition_set_uuid(q, SD_ID128_TO_UUID_STRING(p->new_uuid));
+                        r = sym_fdisk_partition_set_uuid(q, SD_ID128_TO_UUID_STRING(p->new_uuid));
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set partition UUID: %m");
 
-                        r = fdisk_partition_set_name(q, strempty(p->new_label));
+                        r = sym_fdisk_partition_set_name(q, strempty(p->new_label));
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set partition label: %m");
 
@@ -7445,7 +7896,7 @@ static int context_mangle_partitions(Context *context) {
 
                         log_info("Adding new partition %" PRIu64 " to partition table.", p->partno);
 
-                        r = fdisk_add_partition(context->fdisk_context, q, NULL);
+                        r = sym_fdisk_add_partition(context->fdisk_context, q, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to add partition: %m");
 
@@ -7590,7 +8041,7 @@ static int context_split(Context *context) {
                         continue;
 
                 if (fd < 0) {
-                        assert_se((fd = fdisk_get_devfd(context->fdisk_context)) >= 0);
+                        assert_se((fd = sym_fdisk_get_devfd(context->fdisk_context)) >= 0);
 
                         r = read_attr_fd(fd, &attrs);
                         if (r < 0 && !ERRNO_IS_NEG_NOT_SUPPORTED(r))
@@ -7609,17 +8060,404 @@ static int context_split(Context *context) {
                 if (lseek(fd, p->offset, SEEK_SET) < 0)
                         return log_error_errno(errno, "Failed to seek to partition offset: %m");
 
-                r = copy_bytes(fd, fdt, p->new_size, COPY_REFLINK|COPY_HOLES|COPY_TRUNCATE);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to copy to split partition %s: %m", p->split_path);
+                /* Verity signature partitions contain a JSON object NUL-padded out to the partition
+                 * size. The on-disk partition must keep the padding, but the split-out file is a
+                 * standalone artifact, so trim the trailing NUL bytes there to avoid tripping jq. */
+                if (partition_designator_is_verity_sig(p->type.designator)) {
+                        _cleanup_free_ char *buf = malloc(p->new_size);
+                        if (!buf)
+                                return log_oom();
+
+                        r = loop_read_exact(fd, buf, p->new_size, /* do_poll= */ false);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to read verity signature partition: %m");
+
+                        size_t len = strnlen(buf, p->new_size);
+                        if (len == 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Verity signature partition is empty");
+
+                        r = loop_write(fdt, buf, len);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to write to split partition %s: %m", p->split_path);
+                } else {
+                        r = copy_bytes(fd, fdt, p->new_size, COPY_REFLINK|COPY_HOLES|COPY_TRUNCATE);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to copy to split partition %s: %m", p->split_path);
+                }
         }
+
+        return 0;
+}
+
+static int write_primary_descriptor(
+                int fd,
+                uint32_t root_sector,
+                usec_t usec,
+                bool utc,
+                const char *system_id,
+                const char *volume_id,
+                const char *publisher_id) {
+        int r;
+
+        assert(fd >= 0);
+
+        struct iso9660_primary_volume_descriptor desc = {
+                .header = {
+                        .type = 1,
+                        .version = 1,
+                },
+                .volume_space_size_little = htole32(ISO9660_START + ISO9660_SIZE),
+                .volume_space_size_big = htobe32(ISO9660_START + ISO9660_SIZE),
+                .volume_set_size_little = htole16(1),
+                .volume_set_size_big = htobe16(1),
+                .volume_sequence_number_little = htole16(1),
+                .volume_sequence_number_big = htobe16(1),
+                .logical_block_size_little = htole16(ISO9660_BLOCK_SIZE),
+                .logical_block_size_big = htobe16(ISO9660_BLOCK_SIZE),
+                .file_structure_version = 1,
+                .root_directory_entry = {
+                        .len = sizeof(struct iso9660_directory_entry),
+                        .extent_loc_little = htole32(root_sector),
+                        .extent_loc_big = htobe32(root_sector),
+                        .data_len_little = htole32(2*sizeof(struct iso9660_directory_entry)), /* 2 entries with ident size 1: . and .. */
+                        .data_len_big = htobe32(2*sizeof(struct iso9660_directory_entry)), /* 2 entries with ident size 1: . and .. */
+                        .flags = 2, /* directory */
+                        .volume_seq_num_little = htole16(1),
+                        .volume_seq_num_big = htobe16(1),
+                        .ident_len = 1,
+                        .ident[0] = 0, /* special value for root */
+                }
+        };
+
+        iso9660_set_const_string(desc.header.identifier, sizeof(desc.header.identifier), "CD001", /* allow_a_chars= */ true);
+
+        r = iso9660_dir_datetime_from_usec(usec, utc, &desc.root_directory_entry.time);
+        if (r < 0)
+                return r;
+
+        r = iso9660_set_string(desc.system_identifier, sizeof(desc.system_identifier), system_id, /* allow_a_chars= */ true);
+        if (r < 0)
+                return r;
+
+        /* In theory the volume identifier should be d-chars, but in practice, a-chars are allowed */
+        r = iso9660_set_string(desc.volume_identifier, sizeof(desc.volume_identifier), volume_id, /* allow_a_chars= */ true);
+        if (r < 0)
+                return r;
+
+        iso9660_set_const_string(desc.volume_set_identifier, sizeof(desc.volume_set_identifier), NULL, /* allow_a_chars= */ false);
+
+        r = iso9660_set_string(desc.publisher_identifier, sizeof(desc.publisher_identifier), publisher_id, /* allow_a_chars= */ true);
+        if (r < 0)
+                return r;
+
+        iso9660_set_const_string(desc.data_preparer_identifier, sizeof(desc.data_preparer_identifier), NULL, /* allow_a_chars= */ true);
+        iso9660_set_const_string(desc.application_identifier, sizeof(desc.application_identifier), "SYSTEMD-REPART", /* allow_a_chars= */ true);
+        iso9660_set_const_string(desc.copyright_file_identifier, sizeof(desc.copyright_file_identifier), NULL, /* allow_a_chars= */ false);
+        iso9660_set_const_string(desc.abstract_file_identifier, sizeof(desc.abstract_file_identifier), NULL, /* allow_a_chars= */ false);
+        iso9660_set_const_string(desc.bibliographic_file_identifier, sizeof(desc.bibliographic_file_identifier), NULL, /* allow_a_chars= */ false);
+
+        r = iso9660_datetime_from_usec(usec, utc, &desc.volume_creation_date);
+        if (r < 0)
+                return r;
+
+        r = iso9660_datetime_from_usec(usec, utc, &desc.volume_modification_date);
+        if (r < 0)
+                return r;
+
+        iso9660_datetime_zero(&desc.volume_expiration_date);
+        iso9660_datetime_zero(&desc.volume_effective_date);
+
+        ssize_t s = pwrite(fd, &desc, sizeof(desc), ISO9660_PRIMARY_DESCRIPTOR*ISO9660_BLOCK_SIZE);
+        if (s < 0)
+                return log_error_errno(errno, "Failed to write ISO9660 primary descriptor: %m");
+        if (s != sizeof(desc))
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to fully write ISO9660 primary descriptor");
+
+        return 0;
+}
+
+static int write_eltorito_descriptor(int fd, uint32_t catalog_sector) {
+        assert(fd >= 0);
+
+        struct iso9660_eltorito_descriptor desc = {
+                .header = {
+                        .type = 0,
+                        .version = 1,
+                },
+                .boot_catalog_sector = htole32(catalog_sector),
+        };
+
+        iso9660_set_const_string(desc.header.identifier, sizeof(desc.header.identifier), "CD001", /* allow_a_chars= */ true);
+
+        strncpy(desc.boot_system_identifier, "EL TORITO SPECIFICATION", sizeof(desc.boot_system_identifier));
+
+        ssize_t s = pwrite(fd, &desc, sizeof(desc), ISO9660_ELTORITO_DESCRIPTOR*ISO9660_BLOCK_SIZE);
+        if (s < 0)
+                return log_error_errno(errno, "Failed to write ISO9660 El-Torito descriptor: %m");
+        if (s != sizeof(desc))
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to fully write ISO9660 El-Torito descriptor");
+
+        return 0;
+}
+
+static int write_terminal_descriptor(int fd) {
+        assert(fd >= 0);
+
+        struct iso9660_terminal_descriptor desc = {
+                .header = {
+                        .type = 255,
+                        .version = 1,
+                },
+        };
+
+        iso9660_set_const_string(desc.header.identifier, sizeof(desc.header.identifier), "CD001", /* allow_a_chars= */ true);
+
+        ssize_t s = pwrite(fd, &desc, sizeof(desc), ISO9660_TERMINAL_DESCRIPTOR*ISO9660_BLOCK_SIZE);
+        if (s < 0)
+                return log_error_errno(errno, "Failed to write ISO9660 terminal descriptor: %m");
+        if (s != sizeof(desc))
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to fully write ISO9660 terminal descriptor");
+
+        return 0;
+}
+
+static uint16_t calculate_validation_entry_checksum(const void *p, size_t size) {
+        assert(p || size == 0);
+        assert(size % 2 == 0);
+
+        uint16_t checksum = 0;
+
+        for (size_t i = 0; i < (size/2); i++)
+                checksum -= le16toh(((const le16_t*)p)[i]);
+
+        return checksum;
+}
+
+static int write_boot_catalog(int fd, uint32_t load_block) {
+        assert(fd >= 0);
+
+        struct el_torito_validation_entry ve = {
+                .header_indicator = 1,
+                .platform = 0xef, /* EFI */
+                .key_bytes = {0x55, 0xaa},
+        };
+
+        ve.checksum = htole16(calculate_validation_entry_checksum(&ve, sizeof(ve)));
+
+        struct el_torito_initial_entry ie = {
+                .boot_indicator = 0x88, /* bootable */
+                .boot_media_type = 0, /* no emul */
+                /* From UEFI specification:
+                 * > If the value of Sector Count is set to 0 or 1, EFI will assume the system partition
+                 * > consumes the space from the beginning of the “no emulation” image to the end of the
+                 * > CD-ROM.
+                 */
+                .sector_count = htole16(0),
+                .load_rba = htole32(load_block),
+
+        };
+
+        struct el_torito_section_header sh = {
+                .header_indicator = 0x91, /* final header */
+                .nentries = htole16(0), /* no more entries */
+        };
+
+        uint8_t sector[ISO9660_BLOCK_SIZE] = {};
+        uint8_t *p = sector;
+        p = mempcpy(p, &ve, sizeof(ve));
+        p = mempcpy(p, &ie, sizeof(ie));
+        p = mempcpy(p, &sh, sizeof(sh));
+        assert((size_t) (p - sector) <= sizeof(sector));
+
+        ssize_t s = pwrite(fd, &sector, sizeof(sector), ISO9660_BOOT_CATALOG*ISO9660_BLOCK_SIZE);
+        if (s < 0)
+                return log_error_errno(errno, "Failed to write El-Torito boot catalog: %m");
+        if (s != sizeof(sector))
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to fully write El-Torito boot catalog");
+
+        return 0;
+}
+
+static int write_directories(
+                int fd,
+                usec_t usec,
+                bool utc,
+                uint32_t root_sector) {
+
+        int r;
+
+        assert(fd >= 0);
+
+        uint32_t dir_size = 2*sizeof(struct iso9660_directory_entry); /* 2 entries with ident size 1: . and .. */
+
+        struct iso9660_directory_entry self = {
+                .len = sizeof(struct iso9660_directory_entry),
+                .extent_loc_little = htole32(root_sector),
+                .extent_loc_big = htobe32(root_sector),
+                .data_len_little = htole32(dir_size),
+                .data_len_big = htobe32(dir_size),
+                .flags = 2, /* directory */
+                .volume_seq_num_little = htole16(1),
+                .volume_seq_num_big = htobe16(1),
+                .ident_len = 1,
+                .ident[0] = 0, /* special value for self */
+        };
+
+        r = iso9660_dir_datetime_from_usec(usec, utc, &self.time);
+        if (r < 0)
+                return r;
+
+        struct iso9660_directory_entry parent = {
+                .len = sizeof(struct iso9660_directory_entry),
+                .extent_loc_little = htole32(root_sector),
+                .extent_loc_big = htobe32(root_sector),
+                .data_len_little = htole32(dir_size),
+                .data_len_big = htobe32(dir_size),
+                .flags = 2, /* directory */
+                .volume_seq_num_little = htole16(1),
+                .volume_seq_num_big = htobe16(1),
+                .ident_len = 1,
+                .ident[0] = 1, /* special value for parent */
+        };
+
+        // TODO: we should probably add some text file explaining there is no content through ISO9660
+
+        r = iso9660_dir_datetime_from_usec(usec, utc, &parent.time);
+        if (r < 0)
+                return r;
+
+        uint8_t sector[ISO9660_BLOCK_SIZE] = {};
+        uint8_t *p = sector;
+        p = mempcpy(p, &self, sizeof(self));
+        p = mempcpy(p, &parent, sizeof(parent));
+        assert((size_t) (p - sector) <= sizeof(sector));
+
+        ssize_t s = pwrite(fd, &sector, sizeof(sector), ISO9660_ROOT_DIRECTORY*ISO9660_BLOCK_SIZE);
+        if (s < 0)
+                return log_error_errno(errno, "Failed to write ISO9660 root directory: %m");
+        if (s != sizeof(sector))
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to fully write ISO9660 root directory");
+
+        return 0;
+}
+
+static int write_eltorito(
+                int fd,
+                usec_t usec,
+                bool utc,
+                uint32_t load_block, /* in iso9660 blocks */
+                const char *system_id,
+                const char *volume_id,
+                const char *publisher_id) {
+
+        int r;
+
+        assert(fd >= 0);
+
+        r = write_primary_descriptor(fd, ISO9660_ROOT_DIRECTORY, usec, utc, system_id, volume_id, publisher_id);
+        if (r < 0)
+                return r;
+
+        r = write_eltorito_descriptor(fd, ISO9660_BOOT_CATALOG);
+        if (r < 0)
+                return r;
+
+        r = write_terminal_descriptor(fd);
+        if (r < 0)
+                return r;
+
+        r = write_boot_catalog(fd, load_block);
+        if (r < 0)
+                return r;
+
+        r = write_directories(fd, usec, utc, ISO9660_ROOT_DIRECTORY);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
+static int context_verify_eltorito_overlap(Context *context) {
+        /* Check if the partition table collides with the ISO9660 El Torito area. */
+        assert(context);
+
+        if (!arg_eltorito)
+                return 0;
+
+        /* Check how many GPT partition entries can be stored. */
+        size_t nents = sym_fdisk_get_npartitions(context->fdisk_context);
+        /* The GPT contains
+         *  - 1 unused block (protective MBR)
+         *  - GPT header
+         *  - N entries of 128 bytes each.
+         */
+        size_t first_free_offset = 2*context->sector_size + round_up_size(nents*128, context->sector_size);
+
+        if (first_free_offset > ISO9660_START*ISO9660_BLOCK_SIZE)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The partition table is overlapping with the El Torito boot catalog.");
+
+        /* The first lba is the first block where a partition could exist. Even if there is no partition
+         * there, we should still not overlap with it since a partition could be added later.
+         * It is unexpected for tools to change the first lba in the GPT header. So this should be safe.
+         */
+        if (sym_fdisk_get_first_lba(context->fdisk_context) * context->sector_size < (ISO9660_START+ISO9660_SIZE)*ISO9660_BLOCK_SIZE)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "El Torito is overlapping with the first partition block.");
+
+        return 0;
+}
+
+static int context_find_esp_offset(Context *context, uint64_t *ret) {
+        assert(ret);
+
+        uint64_t esp_offset = UINT64_MAX;
+        LIST_FOREACH(partitions, p, context->partitions) {
+                if (p->dropped || PARTITION_IS_FOREIGN(p))
+                        continue;
+                if (p->type.designator == PARTITION_ESP) {
+                        esp_offset = p->offset;
+                        break;
+                }
+        }
+
+        if (esp_offset == UINT64_MAX)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "El Torito boot catalog requires an ESP.");
+        if (esp_offset / ISO9660_BLOCK_SIZE > UINT32_MAX)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "ESP offset is farther than El Torito boot catalog can support.");
+        if (esp_offset % ISO9660_BLOCK_SIZE != 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "ESP offset not aligned on 2K blocks.");
+
+        *ret = esp_offset;
+        return 0;
+}
+
+static int context_partscan(Context *context) {
+        int capable, r;
+
+        assert(context);
+
+        context->needs_rescan = false;
+
+        capable = blockdev_partscan_enabled_fd(sym_fdisk_get_devfd(context->fdisk_context));
+        if (capable == -ENOTBLK)
+                log_debug("Not telling kernel to reread partition table, since we are not operating on a block device.");
+        else if (capable < 0)
+                return log_error_errno(capable, "Failed to check if block device supports partition scanning: %m");
+        else if (capable > 0) {
+                log_info("Informing kernel about changed partitions...");
+                (void) context_notify(context, PROGRESS_REREADING_TABLE, /* object= */ NULL, UINT_MAX);
+
+                r = reread_partition_table_fd(sym_fdisk_get_devfd(context->fdisk_context), /* flags= */ 0);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to reread partition table: %m");
+        } else
+                log_notice("Not telling kernel to reread partition table, because selected image does not support kernel partition block devices.");
 
         return 0;
 }
 
 static int context_write_partition_table(Context *context) {
         _cleanup_(fdisk_unref_tablep) struct fdisk_table *original_table = NULL;
-        int capable, r;
+        int r;
 
         assert(context);
 
@@ -7657,7 +8495,7 @@ static int context_write_partition_table(Context *context) {
                 }
         }
 
-        r = fdisk_get_partitions(context->fdisk_context, &original_table);
+        r = sym_fdisk_get_partitions(context->fdisk_context, &original_table);
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire partition table: %m");
 
@@ -7665,44 +8503,93 @@ static int context_write_partition_table(Context *context) {
          * gaps between partitions, just to be sure. */
         r = context_wipe_and_discard(context);
         if (r < 0)
-                return r;
+                goto error;
 
         r = context_copy_blocks(context);
         if (r < 0)
-                return r;
+                goto error;
 
         r = context_mkfs(context);
         if (r < 0)
-                return r;
+                goto error;
+
+        /* We are now moving destructively btrfs filesystems into the disk before we have written the
+         * partitions. This is OK because the main use case is that the btrfs filesystems moved are initially
+         * volatile (in ram disk for example) with little data to save. But we do not want to finish the gpt
+         * table in case we lose power and reboot and try to boot that incomplete disk.
+         */
+        r = context_block_device_replace(context);
+        if (r < 0)
+                goto error;
 
         r = context_mangle_partitions(context);
         if (r < 0)
-                return r;
+                goto error;
 
         log_info("Writing new partition table.");
 
         (void) context_notify(context, PROGRESS_WRITING_TABLE, /* object= */ NULL, UINT_MAX);
 
-        r = fdisk_write_disklabel(context->fdisk_context);
+        r = sym_fdisk_write_disklabel(context->fdisk_context);
+        if (r < 0) {
+                r = log_error_errno(r, "Failed to write partition table: %m");
+                goto error;
+        }
+
+        context_btrfs_replace_resize(context);
+
+        r = context_partscan(context);
         if (r < 0)
-                return log_error_errno(r, "Failed to write partition table: %m");
+                return r;
 
-        capable = blockdev_partscan_enabled_fd(fdisk_get_devfd(context->fdisk_context));
-        if (capable == -ENOTBLK)
-                log_debug("Not telling kernel to reread partition table, since we are not operating on a block device.");
-        else if (capable < 0)
-                return log_error_errno(capable, "Failed to check if block device supports partition scanning: %m");
-        else if (capable > 0) {
-                log_info("Informing kernel about changed partitions...");
-                (void) context_notify(context, PROGRESS_REREADING_TABLE, /* object= */ NULL, UINT_MAX);
+        log_info("Partition table written.");
 
-                r = reread_partition_table_fd(fdisk_get_devfd(context->fdisk_context), /* flags= */ 0);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to reread partition table: %m");
-        } else
-                log_notice("Not telling kernel to reread partition table, because selected image does not support kernel partition block devices.");
+        return 0;
 
-        log_info("All done.");
+ error:
+        context_btrfs_replace_back(context);
+
+        if (context->needs_rescan)
+                (void) context_partscan(context);
+
+        return r;
+}
+
+static int context_write_eltorito(Context *context) {
+        int r;
+
+        assert(context);
+
+        if (!arg_eltorito)
+                return 0;
+
+        if (context->dry_run)
+                return 0;
+
+        bool utc = true;
+        usec_t usec = parse_source_date_epoch();
+        if (usec == USEC_INFINITY) {
+                usec = now(CLOCK_REALTIME);
+                utc = false;
+        }
+
+        uint64_t esp_offset;
+        r = context_find_esp_offset(context, &esp_offset);
+        if (r < 0)
+                return r;
+
+        log_info("Writing El Torito boot catalog.");
+
+        r = write_eltorito(
+                        sym_fdisk_get_devfd(context->fdisk_context),
+                        usec,
+                        utc,
+                        esp_offset / ISO9660_BLOCK_SIZE,
+                        arg_eltorito_system,
+                        arg_eltorito_volume,
+                        arg_eltorito_publisher);
+        if (r < 0)
+                return log_error_errno(r, "Failed to write El Torito boot catalog: %m");
 
         return 0;
 }
@@ -7761,7 +8648,7 @@ static int context_factory_reset(Context *context) {
 
                 log_info("Removing partition %" PRIu64 " for factory reset.", p->partno);
 
-                r = fdisk_delete_partition(context->fdisk_context, p->partno);
+                r = sym_fdisk_delete_partition(context->fdisk_context, p->partno);
                 if (r < 0)
                         return log_error_errno(r, "Failed to remove partition %" PRIu64 ": %m", p->partno);
 
@@ -7773,7 +8660,7 @@ static int context_factory_reset(Context *context) {
                 return 0;
         }
 
-        r = fdisk_write_disklabel(context->fdisk_context);
+        r = sym_fdisk_write_disklabel(context->fdisk_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to write disk label: %m");
 
@@ -7833,9 +8720,9 @@ static int resolve_copy_blocks_auto_candidate(
                 return log_error_errno(r, "Failed to open block device " DEVNUM_FORMAT_STR ": %m",
                                        DEVNUM_FORMAT_VAL(whole_devno));
 
-        r = dlopen_libblkid();
+        r = DLOPEN_LIBBLKID(LOG_ERR, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
         if (r < 0)
-                return log_error_errno(r, "Failed to find libblkid: %m");
+                return r;
 
         b = sym_blkid_new_probe();
         if (!b)
@@ -8188,9 +9075,6 @@ static int context_open_copy_block_paths(
 
         assert(context);
 
-        if (!context->partitions)
-                return 0;
-
         LIST_FOREACH(partitions, p, context->partitions) {
                 _cleanup_close_ int source_fd = -EBADF;
                 _cleanup_free_ char *opened = NULL;
@@ -8294,6 +9178,72 @@ static int context_open_copy_block_paths(
                         p->new_uuid = uuid;
                         p->new_uuid_is_set = true;
                 }
+        }
+
+        return 0;
+}
+
+static int context_open_btrfs_filesystems(Context *context) {
+        int r;
+
+        assert(context);
+
+        LIST_FOREACH(partitions, p, context->partitions) {
+                _cleanup_(btrfs_replacement_freep) BtrfsReplacement *replacement = NULL;
+
+                if (p->dropped)
+                        continue;
+
+                if (PARTITION_EXISTS(p))
+                        continue;
+
+                if (!p->block_device_replace)
+                        continue;
+
+                if (partition_defer(context, p))
+                        continue;
+
+                (void) context_notify(context, PROGRESS_OPENING_BLOCK_DEVICE_REPLACE_SOURCES, p->definition_path, UINT_MAX);
+
+                replacement = new(BtrfsReplacement, 1);
+                if (!replacement)
+                        return log_oom();
+
+                *replacement = (BtrfsReplacement) {
+                        .mountpoint_fd = -EBADF,
+                        .source_fd = -EBADF,
+                };
+
+                replacement->mountpoint_fd = xopenat(AT_FDCWD, p->block_device_replace, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+                if (replacement->mountpoint_fd < 0)
+                        return log_error_errno(replacement->mountpoint_fd, "Failed to open mountpoint %s for btrfs filesystem: %m", p->block_device_replace);
+
+                r = fd_is_fs_type(replacement->mountpoint_fd, BTRFS_SUPER_MAGIC);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to check filesystem for mountpoint %s: %m", p->block_device_replace);
+                if (r == 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Mountpoint %s is not a btrfs filesystem", p->block_device_replace);
+
+                r = btrfs_get_block_device_at_full(replacement->mountpoint_fd, "", &replacement->devid, &replacement->source_path, /* ret= */ NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to find device id for btrfs filesystem: %m");
+                if (r == 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Btrfs filesystem has multiple devices.");
+
+                /* We need to keep the source device open otherwise, it might be collected. */
+                replacement->source_fd = open(replacement->source_path, O_RDONLY|O_CLOEXEC);
+                if (replacement->source_fd < 0)
+                        return log_error_errno(errno, "Failed to open source device %s: %m", replacement->source_path);
+
+                r = fd_verify_block(replacement->source_fd);
+                if (r < 0)
+                        return log_error_errno(r, "Device %s is not a block device: %m", replacement->source_path);
+
+                r = blockdev_get_device_size(replacement->source_fd, &replacement->source_size);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get device size %s: %m", replacement->source_path);
+
+                p->btrfs_replaced = TAKE_PTR(replacement);
         }
 
         return 0;
@@ -8665,6 +9615,8 @@ static int context_minimize(Context *context) {
                 if (!p->format)
                         continue;
 
+                bool is_btrfs = streq(p->format, "btrfs");
+
                 if (p->copy_blocks_fd >= 0)
                         continue;
 
@@ -8680,7 +9632,7 @@ static int context_minimize(Context *context) {
 
                 (void) partition_hint(p, context->node, &hint);
 
-                log_info("Pre-populating %s filesystem of partition %s twice to calculate minimal partition size",
+                log_info("Pre-populating %s filesystem of partition %s to calculate minimal partition size",
                          p->format, strna(hint));
 
                 if (!vt) {
@@ -8700,9 +9652,11 @@ static int context_minimize(Context *context) {
                                 attrs & FS_NOCOW_FL ? XO_NOCOW : 0,
                                 0600);
                 if (fd < 0)
-                        return log_error_errno(errno, "Failed to open temporary file %s: %m", temp);
+                        return log_error_errno(fd, "Failed to open temporary file %s: %m", temp);
 
-                if (fstype_is_ro(p->format))
+                if (fstype_is_ro(p->format) || is_btrfs)
+                        /* Read-only filesystems and btrfs (with mkfs.btrfs --shrink) produce a minimal
+                         * filesystem in one pass, so we can use the real UUID directly. */
                         fs_uuid = p->fs_uuid;
                 else {
                         /* This may seem huge but it will be created sparse so it doesn't take up any space
@@ -8724,7 +9678,7 @@ static int context_minimize(Context *context) {
                                 return r;
                 }
 
-                if (!d || fstype_is_ro(p->format) || (streq_ptr(p->format, "btrfs") && p->compression)) {
+                if (!d || fstype_is_ro(p->format)) {
                         if (!mkfs_supports_root_option(p->format))
                                 return log_error_errno(SYNTHETIC_ERRNO(ENODEV),
                                                        "Loop device access is required to populate %s filesystems.",
@@ -8754,8 +9708,9 @@ static int context_minimize(Context *context) {
                         return r;
 
                 /* Read-only filesystems are minimal from the first try because they create and size the
-                 * loopback file for us. */
-                if (fstype_is_ro(p->format)) {
+                 * loopback file for us. Similarly, mkfs.btrfs --shrink populates the filesystem from the
+                 * root directory and then shrinks the backing file to the minimal size. */
+                if (fstype_is_ro(p->format) || is_btrfs) {
                         fd = safe_close(fd);
 
                         fd = open(temp, O_RDONLY|O_CLOEXEC|O_NONBLOCK);
@@ -8790,10 +9745,8 @@ static int context_minimize(Context *context) {
 
                 /* Other filesystems need to be provided with a pre-sized loopback file and will adapt to
                  * fully occupy it. Because we gave the filesystem a 1T sparse file, we need to shrink the
-                 * filesystem down to a reasonable size again to fit it in the disk image. While there are
-                 * some filesystems that support shrinking, it doesn't always work properly (e.g. shrinking
-                 * btrfs gives us a 2.0G filesystem regardless of what we put in it). Instead, let's populate
-                 * the filesystem again, but this time, instead of providing the filesystem with a 1T sparse
+                 * filesystem down to a reasonable size again to fit it in the disk image. Let's populate the
+                 * filesystem again, but this time, instead of providing the filesystem with a 1T sparse
                  * loopback file, let's size the loopback file based on the actual data used by the
                  * filesystem in the sparse file after the first attempt. This should be a good guess of the
                  * minimal amount of space needed in the filesystem to fit all the required data.
@@ -8878,6 +9831,9 @@ static int context_minimize(Context *context) {
                 if (PARTITION_EXISTS(p)) /* Never format existing partitions */
                         continue;
 
+                if (p->copy_blocks_fd >= 0)
+                        continue;
+
                 if (p->minimize == MINIMIZE_OFF)
                         continue;
 
@@ -8910,7 +9866,7 @@ static int context_minimize(Context *context) {
                                 attrs & FS_NOCOW_FL ? XO_NOCOW : 0,
                                 0600);
                 if (fd < 0)
-                        return log_error_errno(errno, "Failed to open temporary file %s: %m", temp);
+                        return log_error_errno(fd, "Failed to open temporary file %s: %m", temp);
 
                 r = partition_format_verity_hash(context, p, temp, dp->copy_blocks_path);
                 if (r < 0)
@@ -9075,339 +10031,157 @@ static int help(void) {
         if (r < 0)
                 return log_oom();
 
-        printf("%1$s [OPTIONS...] [DEVICE]\n"
-               "\n%5$sGrow and add partitions to a partition table, and generate disk images (DDIs).%6$s\n\n"
-               "  -h --help               Show this help\n"
-               "     --version            Show package version\n"
-               "     --no-pager           Do not pipe output into a pager\n"
-               "     --no-legend          Do not show the headers and footers\n"
-               "\n%3$sOperation:%4$s\n"
-               "     --dry-run=BOOL       Whether to run dry-run operation\n"
-               "     --empty=MODE         One of refuse, allow, require, force, create; controls\n"
-               "                          how to handle empty disks lacking partition tables\n"
-               "     --offline=BOOL       Whether to build the image offline\n"
-               "     --discard=BOOL       Whether to discard backing blocks for new partitions\n"
-               "     --sector-size=SIZE   Set the logical sector size for the image\n"
-               "     --grain-size=BYTES   Set the grain size for partition alignment\n"
-               "     --architecture=ARCH  Set the generic architecture for the image\n"
-               "     --size=BYTES         Grow loopback file to specified size\n"
-               "     --seed=UUID          128-bit seed UUID to derive all UUIDs from\n"
-               "     --split=BOOL         Whether to generate split artifacts\n"
-               "\n%3$sOutput:%4$s\n"
-               "     --pretty=BOOL        Whether to show pretty summary before doing changes\n"
-               "     --json=pretty|short|off\n"
-               "                          Generate JSON output\n"
-               "\n%3$sFactory Reset:%4$s\n"
-               "     --factory-reset=BOOL Whether to remove data partitions before recreating\n"
-               "                          them\n"
-               "     --can-factory-reset  Test whether factory reset is defined\n"
-               "\n%3$sConfiguration & Image Control:%4$s\n"
-               "     --root=PATH          Operate relative to root path\n"
-               "     --image=PATH         Operate relative to image file\n"
-               "     --image-policy=POLICY\n"
-               "                          Specify disk image dissection policy\n"
-               "     --definitions=DIR    Find partition definitions in specified directory\n"
-               "     --list-devices       List candidate block devices to operate on\n"
-               "\n%3$sVerity:%4$s\n"
-               "     --private-key=PATH|URI\n"
-               "                          Private key to use when generating verity roothash\n"
-               "                          signatures, or an engine or provider specific\n"
-               "                          designation if --private-key-source= is used\n"
-               "     --private-key-source=file|provider:PROVIDER|engine:ENGINE\n"
-               "                          Specify how to use KEY for --private-key=. Allows\n"
-               "                          an OpenSSL engine/provider to be used when generating\n"
-               "                          verity roothash signatures\n"
-               "     --certificate=PATH|URI\n"
-               "                          PEM certificate to use when generating verity roothash\n"
-               "                          signatures, or a provider specific designation if\n"
-               "                           --certificate-source= is used\n"
-               "     --certificate-source=file|provider:PROVIDER\n"
-               "                          Specify how to interpret the certificate from\n"
-               "                          --certificate=. Allows the certificate to be loaded\n"
-               "                          from an OpenSSL provider\n"
-               "     --join-signature=HASH:SIG\n"
-               "                          Specify root hash and pkcs7 signature of root hash for\n"
-               "                          verity as a tuple of hex encoded hash and a DER\n"
-               "                          encoded PKCS7, either as a path to a file or as an\n"
-               "                          ASCII base64 encoded string prefixed by 'base64:'\n"
-               "\n%3$sEncryption:%4$s\n"
-               "     --key-file=PATH      Key to use when encrypting partitions\n"
-               "     --tpm2-device=PATH   Path to TPM2 device node to use\n"
-               "     --tpm2-device-key=PATH\n"
-               "                          Enroll a TPM2 device using its public key\n"
-               "     --tpm2-seal-key-handle=HANDLE\n"
-               "                          Specify handle of key to use for sealing\n"
-               "     --tpm2-pcrs=PCR1+PCR2+PCR3+…\n"
-               "                          TPM2 PCR indexes to use for TPM2 enrollment\n"
-               "     --tpm2-public-key=PATH\n"
-               "                          Enroll signed TPM2 PCR policy against PEM public key\n"
-               "     --tpm2-public-key-pcrs=PCR1+PCR2+PCR3+…\n"
-               "                          Enroll signed TPM2 PCR policy for specified TPM2 PCRs\n"
-               "     --tpm2-pcrlock=PATH\n"
-               "                          Specify pcrlock policy to lock against\n"
-               "\n%3$sPartition Control:%4$s\n"
-               "     --include-partitions=PARTITION1,PARTITION2,PARTITION3,…\n"
-               "                          Ignore partitions not of the specified types\n"
-               "     --exclude-partitions=PARTITION1,PARTITION2,PARTITION3,…\n"
-               "                          Ignore partitions of the specified types\n"
-               "     --defer-partitions=PARTITION1,PARTITION2,PARTITION3,…\n"
-               "                          Take partitions of the specified types into account\n"
-               "                          but don't populate them yet\n"
-               "     --defer-partitions-empty=yes\n"
-               "                          Defer all partitions marked for formatting as empty\n"
-               "     --defer-partitions-factory-reset=yes\n"
-               "                          Defer all partitions marked for factory reset\n"
-               "\n%3$sCopying:%4$s\n"
-               "  -s --copy-source=PATH   Specify the primary source tree to copy files from\n"
-               "     --copy-from=IMAGE    Copy partitions from the given image(s)\n"
-               "\n%3$sDDI Profile:%4$s\n"
-               "  -S --make-ddi=sysext    Make a system extension DDI\n"
-               "  -C --make-ddi=confext   Make a configuration extension DDI\n"
-               "  -P --make-ddi=portable  Make a portable service DDI\n"
-               "\n%3$sAuxiliary Resource Generation:%4$s\n"
-               "     --append-fstab=MODE  One of no, auto, replace; controls how to join the\n"
-               "                          content of a pre-existing fstab with the generated one\n"
-               "     --generate-fstab=PATH\n"
-               "                          Write fstab configuration to the given path\n"
-               "     --generate-crypttab=PATH\n"
-               "                          Write crypttab configuration to the given path\n"
-               "\nSee the %2$s for details.\n",
+        static const char *const option_groups[] = {
+                "Options",
+                "Operation",
+                "Output",
+                "Factory Reset",
+                "Configuration & Image Control",
+                "Verity",
+                "Encryption",
+                "Partition Control",
+                "Copying",
+                "DDI Profile",
+                "Auxiliary Resource Generation",
+                "El Torito boot catalog",
+        };
+
+        Table *option_tables[ELEMENTSOF(option_groups)] = {};
+        CLEANUP_ELEMENTS(option_tables, table_unref_array_clear);
+
+        for (size_t i = 0; i < ELEMENTSOF(option_groups); i++) {
+                r = option_parser_get_help_table_group(option_groups[i], &option_tables[i]);
+                if (r < 0)
+                        return r;
+        }
+
+        (void) table_sync_column_widths(0,
+                                        option_tables[0], option_tables[1], option_tables[2],
+                                        option_tables[3], option_tables[4], option_tables[5],
+                                        option_tables[6], option_tables[7], option_tables[8],
+                                        option_tables[9], option_tables[10], option_tables[11]);
+
+        printf("%s [OPTIONS...] [DEVICE]\n"
+               "\n%sGrow and add partitions to a partition table, and generate disk images (DDIs).%s\n",
                program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
                ansi_highlight(),
                ansi_normal());
 
+        for (size_t i = 0; i < ELEMENTSOF(option_groups); i++) {
+                printf("\n%s%s:%s\n", ansi_underline(), option_groups[i], ansi_normal());
+
+                r = table_print_or_warn(option_tables[i]);
+                if (r < 0)
+                        return r;
+        }
+
+        printf("\nSee the %s for details.\n", link);
         return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_PAGER,
-                ARG_NO_LEGEND,
-                ARG_DRY_RUN,
-                ARG_EMPTY,
-                ARG_DISCARD,
-                ARG_FACTORY_RESET,
-                ARG_CAN_FACTORY_RESET,
-                ARG_ROOT,
-                ARG_IMAGE,
-                ARG_IMAGE_POLICY,
-                ARG_SEED,
-                ARG_PRETTY,
-                ARG_DEFINITIONS,
-                ARG_SIZE,
-                ARG_JSON,
-                ARG_KEY_FILE,
-                ARG_PRIVATE_KEY,
-                ARG_PRIVATE_KEY_SOURCE,
-                ARG_CERTIFICATE,
-                ARG_CERTIFICATE_SOURCE,
-                ARG_TPM2_DEVICE,
-                ARG_TPM2_DEVICE_KEY,
-                ARG_TPM2_SEAL_KEY_HANDLE,
-                ARG_TPM2_PCRS,
-                ARG_TPM2_PUBLIC_KEY,
-                ARG_TPM2_PUBLIC_KEY_PCRS,
-                ARG_TPM2_PCRLOCK,
-                ARG_SPLIT,
-                ARG_INCLUDE_PARTITIONS,
-                ARG_EXCLUDE_PARTITIONS,
-                ARG_DEFER_PARTITIONS,
-                ARG_DEFER_PARTITIONS_EMPTY,
-                ARG_DEFER_PARTITIONS_FACTORY_RESET,
-                ARG_SECTOR_SIZE,
-                ARG_GRAIN_SIZE,
-                ARG_SKIP_PARTITIONS,
-                ARG_ARCHITECTURE,
-                ARG_OFFLINE,
-                ARG_COPY_FROM,
-                ARG_MAKE_DDI,
-                ARG_APPEND_FSTAB,
-                ARG_GENERATE_FSTAB,
-                ARG_GENERATE_CRYPTTAB,
-                ARG_LIST_DEVICES,
-                ARG_JOIN_SIGNATURE,
-        };
-
-        static const struct option options[] = {
-                { "help",                           no_argument,       NULL, 'h'                                },
-                { "version",                        no_argument,       NULL, ARG_VERSION                        },
-                { "no-pager",                       no_argument,       NULL, ARG_NO_PAGER                       },
-                { "no-legend",                      no_argument,       NULL, ARG_NO_LEGEND                      },
-                { "dry-run",                        required_argument, NULL, ARG_DRY_RUN                        },
-                { "empty",                          required_argument, NULL, ARG_EMPTY                          },
-                { "discard",                        required_argument, NULL, ARG_DISCARD                        },
-                { "factory-reset",                  required_argument, NULL, ARG_FACTORY_RESET                  },
-                { "can-factory-reset",              no_argument,       NULL, ARG_CAN_FACTORY_RESET              },
-                { "root",                           required_argument, NULL, ARG_ROOT                           },
-                { "image",                          required_argument, NULL, ARG_IMAGE                          },
-                { "image-policy",                   required_argument, NULL, ARG_IMAGE_POLICY                   },
-                { "seed",                           required_argument, NULL, ARG_SEED                           },
-                { "pretty",                         required_argument, NULL, ARG_PRETTY                         },
-                { "definitions",                    required_argument, NULL, ARG_DEFINITIONS                    },
-                { "size",                           required_argument, NULL, ARG_SIZE                           },
-                { "json",                           required_argument, NULL, ARG_JSON                           },
-                { "key-file",                       required_argument, NULL, ARG_KEY_FILE                       },
-                { "private-key",                    required_argument, NULL, ARG_PRIVATE_KEY                    },
-                { "private-key-source",             required_argument, NULL, ARG_PRIVATE_KEY_SOURCE             },
-                { "certificate",                    required_argument, NULL, ARG_CERTIFICATE                    },
-                { "certificate-source",             required_argument, NULL, ARG_CERTIFICATE_SOURCE             },
-                { "tpm2-device",                    required_argument, NULL, ARG_TPM2_DEVICE                    },
-                { "tpm2-device-key",                required_argument, NULL, ARG_TPM2_DEVICE_KEY                },
-                { "tpm2-seal-key-handle",           required_argument, NULL, ARG_TPM2_SEAL_KEY_HANDLE           },
-                { "tpm2-pcrs",                      required_argument, NULL, ARG_TPM2_PCRS                      },
-                { "tpm2-public-key",                required_argument, NULL, ARG_TPM2_PUBLIC_KEY                },
-                { "tpm2-public-key-pcrs",           required_argument, NULL, ARG_TPM2_PUBLIC_KEY_PCRS           },
-                { "tpm2-pcrlock",                   required_argument, NULL, ARG_TPM2_PCRLOCK                   },
-                { "split",                          required_argument, NULL, ARG_SPLIT                          },
-                { "include-partitions",             required_argument, NULL, ARG_INCLUDE_PARTITIONS             },
-                { "exclude-partitions",             required_argument, NULL, ARG_EXCLUDE_PARTITIONS             },
-                { "defer-partitions",               required_argument, NULL, ARG_DEFER_PARTITIONS               },
-                { "defer-partitions-empty",         required_argument, NULL, ARG_DEFER_PARTITIONS_EMPTY         },
-                { "defer-partitions-factory-reset", required_argument, NULL, ARG_DEFER_PARTITIONS_FACTORY_RESET },
-                { "sector-size",                    required_argument, NULL, ARG_SECTOR_SIZE                    },
-                { "grain-size",                     required_argument, NULL, ARG_GRAIN_SIZE                     },
-                { "architecture",                   required_argument, NULL, ARG_ARCHITECTURE                   },
-                { "offline",                        required_argument, NULL, ARG_OFFLINE                        },
-                { "copy-from",                      required_argument, NULL, ARG_COPY_FROM                      },
-                { "copy-source",                    required_argument, NULL, 's'                                },
-                { "make-ddi",                       required_argument, NULL, ARG_MAKE_DDI                       },
-                { "append-fstab",                   required_argument, NULL, ARG_APPEND_FSTAB                   },
-                { "generate-fstab",                 required_argument, NULL, ARG_GENERATE_FSTAB                 },
-                { "generate-crypttab",              required_argument, NULL, ARG_GENERATE_CRYPTTAB              },
-                { "list-devices",                   no_argument,       NULL, ARG_LIST_DEVICES                   },
-                { "join-signature",                 required_argument, NULL, ARG_JOIN_SIGNATURE                 },
-                {}
-        };
-
-        bool auto_public_key_pcr_mask = true, auto_pcrlock = true;
-        int c, r;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hs:SCP", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        bool auto_public_key_pcr_mask = true, auto_pcrlock = true;
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
+                OPTION_GROUP("Options"): {}
+
+                OPTION_COMMON_HELP:
                         return help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case ARG_NO_LEGEND:
+                OPTION_COMMON_NO_LEGEND:
                         arg_legend = false;
                         break;
 
-                case ARG_DRY_RUN:
-                        r = parse_boolean_argument("--dry-run=", optarg, &arg_dry_run);
+                OPTION_GROUP("Operation"): {}
+
+                OPTION_LONG("dry-run", "BOOL",
+                            "Whether to run dry-run operation"):
+                        r = parse_boolean_argument("--dry-run=", opts.arg, &arg_dry_run);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_EMPTY:
-                        if (isempty(optarg)) {
+                OPTION_LONG("empty", "MODE",
+                            "How to handle empty disks lacking partition tables (refuse, allow, require, force, create)"):
+                        if (isempty(opts.arg)) {
                                 arg_empty = EMPTY_UNSET;
                                 break;
                         }
 
-                        arg_empty = empty_mode_from_string(optarg);
+                        arg_empty = empty_mode_from_string(opts.arg);
                         if (arg_empty < 0)
-                                return log_error_errno(arg_empty, "Failed to parse --empty= parameter: %s", optarg);
+                                return log_error_errno(arg_empty, "Failed to parse --empty= parameter: %s", opts.arg);
 
                         break;
 
-                case ARG_DISCARD:
-                        r = parse_boolean_argument("--discard=", optarg, &arg_discard);
+                OPTION_LONG("offline", "BOOL",
+                            "Whether to build the image offline"):
+                        r = parse_tristate_argument_with_auto("--offline=", opts.arg, &arg_offline);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_FACTORY_RESET:
-                        r = parse_boolean_argument("--factory-reset=", optarg, NULL);
-                        if (r < 0)
-                                return r;
-                        arg_factory_reset = r;
-                        break;
-
-                case ARG_CAN_FACTORY_RESET:
-                        arg_can_factory_reset = true;
-                        break;
-
-                case ARG_ROOT:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_root);
+                OPTION_LONG("discard", "BOOL",
+                            "Whether to discard backing blocks for new partitions"):
+                        r = parse_boolean_argument("--discard=", opts.arg, &arg_discard);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_IMAGE:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_image);
+                OPTION_LONG("sector-size", "SIZE",
+                            "Set the logical sector size for the image"):
+                        r = parse_sector_size(opts.arg, &arg_sector_size);
                         if (r < 0)
                                 return r;
 
-                        arg_relax_copy_block_security = false;
-
                         break;
 
-                case ARG_IMAGE_POLICY:
-                        r = parse_image_policy_argument(optarg, &arg_image_policy);
+                OPTION_LONG("grain-size", "BYTES",
+                            "Set the grain size for partition alignment"):
+                        r = parse_size(opts.arg, 1024, &arg_grain_size);
                         if (r < 0)
-                                return r;
-                        break;
-
-                case ARG_SEED:
-                        if (isempty(optarg)) {
-                                arg_seed = SD_ID128_NULL;
-                                arg_randomize = false;
-                        } else if (streq(optarg, "random"))
-                                arg_randomize = true;
-                        else {
-                                r = sd_id128_from_string(optarg, &arg_seed);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse seed: %s", optarg);
-
-                                arg_randomize = false;
-                        }
+                                return log_error_errno(r, "Failed to parse --grain-size= parameter: %s", opts.arg);
+                        if (arg_grain_size < 512 || !ISPOWEROF2(arg_grain_size))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Grain size must be a power of 2 >= 512.");
 
                         break;
 
-                case ARG_PRETTY:
-                        r = parse_boolean_argument("--pretty=", optarg, NULL);
+                OPTION_LONG("architecture", "ARCH",
+                            "Set the generic architecture for the image"):
+                        r = architecture_from_string(opts.arg);
                         if (r < 0)
-                                return r;
-                        arg_pretty = r;
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid architecture '%s'.", opts.arg);
+
+                        arg_architecture = r;
                         break;
 
-                case ARG_DEFINITIONS: {
-                        _cleanup_free_ char *path = NULL;
-                        r = parse_path_argument(optarg, false, &path);
-                        if (r < 0)
-                                return r;
-                        if (strv_consume(&arg_definitions, TAKE_PTR(path)) < 0)
-                                return log_oom();
-                        break;
-                }
-
-                case ARG_SIZE: {
+                OPTION_LONG("size", "BYTES",
+                            "Grow loopback file to specified size"): {
                         uint64_t parsed, rounded;
 
-                        if (streq(optarg, "auto")) {
+                        if (streq(opts.arg, "auto")) {
                                 arg_size = UINT64_MAX;
                                 arg_size_auto = true;
                                 break;
                         }
 
-                        r = parse_size(optarg, 1024, &parsed);
+                        r = parse_size(opts.arg, 1024, &parsed);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --size= parameter: %s", optarg);
+                                return log_error_errno(r, "Failed to parse --size= parameter: %s", opts.arg);
 
                         rounded = round_up_size(parsed, 4096);
                         if (rounded == 0)
@@ -9424,59 +10198,174 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
+                OPTION_LONG("seed", "UUID",
+                            "128-bit seed UUID to derive all UUIDs from"):
+                        if (isempty(opts.arg)) {
+                                arg_seed = SD_ID128_NULL;
+                                arg_randomize = false;
+                        } else if (streq(opts.arg, "random"))
+                                arg_randomize = true;
+                        else {
+                                r = sd_id128_from_string(opts.arg, &arg_seed);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to parse seed: %s", opts.arg);
+
+                                arg_randomize = false;
+                        }
+
+                        break;
+
+                OPTION_LONG("split", "BOOL",
+                            "Whether to generate split artifacts"):
+                        r = parse_boolean_argument("--split=", opts.arg, NULL);
+                        if (r < 0)
+                                return r;
+
+                        arg_split = r;
+                        break;
+
+                OPTION_GROUP("Output"): {}
+
+                OPTION_LONG("pretty", "BOOL",
+                            "Whether to show pretty summary before doing changes"):
+                        r = parse_boolean_argument("--pretty=", opts.arg, NULL);
+                        if (r < 0)
+                                return r;
+                        arg_pretty = r;
+                        break;
+
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
                         if (r <= 0)
                                 return r;
 
                         break;
 
-                case ARG_KEY_FILE: {
-                        r = parse_key_file(optarg, &arg_key);
+                OPTION_GROUP("Factory Reset"): {}
+
+                OPTION_LONG("factory-reset", "BOOL",
+                            "Whether to remove data partitions before recreating them"):
+                        r = parse_boolean_argument("--factory-reset=", opts.arg, NULL);
+                        if (r < 0)
+                                return r;
+                        arg_factory_reset = r;
+                        break;
+
+                OPTION_LONG("can-factory-reset", NULL,
+                            "Test whether factory reset is defined"):
+                        arg_can_factory_reset = true;
+                        break;
+
+                OPTION_GROUP("Configuration & Image Control"): {}
+
+                OPTION_LONG("root", "PATH",
+                            "Operate relative to root path"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_root);
                         if (r < 0)
                                 return r;
                         break;
-                }
 
-                case ARG_PRIVATE_KEY: {
-                        r = free_and_strdup_warn(&arg_private_key, optarg);
+                OPTION_LONG("image", "PATH",
+                            "Operate relative to image file"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_image);
+                        if (r < 0)
+                                return r;
+
+                        arg_relax_copy_block_security = false;
+
+                        break;
+
+                OPTION_LONG("image-policy", "POLICY",
+                            "Specify disk image dissection policy"):
+                        r = parse_image_policy_argument(opts.arg, &arg_image_policy);
                         if (r < 0)
                                 return r;
                         break;
+
+                OPTION_LONG("definitions", "DIR",
+                            "Find partition definitions in specified directory"): {
+                        _cleanup_free_ char *path = NULL;
+                        r = parse_path_argument(opts.arg, false, &path);
+                        if (r < 0)
+                                return r;
+                        if (strv_consume(&arg_definitions, TAKE_PTR(path)) < 0)
+                                return log_oom();
+                        break;
                 }
 
-                case ARG_PRIVATE_KEY_SOURCE:
+                OPTION_LONG("list-devices", NULL,
+                            "List candidate block devices to operate on"):
+                        r = blockdev_list(
+                                        BLOCKDEV_LIST_SHOW_SYMLINKS|
+                                        BLOCKDEV_LIST_REQUIRE_PARTITION_SCANNING|
+                                        BLOCKDEV_LIST_IGNORE_ZRAM|
+                                        BLOCKDEV_LIST_IGNORE_READ_ONLY,
+                                        /* ret_devices= */ NULL,
+                                        /* ret_n_devices= */ NULL);
+                        if (r < 0)
+                                return r;
+
+                        return 0;
+
+                OPTION_GROUP("Verity"): {}
+
+                OPTION_COMMON_PRIVATE_KEY("Private key to use when generating verity roothash signatures"):
+                        r = free_and_strdup_warn(&arg_private_key, opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_COMMON_PRIVATE_KEY_SOURCE:
                         r = parse_openssl_key_source_argument(
-                                        optarg,
+                                        opts.arg,
                                         &arg_private_key_source,
                                         &arg_private_key_source_type);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_CERTIFICATE:
-                        r = free_and_strdup_warn(&arg_certificate, optarg);
+                OPTION_COMMON_CERTIFICATE("PEM certificate to use when generating verity roothash signatures"):
+                        r = free_and_strdup_warn(&arg_certificate, opts.arg);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_CERTIFICATE_SOURCE:
+                OPTION_COMMON_CERTIFICATE_SOURCE:
                         r = parse_openssl_certificate_source_argument(
-                                        optarg,
+                                        opts.arg,
                                         &arg_certificate_source,
                                         &arg_certificate_source_type);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_TPM2_DEVICE: {
+                OPTION_LONG("join-signature", "HASH:SIG",
+                            "Specify root hash and pkcs7 signature of root hash for verity as a tuple of "
+                            "hex-encoded hash and a DER-encoded PKCS7, either as a path to a file or as an "
+                            "ASCII base64-encoded string prefixed by 'base64:'"):
+                        r = parse_join_signature(opts.arg, &arg_verity_settings);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_GROUP("Encryption"): {}
+
+                OPTION_LONG("key-file", "PATH",
+                            "Key to use when encrypting partitions"):
+                        r = parse_key_file(opts.arg, &arg_key);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("tpm2-device", "PATH",
+                            "Path to TPM2 device node to use"): {
                         _cleanup_free_ char *device = NULL;
 
-                        if (streq(optarg, "list"))
+                        if (streq(opts.arg, "list"))
                                 return tpm2_list_devices(/* legend= */ true, /* quiet= */ false);
 
-                        if (!streq(optarg, "auto")) {
-                                device = strdup(optarg);
+                        if (!streq(opts.arg, "auto")) {
+                                device = strdup(opts.arg);
                                 if (!device)
                                         return log_oom();
                         }
@@ -9486,64 +10375,65 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case ARG_TPM2_DEVICE_KEY:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_tpm2_device_key);
+                OPTION_LONG("tpm2-device-key", "PATH",
+                            "Enroll a TPM2 device using its public key"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_tpm2_device_key);
                         if (r < 0)
                                 return r;
 
                         break;
 
-                case ARG_TPM2_SEAL_KEY_HANDLE:
-                        r = safe_atou32_full(optarg, 16, &arg_tpm2_seal_key_handle);
+                OPTION_LONG("tpm2-seal-key-handle", "HANDLE",
+                            "Specify handle of key to use for sealing"):
+                        r = safe_atou32_full(opts.arg, 16, &arg_tpm2_seal_key_handle);
                         if (r < 0)
-                                return log_error_errno(r, "Could not parse TPM2 seal key handle index '%s': %m", optarg);
+                                return log_error_errno(r, "Could not parse TPM2 seal key handle index '%s': %m", opts.arg);
 
                         break;
 
-                case ARG_TPM2_PCRS:
-                        r = tpm2_parse_pcr_argument_append(optarg, &arg_tpm2_hash_pcr_values, &arg_tpm2_n_hash_pcr_values);
-                        if (r < 0)
-                                return r;
-
-                        break;
-
-                case ARG_TPM2_PUBLIC_KEY:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_tpm2_public_key);
+                OPTION_LONG("tpm2-pcrs", "PCR1+PCR2+…",
+                            "TPM2 PCR indexes to use for TPM2 enrollment"):
+                        r = tpm2_parse_pcr_argument_append(opts.arg, &arg_tpm2_hash_pcr_values, &arg_tpm2_n_hash_pcr_values);
                         if (r < 0)
                                 return r;
 
                         break;
 
-                case ARG_TPM2_PUBLIC_KEY_PCRS:
+                OPTION_LONG("tpm2-public-key", "PATH",
+                            "Enroll signed TPM2 PCR policy against PEM public key"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_tpm2_public_key);
+                        if (r < 0)
+                                return r;
+
+                        break;
+
+                OPTION_LONG("tpm2-public-key-pcrs", "PCR1+PCR2+…",
+                            "Enroll signed TPM2 PCR policy for specified TPM2 PCRs"):
                         auto_public_key_pcr_mask = false;
-                        r = tpm2_parse_pcr_argument_to_mask(optarg, &arg_tpm2_public_key_pcr_mask);
+                        r = tpm2_parse_pcr_argument_to_mask(opts.arg, &arg_tpm2_public_key_pcr_mask);
                         if (r < 0)
                                 return r;
 
                         break;
 
-                case ARG_TPM2_PCRLOCK:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_tpm2_pcrlock);
+                OPTION_LONG("tpm2-pcrlock", "PATH",
+                            "Specify pcrlock policy to lock against"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_tpm2_pcrlock);
                         if (r < 0)
                                 return r;
 
                         auto_pcrlock = false;
                         break;
 
-                case ARG_SPLIT:
-                        r = parse_boolean_argument("--split=", optarg, NULL);
-                        if (r < 0)
-                                return r;
+                OPTION_GROUP("Partition Control"): {}
 
-                        arg_split = r;
-                        break;
-
-                case ARG_INCLUDE_PARTITIONS:
+                OPTION_LONG("include-partitions", "PART1,PART2…",
+                            "Ignore partitions not of the specified types"):
                         if (arg_filter_partitions_type == FILTER_PARTITIONS_EXCLUDE)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Combination of --include-partitions= and --exclude-partitions= is invalid.");
 
-                        r = parse_partition_types(optarg, &arg_filter_partitions, &arg_n_filter_partitions);
+                        r = parse_partition_types(opts.arg, &arg_filter_partitions, &arg_n_filter_partitions);
                         if (r < 0)
                                 return r;
 
@@ -9551,12 +10441,13 @@ static int parse_argv(int argc, char *argv[]) {
 
                         break;
 
-                case ARG_EXCLUDE_PARTITIONS:
+                OPTION_LONG("exclude-partitions", "PART1,PART2…",
+                            "Ignore partitions of the specified types"):
                         if (arg_filter_partitions_type == FILTER_PARTITIONS_INCLUDE)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Combination of --include-partitions= and --exclude-partitions= is invalid.");
 
-                        r = parse_partition_types(optarg, &arg_filter_partitions, &arg_n_filter_partitions);
+                        r = parse_partition_types(opts.arg, &arg_filter_partitions, &arg_n_filter_partitions);
                         if (r < 0)
                                 return r;
 
@@ -9564,68 +10455,44 @@ static int parse_argv(int argc, char *argv[]) {
 
                         break;
 
-                case ARG_DEFER_PARTITIONS:
-                        r = parse_partition_types(optarg, &arg_defer_partitions, &arg_n_defer_partitions);
+                OPTION_LONG("defer-partitions", "PART1,PART2…",
+                            "Take partitions of the specified types into account but don't populate them yet"):
+                        r = parse_partition_types(opts.arg, &arg_defer_partitions, &arg_n_defer_partitions);
                         if (r < 0)
                                 return r;
 
                         break;
 
-                case ARG_DEFER_PARTITIONS_EMPTY:
-                        r = parse_boolean_argument("--defer-partitions-empty=", optarg, &arg_defer_partitions_empty);
+                OPTION_LONG("defer-partitions-empty", "BOOL",
+                            "Defer all partitions marked for formatting as empty"):
+                        r = parse_boolean_argument("--defer-partitions-empty=", opts.arg, &arg_defer_partitions_empty);
                         if (r < 0)
                                 return r;
 
                         break;
 
-                case ARG_DEFER_PARTITIONS_FACTORY_RESET:
-                        r = parse_boolean_argument("--defer-partitions-factory-reset=", optarg, &arg_defer_partitions_factory_reset);
+                OPTION_LONG("defer-partitions-factory-reset", "BOOL",
+                            "Defer all partitions marked for factory reset"):
+                        r = parse_boolean_argument("--defer-partitions-factory-reset=", opts.arg, &arg_defer_partitions_factory_reset);
                         if (r < 0)
                                 return r;
 
                         break;
 
-                case ARG_SECTOR_SIZE:
-                        r = parse_sector_size(optarg, &arg_sector_size);
+                OPTION_GROUP("Copying"): {}
+
+                OPTION('s', "copy-source", "PATH",
+                       "Specify the primary source tree to copy files from"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_copy_source);
                         if (r < 0)
                                 return r;
-
                         break;
 
-                case ARG_GRAIN_SIZE:
-                        r = parse_size(optarg, 1024, &arg_grain_size);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse --grain-size= parameter: %s", optarg);
-                        if (arg_grain_size < 512 || !ISPOWEROF2(arg_grain_size))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Grain size must be a power of 2 >= 512.");
-
-                        break;
-
-                case ARG_ARCHITECTURE:
-                        r = architecture_from_string(optarg);
-                        if (r < 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid architecture '%s'.", optarg);
-
-                        arg_architecture = r;
-                        break;
-
-                case ARG_OFFLINE:
-                        if (streq(optarg, "auto"))
-                                arg_offline = -1;
-                        else {
-                                r = parse_boolean_argument("--offline=", optarg, NULL);
-                                if (r < 0)
-                                        return r;
-
-                                arg_offline = r;
-                        }
-
-                        break;
-
-                case ARG_COPY_FROM: {
+                OPTION_LONG("copy-from", "IMAGE",
+                            "Copy partitions from the given image"): {
                         _cleanup_free_ char *p = NULL;
 
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &p);
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &p);
                         if (r < 0)
                                 return r;
 
@@ -9635,83 +10502,110 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case 's':
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_copy_source);
+                OPTION_GROUP("DDI Profile"): {}
+
+                OPTION_LONG("make-ddi", "TYPE",
+                            "Create a DDI of the given type"):
+                        if (!filename_is_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid DDI type: %s", opts.arg);
+
+                        r = free_and_strdup_warn(&arg_make_ddi, opts.arg);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_MAKE_DDI:
-                        if (!filename_is_valid(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid DDI type: %s", optarg);
-
-                        r = free_and_strdup_warn(&arg_make_ddi, optarg);
-                        if (r < 0)
-                                return r;
-                        break;
-
-                case 'S':
+                OPTION_SHORT('S', NULL, "Same as --make-ddi=sysext, make a system extension"):
                         r = free_and_strdup_warn(&arg_make_ddi, "sysext");
                         if (r < 0)
                                 return r;
                         break;
 
-                case 'C':
+                OPTION_SHORT('C', NULL, "Same as --make-ddi=confext, make a configuration extension"):
                         r = free_and_strdup_warn(&arg_make_ddi, "confext");
                         if (r < 0)
                                 return r;
                         break;
 
-                case 'P':
+                OPTION_SHORT('P', NULL, "Same as --make-ddi=portable, make a portable service"):
                         r = free_and_strdup_warn(&arg_make_ddi, "portable");
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_APPEND_FSTAB:
-                        if (isempty(optarg)) {
+                OPTION_GROUP("Auxiliary Resource Generation"): {}
+
+                OPTION_LONG("append-fstab", "MODE",
+                            "How to join the content of a pre-existing fstab with the generated one "
+                            "(no, auto, replace)"):
+                        if (isempty(opts.arg)) {
                                 arg_append_fstab = APPEND_AUTO;
                                 break;
                         }
 
-                        arg_append_fstab = append_mode_from_string(optarg);
+                        arg_append_fstab = append_mode_from_string(opts.arg);
                         if (arg_append_fstab < 0)
-                                return log_error_errno(arg_append_fstab, "Failed to parse --append-fstab= parameter: %s", optarg);
+                                return log_error_errno(arg_append_fstab, "Failed to parse --append-fstab= parameter: %s", opts.arg);
                         break;
 
-                case ARG_GENERATE_FSTAB:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_generate_fstab);
+                OPTION_LONG("generate-fstab", "PATH",
+                            "Write fstab configuration to the given path"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_generate_fstab);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_GENERATE_CRYPTTAB:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_generate_crypttab);
+                OPTION_LONG("generate-crypttab", "PATH",
+                            "Write crypttab configuration to the given path"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_generate_crypttab);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_LIST_DEVICES:
-                        r = blockdev_list(BLOCKDEV_LIST_REQUIRE_PARTITION_SCANNING|BLOCKDEV_LIST_SHOW_SYMLINKS|BLOCKDEV_LIST_IGNORE_ZRAM, /* ret_devices= */ NULL, /* ret_n_devices= */ NULL);
+                OPTION_GROUP("El Torito boot catalog"): {}
+
+                OPTION_LONG("el-torito", "BOOL",
+                            "Whether to add a boot catalog to boot the ESP"):
+                        r = parse_boolean_argument("--el-torito=", opts.arg, &arg_eltorito);
                         if (r < 0)
                                 return r;
 
-                        return 0;
-
-                case ARG_JOIN_SIGNATURE:
-                        r = parse_join_signature(optarg, &arg_verity_settings);
-                        if (r < 0)
-                                return r;
                         break;
 
-                case '?':
-                        return -EINVAL;
+                OPTION_LONG("el-torito-system", "STRING",
+                            "Set the system identifier in the ISO9660 descriptor"):
+                        if (!iso9660_system_name_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid value '%s' for --el-torito-system=.", opts.arg);
 
-                default:
-                        assert_not_reached();
+                        r = free_and_strdup_warn(&arg_eltorito_system, opts.arg);
+                        if (r < 0)
+                                return r;
+
+                        break;
+
+                OPTION_LONG("el-torito-volume", "STRING",
+                            "Set the volume identifier in the ISO9660 descriptor"):
+                        if (!iso9660_volume_name_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid value '%s' for --el-torito-volume=.", opts.arg);
+
+                        r = free_and_strdup_warn(&arg_eltorito_volume, opts.arg);
+                        if (r < 0)
+                                return r;
+
+                        break;
+
+                OPTION_LONG("el-torito-publisher", "STRING",
+                            "Set the publisher identifier in the ISO9660 descriptor"):
+                        if (!iso9660_publisher_name_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid value '%s' for --el-torito-publisher=.", opts.arg);
+
+                        r = free_and_strdup_warn(&arg_eltorito_publisher, opts.arg);
+                        if (r < 0)
+                                return r;
+
+                        break;
                 }
 
-        if (argc - optind > 1)
+        if (option_parser_get_n_args(&opts) > 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Expected at most one argument, the path to the block device or image file.");
 
@@ -9791,11 +10685,12 @@ static int parse_argv(int argc, char *argv[]) {
                 arg_relax_copy_block_security = true;
         }
 
-        if (argc > optind) {
-                if (empty_or_dash(argv[optind]))
+        char **args = option_parser_get_args(&opts);
+        if (!strv_isempty(args)) {
+                if (empty_or_dash(args[0]))
                         arg_node_none = true;
                 else {
-                        arg_node = strdup(argv[optind]);
+                        arg_node = strdup(args[0]);
                         if (!arg_node)
                                 return log_oom();
                         arg_node_none = false;
@@ -9936,12 +10831,20 @@ static int acquire_root_devno(
         assert(ret);
         assert(ret_fd);
 
-        fd = chase_and_open(p, root, CHASE_PREFIX_ROOT, mode, &found_path);
+        fd = chase_and_open(p, root, CHASE_PREFIX_ROOT, (mode & ~O_ACCMODE_STRICT) | O_RDONLY, &found_path);
         if (fd < 0)
                 return fd;
 
         if (fstat(fd, &st) < 0)
                 return -errno;
+
+        if ((S_ISREG(st.st_mode) || S_ISBLK(st.st_mode)) && (mode & O_ACCMODE_STRICT) != O_RDONLY) {
+                _cleanup_close_ int new_fd = fd_reopen(fd, mode);
+                if (new_fd < 0)
+                        return new_fd;
+
+                close_and_replace(fd, new_fd);
+        }
 
         if (S_ISREG(st.st_mode)) {
                 *ret = TAKE_PTR(found_path);
@@ -10002,7 +10905,7 @@ static int acquire_root_devno(
 
 static int find_root(Context *context) {
         _cleanup_free_ char *device = NULL;
-        int r;
+        int r, open_flags = O_CLOEXEC|context_open_mode(context);
 
         assert(context);
 
@@ -10018,9 +10921,9 @@ static int find_root(Context *context) {
                         if (!s)
                                 return log_oom();
 
-                        fd = xopenat_full(AT_FDCWD, arg_node, O_RDONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW, XO_NOCOW, 0666);
+                        fd = xopenat_full(AT_FDCWD, arg_node, open_flags|O_CREAT|O_EXCL|O_NOFOLLOW, XO_NOCOW, 0666);
                         if (fd < 0)
-                                return log_error_errno(errno, "Failed to create '%s': %m", arg_node);
+                                return log_error_errno(fd, "Failed to create '%s': %m", arg_node);
 
                         context->node = TAKE_PTR(s);
                         context->node_is_our_file = true;
@@ -10030,7 +10933,7 @@ static int find_root(Context *context) {
 
                 /* Note that we don't specify a root argument here: if the user explicitly configured a node
                  * we'll take it relative to the host, not the image */
-                r = acquire_root_devno(arg_node, NULL, O_RDONLY|O_CLOEXEC, &context->node, &context->backing_fd);
+                r = acquire_root_devno(arg_node, NULL, open_flags, &context->node, &context->backing_fd);
                 if (r == -EUCLEAN)
                         return btrfs_log_dev_root(LOG_ERR, r, arg_node);
                 if (r < 0)
@@ -10052,7 +10955,7 @@ static int find_root(Context *context) {
 
                 FOREACH_STRING(p, "/", "/usr") {
 
-                        r = acquire_root_devno(p, arg_root, O_RDONLY|O_DIRECTORY|O_CLOEXEC, &context->node,
+                        r = acquire_root_devno(p, arg_root, open_flags|O_DIRECTORY, &context->node,
                                                &context->backing_fd);
                         if (r < 0) {
                                 if (r == -EUCLEAN)
@@ -10065,7 +10968,7 @@ static int find_root(Context *context) {
         } else if (r < 0)
                 return log_error_errno(r, "Failed to read symlink /run/systemd/volatile-root: %m");
         else {
-                r = acquire_root_devno(device, NULL, O_RDONLY|O_CLOEXEC, &context->node, &context->backing_fd);
+                r = acquire_root_devno(device, /* root= */ NULL, open_flags, &context->node, &context->backing_fd);
                 if (r == -EUCLEAN)
                         return btrfs_log_dev_root(LOG_ERR, r, device);
                 if (r < 0)
@@ -10089,7 +10992,7 @@ static int resize_pt(int fd, uint64_t sector_size) {
         if (r < 0)
                 return log_error_errno(r, "Failed to open device '%s': %m", FORMAT_PROC_FD_PATH(fd));
 
-        r = fdisk_has_label(c);
+        r = sym_fdisk_has_label(c);
         if (r < 0)
                 return log_error_errno(r, "Failed to determine whether disk '%s' has a disk label: %m", FORMAT_PROC_FD_PATH(fd));
         if (r == 0) {
@@ -10097,7 +11000,7 @@ static int resize_pt(int fd, uint64_t sector_size) {
                 return 0;
         }
 
-        r = fdisk_write_disklabel(c);
+        r = sym_fdisk_write_disklabel(c);
         if (r < 0)
                 return log_error_errno(r, "Failed to write resized partition table: %m");
 
@@ -10386,6 +11289,7 @@ static int vl_method_list_candidate_devices(
                         BLOCKDEV_LIST_REQUIRE_PARTITION_SCANNING|
                         BLOCKDEV_LIST_IGNORE_ZRAM|
                         BLOCKDEV_LIST_METADATA|
+                        BLOCKDEV_LIST_IGNORE_READ_ONLY|
                         (p.ignore_empty ? BLOCKDEV_LIST_IGNORE_EMPTY : 0)|
                         (p.ignore_root ? BLOCKDEV_LIST_IGNORE_ROOT : 0),
                         &l,
@@ -10393,7 +11297,7 @@ static int vl_method_list_candidate_devices(
         if (r < 0)
                 return r;
 
-        r = varlink_set_sentinel(link, "io.systemd.Repart.NoCandidateDevices");
+        r = sd_varlink_set_sentinel(link, "io.systemd.Repart.NoCandidateDevices");
         if (r < 0)
                 return r;
 
@@ -10439,13 +11343,13 @@ static int vl_method_run(
                 void *userdata) {
 
         static const sd_json_dispatch_field dispatch_table[] = {
-                { "node",                        SD_JSON_VARIANT_STRING,  sd_json_dispatch_string,  offsetof(RunParameters, node),                           SD_JSON_NULLABLE                 },
-                { "empty",                       SD_JSON_VARIANT_STRING,  json_dispatch_empty_mode, offsetof(RunParameters, empty),                          SD_JSON_MANDATORY                },
-                { "seed",                        SD_JSON_VARIANT_STRING,  sd_json_dispatch_id128,   offsetof(RunParameters, seed),                           SD_JSON_NULLABLE                 },
-                { "dryRun",                      SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(RunParameters, dry_run),                        SD_JSON_MANDATORY                },
-                { "definitions",                 SD_JSON_VARIANT_ARRAY,   json_dispatch_strv_path,  offsetof(RunParameters, definitions),                    SD_JSON_MANDATORY|SD_JSON_STRICT },
-                { "deferPartitionsEmpty",        SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(RunParameters, defer_partitions_empty),         SD_JSON_NULLABLE                 },
-                { "deferPartitionsFactoryReset", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(RunParameters, defer_partitions_factory_reset), SD_JSON_NULLABLE                 },
+                { "node",                        SD_JSON_VARIANT_STRING,  sd_json_dispatch_string,  offsetof(RunParameters, node),                           SD_JSON_NULLABLE  },
+                { "empty",                       SD_JSON_VARIANT_STRING,  json_dispatch_empty_mode, offsetof(RunParameters, empty),                          SD_JSON_MANDATORY },
+                { "seed",                        SD_JSON_VARIANT_STRING,  sd_json_dispatch_id128,   offsetof(RunParameters, seed),                           SD_JSON_NULLABLE  },
+                { "dryRun",                      SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(RunParameters, dry_run),                        SD_JSON_MANDATORY },
+                { "definitions",                 SD_JSON_VARIANT_ARRAY,   json_dispatch_strv_path,  offsetof(RunParameters, definitions),                    SD_JSON_STRICT    },
+                { "deferPartitionsEmpty",        SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(RunParameters, defer_partitions_empty),         SD_JSON_NULLABLE  },
+                { "deferPartitionsFactoryReset", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(RunParameters, defer_partitions_factory_reset), SD_JSON_NULLABLE  },
                 {}
         };
 
@@ -10489,7 +11393,9 @@ static int vl_method_run(
                 return r;
 
         if (p.node) {
-                context->node = TAKE_PTR(p.node);
+                r = acquire_root_devno(p.node, NULL, O_CLOEXEC|context_open_mode(context), &context->node, &context->backing_fd);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to open file or determine backing device of %s: %m", p.node);
 
                 r = context_load_partition_table(context);
                 if (r == -EHWPOISON)
@@ -10501,6 +11407,10 @@ static int vl_method_run(
         context->from_scratch = r > 0; /* Starting from scratch */
 
         r = context_open_copy_block_paths(context, (dev_t) -1);
+        if (r < 0)
+                return r;
+
+        r = context_open_btrfs_filesystems(context);
         if (r < 0)
                 return r;
 
@@ -10528,6 +11438,10 @@ static int vl_method_run(
                                 link,
                                 SD_JSON_BUILD_PAIR_UNSIGNED("minimalSizeBytes", minimal_size));
         }
+
+        r = context_verify_eltorito_overlap(context);
+        if (r < 0)
+                return r;
 
         r = context_ponder(context);
         if (r == -ENOSPC) {
@@ -10577,6 +11491,10 @@ static int vl_method_run(
         if (r < 0)
                 return r;
 
+        r = context_write_eltorito(context);
+        if (r < 0)
+                return r;
+
         context_disarm_auto_removal(context);
 
         return sd_varlink_reply(link, NULL);
@@ -10588,10 +11506,9 @@ static int vl_server(void) {
 
         /* Invocation as Varlink service */
 
-        r = varlink_server_new(
-                        &varlink_server,
-                        SD_VARLINK_SERVER_ROOT_ONLY,
-                        /* userdata= */ NULL);
+        r = varlink_server_new(&varlink_server,
+                               SD_VARLINK_SERVER_ROOT_ONLY | SD_VARLINK_SERVER_MYSELF_ONLY,
+                               /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate Varlink server: %m");
 
@@ -10626,9 +11543,9 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-#if HAVE_LIBCRYPTSETUP
-        cryptsetup_enable_logging(NULL);
-#endif
+        r = DLOPEN_FDISK(LOG_ERR, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
+        if (r < 0)
+                return r;
 
         if (arg_varlink)
                 return vl_server();
@@ -10794,6 +11711,10 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
+        r = context_open_btrfs_filesystems(context);
+        if (r < 0)
+                return r;
+
         /* Make sure each partition has a unique UUID and unique label */
         r = context_acquire_partition_uuids_and_labels(context);
         if (r < 0)
@@ -10843,6 +11764,10 @@ static int run(int argc, char *argv[]) {
                         return r;
         }
 
+        r = context_verify_eltorito_overlap(context);
+        if (r < 0)
+                return r;
+
         r = context_ponder(context);
         if (r == -ENOSPC) {
                 /* When we hit space issues, tell the user the minimal size. */
@@ -10855,6 +11780,10 @@ static int run(int argc, char *argv[]) {
         (void) context_dump(context, /* late= */ false);
 
         r = context_write_partition_table(context);
+        if (r < 0)
+                return r;
+
+        r = context_write_eltorito(context);
         if (r < 0)
                 return r;
 

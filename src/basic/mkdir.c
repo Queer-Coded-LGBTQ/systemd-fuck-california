@@ -3,7 +3,7 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "btrfs.h"
+#include "btrfs-util.h"
 #include "chase.h"
 #include "errno-util.h"
 #include "fd-util.h"
@@ -46,7 +46,7 @@ int mkdirat_safe_internal(
         if ((flags & MKDIR_FOLLOW_SYMLINK) && S_ISLNK(st.st_mode)) {
                 _cleanup_free_ char *p = NULL;
 
-                r = chaseat(dir_fd, path, CHASE_NONEXISTENT, &p, NULL);
+                r = chaseat(XAT_FDROOT, dir_fd, path, CHASE_NONEXISTENT, &p, NULL);
                 if (r < 0)
                         return r;
                 if (r == 0)
