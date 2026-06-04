@@ -3,8 +3,6 @@
 #include <grp.h>
 #include <linux/fscrypt.h>
 #include <linux/magic.h>
-#include <math.h>
-#include <openssl/pem.h>
 #include <pwd.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
@@ -25,6 +23,7 @@
 #include "clean-ipc.h"
 #include "common-signal.h"
 #include "conf-files.h"
+#include "crypto-util.h"
 #include "device-util.h"
 #include "dirent-util.h"
 #include "errno-util.h"
@@ -41,9 +40,9 @@
 #include "homed-manager-bus.h"
 #include "homed-operation.h"
 #include "homed-varlink.h"
+#include "logarithm.h"
 #include "mkdir.h"
 #include "notify-recv.h"
-#include "openssl-util.h"
 #include "ordered-set.h"
 #include "quota-util.h"
 #include "random-util.h"
@@ -313,7 +312,7 @@ Manager* manager_free(Manager *m) {
         m->homes_by_sysfs = hashmap_free(m->homes_by_sysfs);
 
         if (m->private_key)
-                EVP_PKEY_free(m->private_key);
+                sym_EVP_PKEY_free(m->private_key);
 
         hashmap_free(m->public_keys);
 
@@ -1317,7 +1316,7 @@ static int manager_load_key_pair(Manager *m) {
         assert(m);
 
         if (m->private_key) {
-                EVP_PKEY_free(m->private_key);
+                sym_EVP_PKEY_free(m->private_key);
                 m->private_key = NULL;
         }
 
@@ -1337,7 +1336,7 @@ static int manager_load_key_pair(Manager *m) {
         if (st.st_uid != 0 || (st.st_mode & 0077) != 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EPERM), "Private key file is readable by more than the root user");
 
-        m->private_key = PEM_read_PrivateKey(f, NULL, NULL, NULL);
+        m->private_key = sym_PEM_read_PrivateKey(f, NULL, NULL, NULL);
         if (!m->private_key)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to load private key pair");
 
@@ -1353,20 +1352,20 @@ static int manager_generate_key_pair(Manager *m) {
         int r;
 
         if (m->private_key) {
-                EVP_PKEY_free(m->private_key);
+                sym_EVP_PKEY_free(m->private_key);
                 m->private_key = NULL;
         }
 
-        ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+        ctx = sym_EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
         if (!ctx)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to allocate Ed25519 key generation context.");
 
-        if (EVP_PKEY_keygen_init(ctx) <= 0)
+        if (sym_EVP_PKEY_keygen_init(ctx) <= 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to initialize Ed25519 key generation context.");
 
         log_info("Generating key pair for signing local user identity records.");
 
-        if (EVP_PKEY_keygen(ctx, &m->private_key) <= 0)
+        if (sym_EVP_PKEY_keygen(ctx, &m->private_key) <= 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to generate Ed25519 key pair");
 
         log_info("Successfully created Ed25519 key pair.");
@@ -1378,7 +1377,7 @@ static int manager_generate_key_pair(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to open key file for writing: %m");
 
-        if (PEM_write_PUBKEY(fpublic, m->private_key) <= 0)
+        if (sym_PEM_write_PUBKEY(fpublic, m->private_key) <= 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write public key.");
 
         (void) fchmod(fileno(fpublic), 0444); /* Make public key world readable */
@@ -1394,7 +1393,7 @@ static int manager_generate_key_pair(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to open key file for writing: %m");
 
-        if (PEM_write_PrivateKey(fprivate, m->private_key, NULL, NULL, 0, NULL, NULL) <= 0)
+        if (sym_PEM_write_PrivateKey(fprivate, m->private_key, NULL, NULL, 0, NULL, NULL) <= 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write private key pair.");
 
         (void) fchmod(fileno(fprivate), 0400); /* Make private key root readable */
@@ -1459,7 +1458,8 @@ int manager_sign_user_record(Manager *m, UserRecord *u, UserRecord **ret, sd_bus
         return user_record_sign(u, m->private_key, ret);
 }
 
-DEFINE_HASH_OPS_FULL(public_key_hash_ops, char, string_hash_func, string_compare_func, free, EVP_PKEY, EVP_PKEY_free);
+/* dlopen_libcrypto() must have been called before populating this hashmap. */
+DEFINE_HASH_OPS_FULL(public_key_hash_ops, char, string_hash_func, string_compare_func, free, EVP_PKEY, sym_EVP_PKEY_free);
 
 static int manager_load_public_key_one(Manager *m, const char *path) {
         _cleanup_(EVP_PKEY_freep) EVP_PKEY *pkey = NULL;
@@ -1495,7 +1495,7 @@ static int manager_load_public_key_one(Manager *m, const char *path) {
         if (st.st_uid != 0 || (st.st_mode & 0022) != 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EPERM), "Public key file %s is writable by more than the root user, refusing.", path);
 
-        pkey = PEM_read_PUBKEY(f, &pkey, NULL, NULL);
+        pkey = sym_PEM_read_PUBKEY(f, &pkey, NULL, NULL);
         if (!pkey)
                 return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to parse public key file %s.", path);
 
@@ -1536,6 +1536,10 @@ int manager_startup(Manager *m) {
         int r;
 
         assert(m);
+
+        r = DLOPEN_LIBCRYPTO(LOG_ERR, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
+        if (r < 0)
+                return r;
 
         r = manager_listen_notify(m);
         if (r < 0)
@@ -1889,10 +1893,10 @@ static int manager_rebalance_calculate(Manager *m) {
                 assert(h->rebalance_usage <= usage_sum);
                 assert(h->rebalance_weight <= weight_sum);
 
-                d = ((double) (free_sum / 4096.0) * (double) h->rebalance_weight) / (double) weight_sum; /* Calculate new space for this home in units of 4K */
+                d = free_sum / 4096.0 * h->rebalance_weight / weight_sum; /* Calculate new space for this home in units of 4K */
 
                 /* Convert from units of 4K back to bytes */
-                if (d >= (double) (UINT64_MAX/4096))
+                if (d >= UINT64_MAX / 4096)
                         new_free = UINT64_MAX;
                 else
                         new_free = (uint64_t) d * 4096;
@@ -1928,14 +1932,14 @@ static int manager_rebalance_calculate(Manager *m) {
                         h->rebalance_pending = true;
                 }
 
-                if ((fabs((double) h->rebalance_size - (double) h->rebalance_goal) * 100 / (double) h->rebalance_size) >= 5.0)
+                if (ABS_DIFF(h->rebalance_size, h->rebalance_goal) * 100.0 / h->rebalance_size >= 5.0)
                         relevant = true;
         }
 
         /* Scale next rebalancing interval based on the least amount of space of any of the home
-         * directories. We pick a time in the range 1min … 15min, scaled by log2(min_free), so that:
-         * 10M → ~0.7min, 100M → ~2.7min, 1G → ~4.6min, 10G → ~6.5min, 100G ~8.4 */
-        m->rebalance_interval_usec = (usec_t) CLAMP((LESS_BY(log2(min_free), 22)*15*USEC_PER_MINUTE)/26,
+         * directories. We pick a time in the range 1min … 15min, scaled by floor(log2(min_free)),
+         * so that: 10M → ~0.6min, 100M → ~2.3min, 1G → ~4.0min, 10G → ~6.3min, 100G → ~8.1min */
+        m->rebalance_interval_usec = (usec_t) CLAMP((LESS_BY(log2u64(min_free), 22u)*15*USEC_PER_MINUTE)/26,
                                                     1 * USEC_PER_MINUTE,
                                                     15 * USEC_PER_MINUTE);
 

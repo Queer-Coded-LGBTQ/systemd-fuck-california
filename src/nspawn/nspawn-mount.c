@@ -14,7 +14,7 @@
 #include "format-util.h"
 #include "fs-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
@@ -757,12 +757,13 @@ int mount_all(const char *dest,
 }
 
 static int parse_mount_bind_options(const char *options, unsigned long *open_tree_flags, char **mount_opts, RemountIdmapping *idmapping) {
-        unsigned long flags = *open_tree_flags;
+        unsigned long flags = *ASSERT_PTR(open_tree_flags);
         char *opts = NULL;
-        RemountIdmapping new_idmapping = *idmapping;
+        RemountIdmapping new_idmapping = *ASSERT_PTR(idmapping);
         int r;
 
         assert(options);
+        assert(mount_opts);
 
         for (;;) {
                 _cleanup_free_ char *word = NULL;
