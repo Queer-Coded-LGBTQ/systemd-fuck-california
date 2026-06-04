@@ -121,6 +121,12 @@ static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
+        if (c->cpuset_partition >= 0) {
+                r = serialize_item(f, "exec-cgroup-context-cpuset-partition", cpuset_partition_to_string(c->cpuset_partition));
+                if (r < 0)
+                        return r;
+        }
+
         if (c->io_weight != CGROUP_WEIGHT_INVALID) {
                 r = serialize_item_format(f, "exec-cgroup-context-io-weight", "%" PRIu64, c->io_weight);
                 if (r < 0)
@@ -279,7 +285,19 @@ static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        r = serialize_item(f, "exec-cgroup-context-memory-pressure-watch", cgroup_pressure_watch_to_string(c->memory_pressure_watch));
+        r = serialize_strv(f, "exec-cgroup-context-managed-oom-rules", c->moom_rules);
+        if (r < 0)
+                return r;
+
+        r = serialize_item(f, "exec-cgroup-context-memory-pressure-watch", cgroup_pressure_watch_to_string(c->pressure[PRESSURE_MEMORY].watch));
+        if (r < 0)
+                return r;
+
+        r = serialize_item(f, "exec-cgroup-context-cpu-pressure-watch", cgroup_pressure_watch_to_string(c->pressure[PRESSURE_CPU].watch));
+        if (r < 0)
+                return r;
+
+        r = serialize_item(f, "exec-cgroup-context-io-pressure-watch", cgroup_pressure_watch_to_string(c->pressure[PRESSURE_IO].watch));
         if (r < 0)
                 return r;
 
@@ -287,8 +305,20 @@ static int exec_cgroup_context_serialize(const CGroupContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        if (c->memory_pressure_threshold_usec != USEC_INFINITY) {
-                r = serialize_usec(f, "exec-cgroup-context-memory-pressure-threshold-usec", c->memory_pressure_threshold_usec);
+        if (c->pressure[PRESSURE_MEMORY].threshold_usec != USEC_INFINITY) {
+                r = serialize_usec(f, "exec-cgroup-context-memory-pressure-threshold-usec", c->pressure[PRESSURE_MEMORY].threshold_usec);
+                if (r < 0)
+                        return r;
+        }
+
+        if (c->pressure[PRESSURE_CPU].threshold_usec != USEC_INFINITY) {
+                r = serialize_usec(f, "exec-cgroup-context-cpu-pressure-threshold-usec", c->pressure[PRESSURE_CPU].threshold_usec);
+                if (r < 0)
+                        return r;
+        }
+
+        if (c->pressure[PRESSURE_IO].threshold_usec != USEC_INFINITY) {
+                r = serialize_usec(f, "exec-cgroup-context-io-pressure-threshold-usec", c->pressure[PRESSURE_IO].threshold_usec);
                 if (r < 0)
                         return r;
         }
@@ -493,6 +523,10 @@ static int exec_cgroup_context_deserialize(CGroupContext *c, FILE *f) {
                         r = parse_cpu_set(val, &c->startup_cpuset_mems);
                         if (r < 0)
                                 return r;
+                } else if ((val = startswith(l, "exec-cgroup-context-cpuset-partition="))) {
+                        c->cpuset_partition = cpuset_partition_from_string(val);
+                        if (c->cpuset_partition < 0)
+                                return -EINVAL;
                 } else if ((val = startswith(l, "exec-cgroup-context-io-weight="))) {
                         r = safe_atou64(val, &c->io_weight);
                         if (r < 0)
@@ -620,16 +654,36 @@ static int exec_cgroup_context_deserialize(CGroupContext *c, FILE *f) {
                         r = deserialize_usec(val, &c->moom_mem_pressure_duration_usec);
                         if (r < 0)
                                 return r;
+                } else if ((val = startswith(l, "exec-cgroup-context-managed-oom-rules="))) {
+                        r = deserialize_strv(val, &c->moom_rules);
+                        if (r < 0)
+                                return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-memory-pressure-watch="))) {
-                        c->memory_pressure_watch = cgroup_pressure_watch_from_string(val);
-                        if (c->memory_pressure_watch < 0)
+                        c->pressure[PRESSURE_MEMORY].watch = cgroup_pressure_watch_from_string(val);
+                        if (c->pressure[PRESSURE_MEMORY].watch < 0)
+                                return -EINVAL;
+                } else if ((val = startswith(l, "exec-cgroup-context-cpu-pressure-watch="))) {
+                        c->pressure[PRESSURE_CPU].watch = cgroup_pressure_watch_from_string(val);
+                        if (c->pressure[PRESSURE_CPU].watch < 0)
+                                return -EINVAL;
+                } else if ((val = startswith(l, "exec-cgroup-context-io-pressure-watch="))) {
+                        c->pressure[PRESSURE_IO].watch = cgroup_pressure_watch_from_string(val);
+                        if (c->pressure[PRESSURE_IO].watch < 0)
                                 return -EINVAL;
                 } else if ((val = startswith(l, "exec-cgroup-context-delegate-subgroup="))) {
                         r = free_and_strdup(&c->delegate_subgroup, val);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-memory-pressure-threshold-usec="))) {
-                        r = deserialize_usec(val, &c->memory_pressure_threshold_usec);
+                        r = deserialize_usec(val, &c->pressure[PRESSURE_MEMORY].threshold_usec);
+                        if (r < 0)
+                                return r;
+                } else if ((val = startswith(l, "exec-cgroup-context-cpu-pressure-threshold-usec="))) {
+                        r = deserialize_usec(val, &c->pressure[PRESSURE_CPU].threshold_usec);
+                        if (r < 0)
+                                return r;
+                } else if ((val = startswith(l, "exec-cgroup-context-io-pressure-threshold-usec="))) {
+                        r = deserialize_usec(val, &c->pressure[PRESSURE_IO].threshold_usec);
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-cgroup-context-device-allow="))) {
@@ -1662,7 +1716,7 @@ static int exec_context_serialize(const ExecContext *c, FILE *f) {
         if (r < 0)
                 return r;
 
-        r = serialize_item(f, "exec-context-memory-thp", memory_thp_to_string(c->memory_thp));
+        r = serialize_item(f, "exec-context-memory-thp", exec_memory_thp_to_string(c->memory_thp));
         if (r < 0)
                 return r;
 
@@ -2607,7 +2661,7 @@ static int exec_context_deserialize(ExecContext *c, FILE *f) {
                         if (r < 0)
                                 return r;
                 } else if ((val = startswith(l, "exec-context-memory-thp="))) {
-                        c->memory_thp = memory_thp_from_string(val);
+                        c->memory_thp = exec_memory_thp_from_string(val);
                         if (c->memory_thp < 0)
                                 return c->memory_thp;
                 } else if ((val = startswith(l, "exec-context-private-tmp="))) {
