@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "sd-dlopen.h"
+
 #include "shared-forward.h"
 
 #if HAVE_ACL
@@ -36,8 +38,6 @@ extern DLSYM_PROTOTYPE(acl_set_qualifier);
 extern DLSYM_PROTOTYPE(acl_set_tag_type);
 extern DLSYM_PROTOTYPE(acl_to_any_text);
 
-int dlopen_libacl(void);
-
 int devnode_acl(int fd, const Set *uids);
 
 int calc_acl_mask_if_needed(acl_t *acl_p);
@@ -62,6 +62,17 @@ static inline int acl_set_perm(acl_permset_t ps, acl_perm_t p, bool b) {
         return (b ? sym_acl_add_perm : sym_acl_delete_perm)(ps, p);
 }
 
+#define LIBACL_NOTE(priority)                                           \
+        SD_ELF_NOTE_DLOPEN("acl",                                       \
+                           "Support for file Access Control Lists (ACLs)", \
+                           priority,                                    \
+                           "libacl.so.1")
+
+#define DLOPEN_LIBACL(log_level, priority)                              \
+        ({                                                              \
+                LIBACL_NOTE(priority);                                  \
+                dlopen_libacl(log_level);                               \
+        })
 #else
 
 typedef void* acl_t;
@@ -85,10 +96,6 @@ typedef unsigned acl_type_t;
 #define ACL_TYPE_ACCESS         (0x8000)
 #define ACL_TYPE_DEFAULT        (0x4000)
 
-static inline int dlopen_libacl(void) {
-        return -EOPNOTSUPP;
-}
-
 static inline int devnode_acl(int fd, const Set *uids) {
         return -EOPNOTSUPP;
 }
@@ -96,7 +103,11 @@ static inline int devnode_acl(int fd, const Set *uids) {
 static inline int fd_add_uid_acl_permission(int fd, uid_t uid, unsigned mask) {
         return -EOPNOTSUPP;
 }
+
+#define DLOPEN_LIBACL(log_level, priority) dlopen_libacl(log_level)
 #endif
+
+int dlopen_libacl(int log_level);
 
 int fd_acl_make_read_only(int fd);
 int fd_acl_make_writable(int fd);

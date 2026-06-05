@@ -240,6 +240,7 @@ units = [
         },
         { 'file' : 'sysinit.target' },
         { 'file' : 'syslog.socket' },
+        { 'file' : 'system-install.target' },
         {
           'file' : 'system-systemd\\x2dcryptsetup.slice',
           'conditions' : ['HAVE_LIBCRYPTSETUP'],
@@ -310,6 +311,10 @@ units = [
           'file' : 'systemd-confext-initrd.service',
           'conditions' : ['ENABLE_INITRD', 'ENABLE_SYSEXT'],
           'symlinks' : ['initrd.target.wants/'],
+        },
+        {
+          'file' : 'systemd-confext-sysroot.service',
+          'conditions' : ['ENABLE_INITRD', 'ENABLE_SYSEXT'],
         },
         {
           'file' : 'systemd-coredump.socket',
@@ -391,6 +396,22 @@ units = [
         {
           'file' : 'systemd-hybrid-sleep.service.in',
           'conditions' : ['ENABLE_HIBERNATE'],
+        },
+        {
+          'file' : 'systemd-imdsd@.service.in',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-imdsd.socket',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-imds-early-network.service.in',
+          'conditions' : ['ENABLE_IMDS'],
+        },
+        {
+          'file' : 'systemd-imds-import.service.in',
+          'conditions' : ['ENABLE_IMDS'],
         },
         {
           'file' : 'systemd-importd.service.in',
@@ -569,6 +590,11 @@ units = [
           'symlinks' : ['sysinit.target.wants/'],
         },
         {
+          'file' : 'systemd-pcrosseparator.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
+          'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
           'file' : 'systemd-pcrphase-factory-reset.service.in',
           'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
           'symlinks' : ['factory-reset.target.wants/'],
@@ -577,6 +603,10 @@ units = [
           'file' : 'systemd-pcrproduct.service.in',
           'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
           'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-pcrlogin@.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
         },
         {
           'file' : 'systemd-pcrphase-initrd.service.in',
@@ -603,6 +633,8 @@ units = [
           'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
           'symlinks' : ['sysinit.target.wants/'],
         },
+        { 'file' : 'systemd-report-basic.socket' },
+        { 'file' : 'systemd-report-basic@.service.in' },
         {
           'file' : 'systemd-tpm2-clear.service.in',
           'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
@@ -616,6 +648,10 @@ units = [
           'file' : 'systemd-tpm2-setup-early.service.in',
           'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
           'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-tpm2-swtpm.service.in',
+          'conditions' : ['ENABLE_BOOTLOADER', 'HAVE_OPENSSL', 'HAVE_TPM2'],
         },
         {
           'file' : 'systemd-pcrlock-make-policy.service.in',
@@ -693,6 +729,8 @@ units = [
           'file' : 'systemd-repart@.service',
           'conditions' : ['ENABLE_REPART'],
         },
+        { 'file' : 'systemd-report-cgroup.socket' },
+        { 'file' : 'systemd-report-cgroup@.service.in' },
         {
           'file' : 'systemd-resolved.service.in',
           'conditions' : ['ENABLE_RESOLVE'],
@@ -733,6 +771,10 @@ units = [
           'symlinks' : ['initrd.target.wants/'],
         },
         {
+          'file' : 'systemd-sysext-sysroot.service',
+          'conditions' : ['ENABLE_INITRD', 'ENABLE_SYSEXT'],
+        },
+        {
           'file' : 'systemd-sysext.socket',
           'conditions' : ['ENABLE_SYSEXT'],
           'symlinks' : ['sockets.target.wants/'],
@@ -742,7 +784,12 @@ units = [
           'conditions' : ['ENABLE_SYSEXT'],
         },
         {
-          'file' : 'systemd-sysupdate-reboot.service.in',
+          'file' : 'systemd-sysinstall.service',
+          'conditions' : ['ENABLE_SYSINSTALL'],
+          'symlinks' : ['system-install.target.wants/'],
+        },
+        {
+          'file' : 'systemd-sysupdate-reboot.service',
           'conditions' : ['ENABLE_SYSUPDATE'],
         },
         {
@@ -750,7 +797,7 @@ units = [
           'conditions' : ['ENABLE_SYSUPDATE'],
         },
         {
-          'file' : 'systemd-sysupdate.service.in',
+          'file' : 'systemd-sysupdate.service',
           'conditions' : ['ENABLE_SYSUPDATE'],
         },
         {
@@ -766,6 +813,20 @@ units = [
           'file' : 'systemd-sysusers.service',
           'conditions' : ['ENABLE_SYSUSERS'],
           'symlinks' : ['sysinit.target.wants/'],
+        },
+        {
+          'file' : 'systemd-storage-block.socket',
+          'symlinks' : ['sockets.target.wants/']
+        },
+        {
+          'file' : 'systemd-storage-block@.service.in',
+        },
+        {
+          'file' : 'systemd-storage-fs.socket',
+          'symlinks' : ['sockets.target.wants/']
+        },
+        {
+          'file' : 'systemd-storage-fs@.service.in',
         },
         {
           'file' : 'systemd-storagetm.service.in',

@@ -35,11 +35,15 @@ All tools:
   no-ops. If that's what's explicitly desired, you might consider setting
   `$SYSTEMD_OFFLINE=1`.
 
+* `$SYSTEMD_IN_INITRD` — takes a boolean. If set, overrides initrd detection.
+  This is useful for debugging and testing initrd-only programs in the main
+  system.
+
 * `$SYSTEMD_FIRST_BOOT=0|1` — if set, assume "first boot" condition to be false
   or true, instead of checking the flag file created by PID 1.
 
-* `$SD_EVENT_PROFILE_DELAYS=1` — if set, the sd-event event loop implementation
-  will print latency information at runtime.
+* `$SYSTEMD_INVOKED_AS=name` — override argv[0] for detection of a multicall
+  binary. E.g. `SYSTEMD_INVOKED_AS=systemd-udevd build/udevadm`.
 
 * `$SYSTEMD_PROC_CMDLINE` — if set, the contents are used as the kernel command
   line instead of the actual one in `/proc/cmdline`. This is useful for
@@ -76,9 +80,8 @@ All tools:
   (relevant in particular for the system manager and `systemd-hostnamed`).
   Must be a valid hostname (either a single label or a FQDN).
 
-* `$SYSTEMD_IN_INITRD` — takes a boolean. If set, overrides initrd detection.
-  This is useful for debugging and testing initrd-only programs in the main
-  system.
+* `$SD_EVENT_PROFILE_DELAYS=1` — if set, the sd-event event loop implementation
+  will print latency information at runtime.
 
 * `$SYSTEMD_BUS_TIMEOUT=SECS` — specifies the maximum time to wait for method call
   completion. If no time unit is specified, assumes seconds. The usual other units
@@ -678,6 +681,11 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
 * `$SYSTEMD_JOURNAL_FD_SIZE_MAX` – Takes a size with the usual suffixes (K, M, ...) in
   string format. Overrides the default maximum allowed size for a file-descriptor
   based input record to be stored in the journal.
+
+* `$SYSTEMD_JOURNAL_REMOTE_CONFIG_FILE` – path to a configuration file for
+  `systemd-journal-remote`. When set, the specified file is used instead of the
+  default configuration file and drop-in directories. If set to the empty string
+  or `/dev/null`, configuration file parsing is skipped entirely.
 
 * `$SYSTEMD_CATALOG` – path to the compiled catalog database file to use for
   `journalctl -x`, `journalctl --update-catalog`, `journalctl --list-catalog`

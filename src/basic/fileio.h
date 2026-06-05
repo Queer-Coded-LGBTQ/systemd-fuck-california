@@ -63,6 +63,10 @@ int read_one_line_file_at(int dir_fd, const char *filename, char **ret);
 static inline int read_one_line_file(const char *filename, char **ret) {
         return read_one_line_file_at(AT_FDCWD, filename, ret);
 }
+int read_boolean_file_at(int dir_fd, const char *filename);
+static inline int read_boolean_file(const char *filename) {
+        return read_boolean_file_at(AT_FDCWD, filename);
+}
 int read_full_file_full(int dir_fd, const char *filename, uint64_t offset, size_t size, ReadFullFileFlags flags, const char *bind_name, char **ret_contents, size_t *ret_size);
 static inline int read_full_file_at(int dir_fd, const char *filename, char **ret_contents, size_t *ret_size) {
         return read_full_file_full(dir_fd, filename, UINT64_MAX, SIZE_MAX, 0, NULL, ret_contents, ret_size);
@@ -166,6 +170,7 @@ int fopen_mode_to_flags(const char *mode);
 
 typedef enum WriteDataFileFlags {
         WRITE_DATA_FILE_MKDIR_0755 = 1 << 0,
+        WRITE_DATA_FILE_MODE_0400  = 1 << 1,
 } WriteDataFileFlags;
 
 int write_data_file_atomic_at(int dir_fd, const char *path, const struct iovec *iovec, WriteDataFileFlags flags);
