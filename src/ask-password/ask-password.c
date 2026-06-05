@@ -57,7 +57,9 @@ static int help(void) {
                program_invocation_short_name,
                ansi_highlight(),
                ansi_normal());
-        table_print(options, stdout);
+        r = table_print_or_warn(options);
+        if (r < 0)
+                return r;
 
         printf("\nSee the %s for details.\n", link);
         return 0;
@@ -71,10 +73,9 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        OptionParser state = {};
-        const char *arg;
+        OptionParser opts = { argc, argv };
 
-        FOREACH_OPTION(&state, c, argc, argv, &arg, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
                         return help();
@@ -83,13 +84,13 @@ static int parse_argv(int argc, char *argv[]) {
                         return version();
 
                 OPTION_LONG("icon", "NAME", "Icon name"):
-                        arg_icon = arg;
+                        arg_icon = opts.arg;
                         break;
 
                 OPTION_LONG("timeout", "SEC", "Timeout in seconds"):
-                        r = parse_sec(arg, &arg_timeout);
+                        r = parse_sec(opts.arg, &arg_timeout);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --timeout= parameter: %s", arg);
+                                return log_error_errno(r, "Failed to parse --timeout= parameter: %s", opts.arg);
                         break;
 
                         /* Note the asymmetry: the long option --echo= allows an optional argument,
@@ -97,15 +98,15 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_LONG_FLAGS(OPTION_OPTIONAL_ARG, "echo", "yes|no|masked",
                                   "Control whether to show password while typing"): {}
                 OPTION('e', "echo", NULL, "Equivalent to --echo=yes"):
-                        if (!arg) {
+                        if (!opts.arg) {
                                 /* Short option -e is used, or no argument to long option --echo= */
                                 arg_flags |= ASK_PASSWORD_ECHO;
                                 arg_flags &= ~ASK_PASSWORD_SILENT;
-                        } else if (isempty(arg) || streq(arg, "masked"))
+                        } else if (isempty(opts.arg) || streq(opts.arg, "masked"))
                                 /* Empty argument or explicit string "masked" for default behaviour. */
                                 arg_flags &= ~(ASK_PASSWORD_ECHO|ASK_PASSWORD_SILENT);
                         else {
-                                r = parse_boolean_argument("--echo=", arg, NULL);
+                                r = parse_boolean_argument("--echo=", opts.arg, NULL);
                                 if (r < 0)
                                         return r;
 
@@ -115,7 +116,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 OPTION_LONG("emoji", "yes|no|auto", "Show a lock and key emoji"):
-                        emoji = arg;
+                        emoji = opts.arg;
                         break;
 
                 OPTION_LONG("no-tty", NULL, "Ask question via agent even on TTY"):
@@ -131,11 +132,11 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 OPTION_LONG("id", "ID", "Query identifier (e.g. \"cryptsetup:/dev/sda5\")"):
-                        arg_id = arg;
+                        arg_id = opts.arg;
                         break;
 
                 OPTION_LONG("keyname", "NAME", "Kernel key name for caching passwords"):
-                        arg_key_name = arg;
+                        arg_key_name = opts.arg;
                         break;
 
                 OPTION_LONG("no-output", NULL, "Do not print password to standard output"):
@@ -144,7 +145,7 @@ static int parse_argv(int argc, char *argv[]) {
 
                 OPTION_LONG("credential", "NAME",
                             "Credential name for ImportCredential=, LoadCredential= or SetCredential= credentials"):
-                        arg_credential_name = arg;
+                        arg_credential_name = opts.arg;
                         break;
 
                 OPTION_LONG("user", NULL, "Ask only our own user's agents"):
@@ -170,7 +171,7 @@ static int parse_argv(int argc, char *argv[]) {
                 SET_FLAG(arg_flags, ASK_PASSWORD_HIDE_EMOJI, !r);
         }
 
-        char **args = option_parser_get_args(&state, argc, argv);
+        char **args = option_parser_get_args(&opts);
 
         if (!strv_isempty(args)) {
                 arg_message = strv_join(args, " ");
