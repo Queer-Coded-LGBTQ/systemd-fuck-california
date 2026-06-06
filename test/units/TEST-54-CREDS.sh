@@ -17,7 +17,8 @@ run_with_cred_compare() (
     trap "rm -f '$log_file'" RETURN
 
     set -o pipefail
-    systemd-run -p SetCredential="$cred" --wait --pipe -- systemd-creds "$@" | tee "$log_file"
+    # This has been observed to get stuck under ASAN, so add a timeout as precaution
+    timeout 120 systemd-run -p SetCredential="$cred" --wait --pipe -- systemd-creds "$@" | tee "$log_file"
     diff "$log_file" <(echo -ne "$exp")
 )
 
@@ -114,10 +115,9 @@ run_with_cred_compare "mycred:" "" cat mycred
 run_with_cred_compare "mycred:\n" "\n" cat mycred
 run_with_cred_compare "mycred:foo" "foo" cat mycred
 run_with_cred_compare "mycred:foo" "foofoofoo" cat mycred mycred mycred
-# Note: --newline= does nothing when stdout is not a tty, which is the case here
-run_with_cred_compare "mycred:foo" "foo" --newline=yes cat mycred
-run_with_cred_compare "mycred:foo" "foo" --newline=no cat mycred
 run_with_cred_compare "mycred:foo" "foo" --newline=auto cat mycred
+run_with_cred_compare "mycred:foo" "foo" --newline=no cat mycred
+run_with_cred_compare "mycred:foo" "foo\n" --newline=yes cat mycred
 run_with_cred_compare "mycred:foo" "foo" --transcode=no cat mycred
 run_with_cred_compare "mycred:foo" "foo" --transcode=0 cat mycred
 run_with_cred_compare "mycred:foo" "foo" --transcode=false cat mycred
