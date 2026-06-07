@@ -30,7 +30,7 @@ LICENSE:
 
 REQUIREMENTS:
         Linux kernel ≥ 3.15 for timerfd_create() CLOCK_BOOTTIME support
-                     ≥ 3.17 for memfd_create() and getrandom()
+                     ≥ 3.17 for memfd_create(), getrandom(), and kexec_file_load() (x86-64)
                      ≥ 4.3 for ambient capabilities
                      ≥ 4.5 for pids controller in cgroup v2
                      ≥ 4.6 for cgroup namespaces
@@ -60,7 +60,7 @@ REQUIREMENTS:
 
         Linux kernel ≥ 5.11 for epoll_pwait2()
                      ≥ 5.12 for idmapped mount (mount_setattr())
-                     ≥ 5.14 for cgroup.kill and quotactl_fd()
+                     ≥ 5.14 for cgroup.kill, quotactl_fd(), and MOUNT_ATTR_NOSYMFOLLOW
 
         ⚠️ Kernel versions below 5.14 ("recommended baseline") have significant gaps
            in functionality and are not recommended for use with this version
@@ -77,7 +77,7 @@ REQUIREMENTS:
                      ≥ 6.10 for fcntl(F_DUPFD_QUERY), unprivileged linkat(AT_EMPTY_PATH),
                                 and block device 'partscan' sysfs attribute
                      ≥ 6.12 for AT_HANDLE_MNT_ID_UNIQUE
-                     ≥ 6.13 for PIDFD_GET_INFO and {set,remove}xattrat() and
+                     ≥ 6.13 for PIDFD_GET_INFO, {set,remove}xattrat(), and
                                 FSCONFIG_SET_FD support for overlayfs layers
                      ≥ 6.16 for coredump pattern '%F' (pidfd) specifier and SO_PASSRIGHTS
 
@@ -205,8 +205,7 @@ REQUIREMENTS:
           CONFIG_MEMCG
 
         glibc >= 2.34
-        musl >= 1.2.5 with fde29c04adbab9d5b081bf6717b5458188647f1c
-                (required when building systemd with -Dlibc=musl)
+        musl >= 1.2.6 (required when building systemd with -Dlibc=musl)
         libxcrypt >= 4.4.0 (optional)
         libmount >= 2.30 (from util-linux)
                 (util-linux *must* be built without --enable-libmount-support-mtab)
@@ -219,7 +218,7 @@ REQUIREMENTS:
         libacl (optional)
         libbpf >= 0.1.0 (optional),
                >= 1.4.0 is required for using GCC as a bpf compiler
-        libfdisk >= 2.32 (from util-linux) (optional)
+        libfdisk >= 2.35 (from util-linux) (optional)
         libselinux >= 2.1.9 (optional)
         libapparmor >= 2.13 (optional)
         libxenctrl >= 4.9 (optional)
@@ -264,9 +263,9 @@ REQUIREMENTS:
         During runtime, you need the following additional
         dependencies:
 
-        util-linux >= v2.41 required (including but not limited to: mount,
-                                      umount, swapon, swapoff, sulogin,
-                                      agetty, fsck)
+        util-linux >= v2.27.1 required (including but not limited to: mount,
+                                        umount, swapon, swapoff, sulogin,
+                                        agetty, fsck)
         dbus >= 1.4.0 (strictly speaking optional, but recommended)
                 NOTE: If using dbus < 1.9.18, you should override the default
                 policy directory (--with-dbuspolicydir=/etc/dbus-1/system.d).
