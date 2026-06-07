@@ -558,6 +558,8 @@ static int assess_system_call_architectures(
 }
 
 static bool syscall_names_in_filter(Set *s, bool allow_list, const SyscallFilterSet *f, const char **ret_offending_syscall) {
+        assert(ret_offending_syscall);
+
         NULSTR_FOREACH(syscall, f->value) {
                 if (syscall[0] == '@') {
                         const SyscallFilterSet *g;
@@ -575,8 +577,7 @@ static bool syscall_names_in_filter(Set *s, bool allow_list, const SyscallFilter
 
                 if (set_contains(s, syscall) == allow_list) {
                         log_debug("Offending syscall filter item: %s", syscall);
-                        if (ret_offending_syscall)
-                                *ret_offending_syscall = syscall;
+                        *ret_offending_syscall = syscall;
                         return true; /* bad! */
                 }
         }
@@ -604,7 +605,7 @@ static int assess_system_call_filter(
         uint64_t b;
         int r;
 
-        r = dlopen_libseccomp();
+        r = DLOPEN_LIBSECCOMP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
         if (r < 0) {
                 *ret_badness = UINT64_MAX;
                 *ret_description = NULL;
@@ -2577,7 +2578,7 @@ static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, Security
                 info->_umask = c->umask;
 
 #if HAVE_SECCOMP
-                if (dlopen_libseccomp() >= 0) {
+                if (DLOPEN_LIBSECCOMP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED) >= 0) {
                         SET_FOREACH(key, c->syscall_archs) {
                                 const char *name;
 
@@ -2712,7 +2713,7 @@ static int offline_security_checks(
 
         log_debug("Starting manager...");
 
-        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, root);
+        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, /* named_listen_fds= */ NULL, root);
         if (r < 0)
                 return r;
 

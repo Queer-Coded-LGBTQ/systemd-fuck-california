@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "sd-dlopen.h"
+
 #include "shared-forward.h"
 
 #if HAVE_KMOD
@@ -23,8 +25,6 @@ extern DLSYM_PROTOTYPE(kmod_set_log_fn);
 extern DLSYM_PROTOTYPE(kmod_unref);
 extern DLSYM_PROTOTYPE(kmod_validate_resources);
 
-int dlopen_libkmod(void);
-
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct kmod_ctx*, sym_kmod_unref, kmod_unrefp, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct kmod_module*, sym_kmod_module_unref, kmod_module_unrefp, NULL);
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct kmod_list*, sym_kmod_module_unref_list, kmod_module_unref_listp, NULL);
@@ -37,13 +37,21 @@ DEFINE_TRIVIAL_CLEANUP_FUNC_FULL_RENAME(struct kmod_list*, sym_kmod_module_unref
 int module_load_and_warn(struct kmod_ctx *ctx, const char *module, bool verbose);
 int module_setup_context(struct kmod_ctx **ret);
 
+#define LIBKMOD_NOTE(priority)                                          \
+        SD_ELF_NOTE_DLOPEN("kmod",                                      \
+                           "Support for loading kernel modules",        \
+                           priority,                                    \
+                           "libkmod.so.2")
+
+#define DLOPEN_LIBKMOD(log_level, priority)                             \
+        ({                                                              \
+                LIBKMOD_NOTE(priority);                                 \
+                dlopen_libkmod(log_level);                              \
+        })
 #else
 
 struct kmod_ctx;
 
-static inline int dlopen_libkmod(void) {
-        return -EOPNOTSUPP;
-}
 
 static inline int module_setup_context(struct kmod_ctx **ret) {
         return -EOPNOTSUPP;
@@ -53,4 +61,7 @@ static inline int module_load_and_warn(struct kmod_ctx *ctx, const char *module,
         return -EOPNOTSUPP;
 }
 
+#define DLOPEN_LIBKMOD(log_level, priority) dlopen_libkmod(log_level)
 #endif
+
+int dlopen_libkmod(int log_level);

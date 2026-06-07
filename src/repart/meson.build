@@ -8,17 +8,15 @@ executables += [
         executable_template + {
                 'name' : 'systemd-repart',
                 'public' : true,
-                'extract' : files('repart.c'),
-                'link_with' : [
-                        libshared,
-                        libshared_fdisk,
-                ],
+                'extract' : files(
+                        'repart.c',
+                        'iso9660.c',
+                ),
                 'dependencies' : [
                         libblkid_cflags,
-                        libfdisk,
+                        libfdisk_cflags,
                         libmount_cflags,
-                        libopenssl,
-                        threads,
+                        libopenssl_cflags,
                 ],
         },
         executable_template + {
@@ -28,16 +26,14 @@ executables += [
                 'link_with' : [
                         libc_wrapper_static,
                         libbasic_static,
-                        libshared_fdisk,
                         libshared_static,
                         libsystemd_static,
                 ],
                 'dependencies' : [
                         libblkid_cflags,
-                        libfdisk,
+                        libfdisk_cflags,
                         libmount_cflags,
-                        libopenssl,
-                        threads,
+                        libopenssl_cflags,
                 ],
         },
 ]
