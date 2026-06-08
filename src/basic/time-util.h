@@ -113,6 +113,7 @@ struct timespec* timespec_store(struct timespec *ts, usec_t u);
 struct timespec* timespec_store_nsec(struct timespec *ts, nsec_t n);
 
 #define TIMESPEC_STORE(u) timespec_store(&(struct timespec) {}, (u))
+#define TIMESPEC_STORE_NSEC(n) timespec_store_nsec(&(struct timespec) {}, (n))
 
 usec_t timeval_load(const struct timeval *tv) _pure_;
 struct timeval* timeval_store(struct timeval *tv, usec_t u);
@@ -176,6 +177,7 @@ bool clock_supported(clockid_t clock);
 usec_t usec_shift_clock(usec_t x, clockid_t from, clockid_t to);
 
 int get_timezone(char **ret);
+int get_timezone_prefer_env(char **ret);
 const char* etc_localtime(void);
 
 int mktime_or_timegm_usec(struct tm *tm, bool utc, usec_t *ret);
