@@ -76,6 +76,7 @@ extern char *arg_image;
 extern usec_t arg_when;
 extern bool arg_stdin;
 extern const char *arg_reboot_argument;
+extern char *arg_kernel_cmdline;
 extern enum action arg_action;
 extern BusTransport arg_transport;
 extern const char *arg_host;
@@ -101,4 +102,5 @@ static inline const char* arg_job_mode(void) {
         return _arg_job_mode ?: "replace";
 }
 
-int systemctl_dispatch_parse_argv(int argc, char *argv[]);
+int systemctl_dispatch_parse_argv(int argc, char *argv[], int log_level_shift, char ***remaining_args);
+int systemctl_main(char **args);
