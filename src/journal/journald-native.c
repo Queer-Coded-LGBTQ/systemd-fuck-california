@@ -10,7 +10,6 @@
 #include "fd-util.h"
 #include "format-util.h"
 #include "iovec-util.h"
-#include "journal-importer.h"
 #include "journal-internal.h"
 #include "journald-client.h"
 #include "journald-console.h"
@@ -44,6 +43,10 @@ static void manager_process_entry_meta(
                 char **identifier,
                 char **message,
                 pid_t *object_pid) {
+
+        assert(priority);
+        assert(identifier);
+        assert(message);
 
         /* We need to determine the priority of this entry for the rate limiting logic */
 
@@ -113,6 +116,8 @@ static int manager_process_entry(
         const char *p;
         int r = 1;
 
+        assert(remaining);
+
         p = buffer;
 
         while (*remaining > 0) {
@@ -140,7 +145,7 @@ static int manager_process_entry(
                 }
 
                 /* A property follows */
-                if (n > ENTRY_FIELD_COUNT_MAX) {
+                if (n >= ENTRY_FIELD_COUNT_MAX) {
                         log_debug("Received an entry that has more than " STRINGIFY(ENTRY_FIELD_COUNT_MAX) " fields, ignoring entry.");
                         goto finish;
                 }
