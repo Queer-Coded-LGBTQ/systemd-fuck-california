@@ -268,6 +268,8 @@ static int verify_unit(Unit *u, bool check_man, const char *root) {
 }
 
 static void set_destroy_ignore_pointer_max(Set **s) {
+        assert(s);
+
         if (*s == POINTER_MAX)
                 return;
         set_free(*s);
@@ -313,7 +315,7 @@ int verify_units(
 
         log_debug("Starting manager...");
 
-        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, root);
+        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, /* named_listen_fds= */ NULL, root);
         if (r < 0)
                 return r;
 

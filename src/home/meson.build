@@ -51,6 +51,10 @@ homectl_sources = files(
         'homectl.c',
 )
 
+homectl_extract = files(
+        'homectl-prompts.c',
+)
+
 pam_systemd_home_sources = files(
         'home-util.c',
         'pam_systemd_home.c',
@@ -63,39 +67,34 @@ executables += [
                 'dbus' : true,
                 'sources' : systemd_homed_sources,
                 'extract' : systemd_homed_extract_sources,
-                'dependencies' : [
-                        libm,
-                        libopenssl,
-                        threads,
-                ],
+                'dependencies' : libopenssl_cflags,
         },
         libexec_template + {
                 'name' : 'systemd-homework',
                 'sources' : systemd_homework_sources,
                 'objects' : ['systemd-homed'],
-                'link_with' : [
-                        libshared,
-                        libshared_fdisk
-                ],
                 'dependencies' : [
                         libblkid_cflags,
-                        libfdisk,
-                        libopenssl,
+                        libfdisk_cflags,
+                        libopenssl_cflags,
                         libp11kit_cflags,
-                        threads,
                 ],
         },
         executable_template + {
                 'name' : 'homectl',
                 'public' : true,
                 'sources' : homectl_sources,
+                'extract' : homectl_extract,
                 'objects' : ['systemd-homed'],
                 'dependencies' : [
-                        libdl,
-                        libopenssl,
+                        libopenssl_cflags,
                         libp11kit_cflags,
-                        threads,
                 ],
+        },
+        test_template + {
+                'sources' : files('test-homectl-prompts.c'),
+                'objects' : ['homectl'],
+                'type' : 'manual',
         },
         test_template + {
                 'sources' : files('test-homed-regression-31896.c'),
@@ -108,12 +107,6 @@ modules += [
                 'name' : 'pam_systemd_home',
                 'conditions' : ['HAVE_PAM'],
                 'sources' : pam_systemd_home_sources,
-                'dependencies' : [
-                        libintl,
-                        libpam_misc,
-                        libpam,
-                        threads,
-                ],
                 'version-script' : meson.current_source_dir() / 'pam_systemd_home.sym',
         },
 ]
