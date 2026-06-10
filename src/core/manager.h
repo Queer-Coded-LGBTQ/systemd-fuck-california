@@ -3,6 +3,7 @@
 
 #include "sd-event.h"
 
+#include "bpf-restrict-fsaccess.h"
 #include "cgroup.h"
 #include "common-signal.h"
 #include "execute.h"
@@ -14,8 +15,12 @@
 
 struct libmnt_monitor;
 
-/* Enforce upper limit how many names we allow */
+/* Enforce upper limit on how many names we allow */
 #define MANAGER_MAX_NAMES 131072 /* 128K */
+
+/* Enforce upper limit on the number of patterns/states requested over IPC */
+#define MANAGER_MAX_PATTERNS_PER_CALL 4096U
+#define MANAGER_MAX_STATES_PER_CALL 256U
 
 /* On sigrtmin+18, private commands */
 enum {
@@ -147,8 +152,9 @@ typedef struct UnitDefaults {
         int oom_score_adjust;
         bool oom_score_adjust_set;
 
-        CGroupPressureWatch memory_pressure_watch;
-        usec_t memory_pressure_threshold_usec;
+        bool memory_zswap_writeback;
+
+        CGroupPressure pressure[_PRESSURE_RESOURCE_MAX];
 
         char *smack_process_label;
 
@@ -474,12 +480,25 @@ typedef struct Manager {
         /* Reference to RestrictFileSystems= BPF program */
         struct restrict_fs_bpf *restrict_fs;
 
+        /* Reference to RestrictFileSystemAccess= BPF LSM program */
+        RestrictFileSystemAccess restrict_filesystem_access;
+
+        /* Raw BPF FDs extracted from the skeleton after attach. The kernel
+         * reference chain (link FD -> bpf_link -> bpf_prog -> bpf_map) keeps
+         * programs attached and map data alive. The .bss map FD is used for
+         * targeted writes (clearing initramfs_s_dev after switch_root). */
+        int restrict_fsaccess_link_fds[_RESTRICT_FILESYSTEM_ACCESS_LINK_MAX];
+        int restrict_fsaccess_bss_map_fd;
+
         /* Allow users to configure a rate limit for Reload()/Reexecute() operations */
         RateLimit reload_reexec_ratelimit;
         /* Dump*() are slow, so always rate limit them to 10 per 10 minutes */
         RateLimit dump_ratelimit;
 
-        sd_event_source *memory_pressure_event_source;
+        /* Rate limit for the manager event loop */
+        RateLimit event_loop_ratelimit;
+
+        sd_event_source *pressure_event_source[_PRESSURE_RESOURCE_MAX];
 
         /* For NFTSet= */
         sd_netlink *nfnl;
@@ -490,6 +509,14 @@ typedef struct Manager {
         int executor_fd;
 
         unsigned soft_reboots_count;
+
+        /* The number of successfully completed configuration reloads. */
+        uint64_t reload_count;
+
+        /* Monotonic counter for fdstore entries propagated to a NOTIFY_SOCKET supervisor. Each propagated
+         * fd is sent upstream using this index as the FDNAME. The mapping (index -> unit_id + original fdname)
+         * is pushed alongside as a JSON memfd named "systemd-fdstore-mapping". */
+        uint64_t fd_store_upstream_next_index;
 
         /* Original ambient capabilities when we were initialized */
         uint64_t saved_ambient_set;
@@ -520,7 +547,20 @@ int manager_new(RuntimeScope scope, ManagerTestRunFlags test_run_flags, Manager 
 Manager* manager_free(Manager *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
 
-int manager_startup(Manager *m, FILE *serialization, FDSet *fds, const char *root);
+/* One entry parsed out of the upstream "systemd-fdstore-mapping" memfd. Pairs the numeric index from the
+ * JSON map to the (unit-id, original fdname) the fd was originally stored as. */
+typedef struct ListenFDsTag {
+        char *unit_id;
+        char *fdname;
+        uint64_t index;
+} ListenFDsTag;
+
+ListenFDsTag* listen_fds_tag_free(ListenFDsTag *t);
+DEFINE_TRIVIAL_CLEANUP_FUNC(ListenFDsTag*, listen_fds_tag_free);
+
+extern const struct hash_ops fd_to_listen_fds_tag_hash_ops;
+
+int manager_startup(Manager *m, FILE *serialization, FDSet *fds, Hashmap *named_listen_fds, const char *root);
 
 Job *manager_get_job(Manager *m, uint32_t id);
 Unit *manager_get_unit(Manager *m, const char *name);
@@ -530,6 +570,7 @@ int manager_get_job_from_dbus_path(Manager *m, const char *s, Job **_j);
 bool manager_unit_cache_should_retry_load(Unit *u);
 int manager_load_unit_prepare(Manager *m, const char *name, const char *path, sd_bus_error *e, Unit **ret);
 int manager_load_unit(Manager *m, const char *name, const char *path, sd_bus_error *e, Unit **ret);
+int manager_dispatch_external_fd_to_unit(Manager *m, const char *unit_id, const char *fdname, uint64_t index, int fd, const char *log_context);
 int manager_load_startable_unit_or_warn(Manager *m, const char *name, const char *path, Unit **ret);
 int manager_load_unit_from_dbus_path(Manager *m, const char *s, sd_bus_error *e, Unit **_u);
 
@@ -560,7 +601,7 @@ void manager_unwatch_pidref(Manager *m, const PidRef *pid);
 
 unsigned manager_dispatch_load_queue(Manager *m);
 
-int manager_setup_memory_pressure_event_source(Manager *m);
+int manager_setup_pressure_event_source(Manager *m, PressureResource t);
 
 int manager_default_environment(Manager *m);
 int manager_transient_environment_add(Manager *m, char **plus);

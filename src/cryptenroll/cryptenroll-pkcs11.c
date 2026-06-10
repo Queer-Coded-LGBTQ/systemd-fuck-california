@@ -2,10 +2,10 @@
 
 #include "alloc-util.h"
 #include "cryptenroll-pkcs11.h"
+#include "crypto-util.h"
 #include "cryptsetup-util.h"
 #include "hexdecoct.h"
 #include "json-util.h"
-#include "openssl-util.h"
 #include "pkcs11-util.h"
 
 #if HAVE_P11KIT && HAVE_OPENSSL
@@ -13,6 +13,8 @@ static int uri_set_private_class(const char *uri, char **ret_uri) {
         _cleanup_(p11_kit_uri_freep) P11KitUri *p11kit_uri = NULL;
         _cleanup_free_ char *private_uri = NULL;
         int r;
+
+        assert(ret_uri);
 
         r = uri_from_string(uri, &p11kit_uri);
         if (r < 0)
@@ -43,6 +45,7 @@ int enroll_pkcs11(struct crypt_device *cd, const struct iovec *volume_key,const 
         size_t decrypted_key_size, saved_key_size;
         _cleanup_free_ void *saved_key = NULL;
         _cleanup_(EVP_PKEY_freep) EVP_PKEY *pkey = NULL;
+        Pkcs11RsaPadding rsa_padding = _PKCS11_RSA_PADDING_INVALID;
         ssize_t base64_encoded_size;
         const char *node;
         int r;
@@ -51,7 +54,7 @@ int enroll_pkcs11(struct crypt_device *cd, const struct iovec *volume_key,const 
         assert_se(iovec_is_set(volume_key));
         assert_se(uri);
 
-        assert_se(node = crypt_get_device_name(cd));
+        assert_se(node = sym_crypt_get_device_name(cd));
 
         r = pkcs11_acquire_public_key(
                         uri,
@@ -60,11 +63,14 @@ int enroll_pkcs11(struct crypt_device *cd, const struct iovec *volume_key,const 
                         "cryptenroll.pkcs11-pin",
                         /* askpw_flags= */ 0,
                         &pkey,
+                        &rsa_padding,
                         /* ret_pin_used= */ NULL);
         if (r < 0)
                 return r;
 
-        r = pkey_generate_volume_keys(pkey, &decrypted_key, &decrypted_key_size, &saved_key, &saved_key_size);
+        r = pkey_generate_volume_keys(pkey,
+                                      pkcs11_rsa_padding_to_oaep_hash(rsa_padding),
+                                      &decrypted_key, &decrypted_key_size, &saved_key, &saved_key_size);
         if (r < 0)
                 return log_error_errno(r, "Failed to generate volume keys: %m");
 
@@ -78,7 +84,7 @@ int enroll_pkcs11(struct crypt_device *cd, const struct iovec *volume_key,const 
         if (r < 0)
                 return log_error_errno(r, "Failed to set minimal PBKDF: %m");
 
-        int keyslot = crypt_keyslot_add_by_volume_key(
+        int keyslot = sym_crypt_keyslot_add_by_volume_key(
                         cd,
                         CRYPT_ANY_SLOT,
                         volume_key->iov_base,
@@ -102,7 +108,9 @@ int enroll_pkcs11(struct crypt_device *cd, const struct iovec *volume_key,const 
                            SD_JSON_BUILD_PAIR("type", JSON_BUILD_CONST_STRING("systemd-pkcs11")),
                            SD_JSON_BUILD_PAIR("keyslots", SD_JSON_BUILD_ARRAY(SD_JSON_BUILD_STRING(keyslot_as_string))),
                            SD_JSON_BUILD_PAIR_STRING("pkcs11-uri", private_uri ?: uri),
-                           SD_JSON_BUILD_PAIR_BASE64("pkcs11-key", saved_key, saved_key_size));
+                           SD_JSON_BUILD_PAIR_BASE64("pkcs11-key", saved_key, saved_key_size),
+                           SD_JSON_BUILD_PAIR_CONDITION(rsa_padding > PKCS11_RSA_PADDING_PKCS1V15,
+                                                        "pkcs11-padding", SD_JSON_BUILD_STRING(pkcs11_rsa_padding_to_string(rsa_padding))));
         if (r < 0)
                 return log_error_errno(r, "Failed to prepare PKCS#11 JSON token object: %m");
 
