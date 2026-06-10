@@ -7,7 +7,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef __GLIBC__
+#include "sd-dlopen.h"
+#endif
+
 #include "dirent-util.h"
+#include "dlfcn-util.h"
 #include "env-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -16,10 +21,33 @@
 #include "path-util.h"
 #include "process-util.h"
 #include "set.h"
+#include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "utf8.h"
+
+#ifdef __GLIBC__
+DLSYM_PROTOTYPE(dgettext) = dgettext;
+#else
+DLSYM_PROTOTYPE(dgettext) = NULL;
+#endif
+
+int dlopen_libintl(int log_level) {
+#ifdef __GLIBC__
+        return 1;
+#else
+        static void *libintl_dl = NULL;
+
+        LIBINTL_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED);
+
+        return dlopen_many_sym_or_warn(
+                        &libintl_dl,
+                        "libintl.so.8",
+                        log_level,
+                        DLSYM_ARG(dgettext));
+#endif
+}
 
 static char* normalize_locale(const char *name) {
         const char *e;
@@ -115,8 +143,9 @@ static int add_locales_from_archive(Set *locales) {
         if (fstat(fd, &st) < 0)
                 return -errno;
 
-        if (!S_ISREG(st.st_mode))
-                return -EBADMSG;
+        r = stat_verify_regular(&st);
+        if (r < 0)
+                return r;
 
         if (st.st_size < (off_t) sizeof(struct locarhead))
                 return -EBADMSG;
