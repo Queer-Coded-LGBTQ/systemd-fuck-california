@@ -32,7 +32,7 @@ static int verify_stat_at(
         struct stat st;
         int r;
 
-        assert(fd >= 0 || IN_SET(fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(fd));
         assert(!isempty(path) || !follow);
         assert(verify_func);
 
@@ -145,6 +145,9 @@ int stat_verify_symlink(const struct stat *st) {
 }
 
 int fd_verify_symlink(int fd) {
+        if (IN_SET(fd, AT_FDCWD, XAT_FDROOT))
+                return -EISDIR;
+
         return verify_stat_at(fd, /* path= */ NULL, /* follow= */ false, stat_verify_symlink, /* verify= */ true);
 }
 
@@ -153,12 +156,12 @@ int is_symlink(const char *path) {
         return verify_stat_at(AT_FDCWD, path, false, stat_verify_symlink, false);
 }
 
-static mode_t mode_verify_socket(mode_t mode) {
-        if (S_ISLNK(mode))
-                return -ELOOP;
-
+static int mode_verify_socket(mode_t mode) {
         if (S_ISDIR(mode))
                 return -EISDIR;
+
+        if (S_ISLNK(mode))
+                return -ELOOP;
 
         if (!S_ISSOCK(mode))
                 return -ENOTSOCK;
@@ -176,6 +179,13 @@ int statx_verify_socket(const struct statx *stx) {
         assert(stx);
 
         return mode_verify_socket(stx->stx_mode);
+}
+
+int fd_verify_socket(int fd) {
+        if (IN_SET(fd, AT_FDCWD, XAT_FDROOT))
+                return -EISDIR;
+
+        return verify_stat_at(fd, /* path= */ NULL, /* follow= */ false, stat_verify_socket, /* verify= */ true);
 }
 
 int is_socket(const char *path) {
@@ -200,14 +210,51 @@ int fd_verify_linked(int fd) {
         return verify_stat_at(fd, NULL, false, stat_verify_linked, true);
 }
 
-int stat_verify_device_node(const struct stat *st) {
+int stat_verify_block(const struct stat *st) {
         assert(st);
+
+        if (S_ISDIR(st->st_mode))
+                return -EISDIR;
 
         if (S_ISLNK(st->st_mode))
                 return -ELOOP;
 
+        if (!S_ISBLK(st->st_mode))
+                return -ENOTBLK;
+
+        return 0;
+}
+
+int fd_verify_block(int fd) {
+        if (IN_SET(fd, AT_FDCWD, XAT_FDROOT))
+                return -EISDIR;
+
+        return verify_stat_at(fd, /* path= */ NULL, /* follow= */ false, stat_verify_block, /* verify= */ true);
+}
+
+int stat_verify_char(const struct stat *st) {
+        assert(st);
+
         if (S_ISDIR(st->st_mode))
                 return -EISDIR;
+
+        if (S_ISLNK(st->st_mode))
+                return -ELOOP;
+
+        if (!S_ISCHR(st->st_mode))
+                return -EBADFD;
+
+        return 0;
+}
+
+int stat_verify_device_node(const struct stat *st) {
+        assert(st);
+
+        if (S_ISDIR(st->st_mode))
+                return -EISDIR;
+
+        if (S_ISLNK(st->st_mode))
+                return -ELOOP;
 
         if (!S_ISBLK(st->st_mode) && !S_ISCHR(st->st_mode))
                 return -ENOTTY;
@@ -218,6 +265,28 @@ int stat_verify_device_node(const struct stat *st) {
 int is_device_node(const char *path) {
         assert(!isempty(path));
         return verify_stat_at(AT_FDCWD, path, false, stat_verify_device_node, false);
+}
+
+int stat_verify_regular_or_block(const struct stat *st) {
+        assert(st);
+
+        if (S_ISDIR(st->st_mode))
+                return -EISDIR;
+
+        if (S_ISLNK(st->st_mode))
+                return -ELOOP;
+
+        if (!S_ISREG(st->st_mode) && !S_ISBLK(st->st_mode))
+                return -EBADFD;
+
+        return 0;
+}
+
+int fd_verify_regular_or_block(int fd) {
+        if (IN_SET(fd, AT_FDCWD, XAT_FDROOT))
+                return -EISDIR;
+
+        return verify_stat_at(fd, /* path= */ NULL, /* follow= */ false, stat_verify_regular_or_block, /* verify= */ true);
 }
 
 int dir_is_empty_at(int dir_fd, const char *path, bool ignore_hidden_or_backup) {
@@ -349,7 +418,7 @@ int xstatx_full(int fd,
          *    STATX_MNT_ID if not.
          */
 
-        assert(fd >= 0 || IN_SET(fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(fd));
         assert((mandatory_mask & optional_mask) == 0);
         assert(!FLAGS_SET(xstatx_flags, XSTATX_MNT_ID_BEST) || !((mandatory_mask|optional_mask) & (STATX_MNT_ID|STATX_MNT_ID_UNIQUE)));
         assert(ret);
@@ -411,7 +480,7 @@ static int xfstatfs(int fd, struct statfs *ret) {
 int xstatfsat(int dir_fd, const char *path, struct statfs *ret) {
         _cleanup_close_ int fd = -EBADF;
 
-        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(ret);
 
         if (!isempty(path)) {
@@ -516,15 +585,17 @@ int inode_same_at(int fda, const char *filea, int fdb, const char *fileb, int fl
 
                         goto fallback;
                 }
-                if (r == 0)
+                bool have_unique_mntid = r > 0;
+
+                if (!have_unique_mntid)
                         mntida = _mntida;
 
                 r = name_to_handle_at_try_fid(
                                 fdb,
                                 fileb,
                                 &hb,
-                                r > 0 ? NULL : &_mntidb, /* if we managed to get unique mnt id for a, insist on that for b */
-                                r > 0 ? &mntidb : NULL,
+                                have_unique_mntid ? NULL : &_mntidb, /* if we managed to get unique mnt id for a, insist on that for b */
+                                have_unique_mntid ? &mntidb : NULL,
                                 ntha_flags);
                 if (r < 0) {
                         if (is_name_to_handle_at_fatal_error(r))
@@ -532,8 +603,10 @@ int inode_same_at(int fda, const char *filea, int fdb, const char *fileb, int fl
 
                         goto fallback;
                 }
-                if (r == 0)
+                if (r == 0) {
+                        assert(!have_unique_mntid); /* _mntidb was initialized by name_to_handle_at_try_fid() */
                         mntidb = _mntidb;
+                }
 
                 /* Now compare the two file handles */
                 if (!file_handle_equal(ha, hb))
@@ -831,4 +904,21 @@ mode_t inode_type_from_string(const char *s) {
                 return S_IFSOCK;
 
         return MODE_INVALID;
+}
+
+int vfs_free_bytes(int fd, uint64_t *ret) {
+        assert(fd >= 0);
+        assert(ret);
+
+        /* Safely returns the current available disk space (for root, i.e. including any space reserved for
+         * root) of the disk referenced by the fd, converted to bytes. */
+
+        struct statvfs sv;
+        if (fstatvfs(fd, &sv) < 0)
+                return -errno;
+
+        if (!MUL_SAFE(ret, (uint64_t) sv.f_frsize, (uint64_t) sv.f_bfree))
+                return -ERANGE;
+
+        return 0;
 }

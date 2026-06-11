@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-subdir('bpf/sysctl-monitor')
-
 systemd_networkd_sources = files(
         'networkd.c'
 )
@@ -45,6 +43,7 @@ systemd_networkd_extract_sources = files(
         'networkd-conf.c',
         'networkd-dhcp-common.c',
         'networkd-dhcp-prefix-delegation.c',
+        'networkd-dhcp-relay.c',
         'networkd-dhcp-server-bus.c',
         'networkd-dhcp-server-static-lease.c',
         'networkd-dhcp-server.c',
@@ -130,9 +129,11 @@ networkctl_sources = files(
         'networkctl-address-label.c',
         'networkctl-config-file.c',
         'networkctl-description.c',
+        'networkctl-dhcp-lease.c',
         'networkctl-dump-util.c',
         'networkctl-journal.c',
         'networkctl-link-info.c',
+        'networkctl-link-info-json.c',
         'networkctl-list.c',
         'networkctl-lldp.c',
         'networkctl-misc.c',
@@ -143,10 +144,6 @@ networkctl_sources = files(
 
 networkd_network_gperf_gperf = files('networkd-network-gperf.gperf')
 networkd_netdev_gperf_gperf = files('netdev/netdev-gperf.gperf')
-
-if conf.get('ENABLE_SYSCTL_BPF') == 1
-        systemd_networkd_extract_sources += sysctl_monitor_skel_h
-endif
 
 networkd_gperf_c = custom_target(
         input : 'networkd-gperf.gperf',
@@ -173,7 +170,7 @@ else
                               libshared_static]
 endif
 
-network_includes = [libsystemd_network_includes, include_directories(['.', 'netdev', 'tc'])]
+network_includes = [include_directories(['.', 'netdev', 'tc']), libsystemd_network_includes]
 
 network_test_template = test_template + {
         'conditions' : ['ENABLE_NETWORKD'],
@@ -192,7 +189,6 @@ network_fuzz_template = fuzz_template + {
                 libsystemd_network,
         ],
         'objects' : ['systemd-networkd'],
-        'dependencies' : threads,
         'include_directories' : network_includes,
 }
 
@@ -208,7 +204,9 @@ executables += [
                         libsystemd_network,
                         networkd_link_with,
                 ],
-                'dependencies' : threads,
+                'bpf_programs': [
+                        'sysctl-monitor',
+                ]
         },
         libexec_template + {
                 'name' : 'systemd-networkd-wait-online',
@@ -241,11 +239,9 @@ executables += [
         },
         network_test_template + {
                 'sources' : files('test-network-tables.c'),
-                'dependencies' : threads,
         },
         network_test_template + {
                 'sources' : files('test-network.c'),
-                'dependencies' : threads,
         },
         network_test_template + {
                 'sources' : files('test-networkd-address.c'),
@@ -257,6 +253,12 @@ executables += [
         },
         network_test_template + {
                 'sources' : files('test-networkd-util.c'),
+        },
+        test_template + {
+                'sources' : files('test-modem-manager-mock.c'),
+                'conditions' : ['ENABLE_NETWORKD'],
+                'link_with' : [libshared],
+                'type' : 'manual',
         },
         network_fuzz_template + {
                 'sources' : files('fuzz-netdev-parser.c'),
