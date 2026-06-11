@@ -4,14 +4,15 @@
 #include <sys/uio.h>                /* IWYU pragma: export */
 
 #include "basic-forward.h"
-#include "iovec-util-fundamental.h" /* IWYU pragma: export */
+
+#include "../fundamental/iovec-util.h" /* IWYU pragma: export */
 
 extern const struct iovec iovec_nul_byte; /* Points to a single NUL byte */
 extern const struct iovec iovec_empty;    /* Points to an empty, but valid (i.e. non-NULL) pointer */
 
 size_t iovec_total_size(const struct iovec *iovec, size_t n) _nonnull_if_nonzero_(1, 2);
 
-bool iovec_increment(struct iovec *iovec, size_t n, size_t k) _nonnull_if_nonzero_(1, 2);
+bool iovec_inc_many(struct iovec *iovec, size_t n, size_t k) _nonnull_if_nonzero_(1, 2);
 
 struct iovec* iovec_make_string(struct iovec *iovec, const char *s);
 
@@ -38,7 +39,11 @@ char* set_iovec_string_field_free(struct iovec *iovec, size_t *n_iovec, const ch
 void iovec_array_free(struct iovec *iovec, size_t n_iovec) _nonnull_if_nonzero_(1, 2);
 
 int iovec_memcmp(const struct iovec *a, const struct iovec *b) _pure_;
+static inline bool iovec_equal(const struct iovec *a, const struct iovec *b) {
+        return iovec_memcmp(a, b) == 0;
+}
 
 struct iovec* iovec_memdup(const struct iovec *source, struct iovec *ret);
+int iovec_done_and_memdup(struct iovec *iovec, const struct iovec *source);
 
 struct iovec* iovec_append(struct iovec *iovec, const struct iovec *append);

@@ -50,7 +50,7 @@ static int help(void) {
         if (r < 0)
                 return r;
 
-        (void) table_sync_column_width(options, 0, verbs, 0);
+        (void) table_sync_column_widths(0, options, verbs);
 
         printf("%s [OPTIONS...] COMMAND\n"
                "\n%sMark the boot process as good or bad.%s\n"
@@ -58,10 +58,14 @@ static int help(void) {
                program_invocation_short_name,
                ansi_highlight(),
                ansi_normal());
-        table_print(verbs, stdout);
+        r = table_print_or_warn(verbs);
+        if (r < 0)
+                return r;
 
         printf("\nOptions:\n");
-        table_print(options, stdout);
+        r = table_print_or_warn(options);
+        if (r < 0)
+                return r;
 
         printf("\nSee the %s for details.\n", link);
         return 0;
@@ -75,10 +79,9 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
 
-        OptionParser state = {};
-        const char *arg;
+        OptionParser opts = { argc, argv };
 
-        FOREACH_OPTION(&state, c, argc, argv, &arg, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
                         return help();
@@ -87,13 +90,13 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         return version();
 
                 OPTION_LONG("path", "PATH", "Path to the $BOOT partition (may be used multiple times)"):
-                        r = strv_extend(&arg_path, arg);
+                        r = strv_extend(&arg_path, opts.arg);
                         if (r < 0)
                                 return log_oom();
                         break;
                 }
 
-        *ret_args = option_parser_get_args(&state, argc, argv);
+        *ret_args = option_parser_get_args(&opts);
         return 1;
 }
 
@@ -111,6 +114,7 @@ static int acquire_path(void) {
                         /* path= */ NULL,
                         /* unprivileged_mode= */ false,
                         &esp_path,
+                        /* ret_fd= */ NULL,
                         /* ret_part= */ NULL,
                         /* ret_pstart= */ NULL,
                         /* ret_psize= */ NULL,
@@ -124,6 +128,7 @@ static int acquire_path(void) {
                         /* path= */ NULL,
                         /* unprivileged_mode= */ false,
                         &xbootldr_path,
+                        /* ret_fd= */ NULL,
                         /* ret_uuid= */ NULL,
                         &xbootldr_devid);
         if (r < 0 && r != -ENOKEY)
@@ -334,7 +339,7 @@ static int make_bad(const char *prefix, uint64_t done, const char *suffix, char 
         return 0;
 }
 
-VERB(verb_status, "status", NULL, VERB_ANY, 1, VERB_DEFAULT, "Show status of current boot loader entry");
+VERB_DEFAULT_NOARG(verb_status, "status", "Show status of current boot loader entry");
 static int verb_status(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_free_ char *path = NULL, *prefix = NULL, *suffix = NULL, *good = NULL, *bad = NULL;
         uint64_t left, done;
@@ -575,7 +580,7 @@ static int run(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
                                        "Marking a boot is only supported on EFI systems.");
 
-        return dispatch_verb_with_args(args, NULL);
+        return dispatch_verb(args, NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);
