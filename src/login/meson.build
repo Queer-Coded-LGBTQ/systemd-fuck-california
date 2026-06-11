@@ -21,6 +21,7 @@ systemd_logind_extract_sources = files(
         'logind-session-dbus.c',
         'logind-session-device.c',
         'logind-session.c',
+        'logind-shutdown.c',
         'logind-user-dbus.c',
         'logind-user.c',
         'logind-utmp.c',
@@ -47,9 +48,6 @@ executables += [
                 'dbus' : true,
                 'sources' : systemd_logind_sources,
                 'extract' : systemd_logind_extract_sources,
-                'dependencies' : [
-                        threads,
-                ],
         },
         executable_template + {
                 'name' : 'loginctl',
@@ -59,7 +57,6 @@ executables += [
                         liblz4_cflags,
                         libxz_cflags,
                         libzstd_cflags,
-                        threads,
                 ],
         },
         executable_template + {
@@ -78,7 +75,6 @@ executables += [
         test_template + {
                 'sources' : files('test-login-tables.c'),
                 'objects' : ['systemd-logind'],
-                'dependencies' : threads,
         },
         test_template + {
                 'sources' : files('test-session-properties.c'),

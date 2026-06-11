@@ -142,6 +142,7 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
                 { "vSockCid",            _SD_JSON_VARIANT_TYPE_INVALID, machine_cid,              offsetof(Machine, vsock_cid),            0                 },
                 { "sshAddress",          SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,  offsetof(Machine, ssh_address),          SD_JSON_STRICT    },
                 { "sshPrivateKeyPath",   SD_JSON_VARIANT_STRING,        json_dispatch_path,       offsetof(Machine, ssh_private_key_path), 0                 },
+                { "controlAddress",      SD_JSON_VARIANT_STRING,        json_dispatch_path,       offsetof(Machine, control_address),      SD_JSON_STRICT    },
                 { "allocateUnit",        SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool, offsetof(Machine, allocate_unit),        0                 },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
@@ -155,7 +156,7 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
         if (r != 0)
                 return r;
 
-        if (!IN_SET(machine->class, MACHINE_CONTAINER, MACHINE_VM))
+        if (!MACHINE_CLASS_CAN_REGISTER(machine->class))
                 return sd_varlink_error_invalid_parameter_name(link, "class");
 
         if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
@@ -192,8 +193,10 @@ int vl_method_register(sd_varlink *link, sd_json_variant *parameters, sd_varlink
         if (r < 0)
                 return r;
 
-        /* Ensure an unprivileged user cannot claim any process they don't control as their own machine */
-        if (machine->uid != 0) {
+        /* In system scope, ensure an unprivileged user cannot claim any process they don't
+         * control as their own machine. In user scope the varlink socket is already
+         * protected by $XDG_RUNTIME_DIR permissions. */
+        if (manager->runtime_scope != RUNTIME_SCOPE_USER && machine->uid != 0) {
                 r = process_is_owned_by_uid(&machine->leader, machine->uid);
                 if (r < 0)
                         return r;
@@ -358,10 +361,12 @@ int vl_method_terminate_internal(sd_varlink *link, sd_json_variant *parameters, 
         return sd_varlink_reply(link, NULL);
 }
 
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_kill_whom, KillWhom, kill_whom_from_string);
+
 typedef struct MachineKillParameters {
         const char *name;
         PidRef pidref;
-        const char *swhom;
+        KillWhom whom;
         int32_t signo;
 } MachineKillParameters;
 
@@ -374,7 +379,7 @@ static void machine_kill_paramaters_done(MachineKillParameters *p) {
 int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         static const sd_json_dispatch_field dispatch_table[] = {
                 VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineKillParameters),
-                { "whom",   SD_JSON_VARIANT_STRING,         sd_json_dispatch_const_string, offsetof(MachineKillParameters, swhom), 0                 },
+                { "whom",   SD_JSON_VARIANT_STRING,         dispatch_kill_whom,            offsetof(MachineKillParameters, whom),  0                 },
                 { "signal", _SD_JSON_VARIANT_TYPE_INVALID , sd_json_dispatch_signal,       offsetof(MachineKillParameters, signo), SD_JSON_MANDATORY },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
@@ -383,8 +388,8 @@ int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
         Manager *manager = ASSERT_PTR(userdata);
         _cleanup_(machine_kill_paramaters_done) MachineKillParameters p = {
                 .pidref = PIDREF_NULL,
+                .whom = _KILL_WHOM_INVALID,
         };
-        KillWhom whom;
         int r;
 
         assert(link);
@@ -401,13 +406,7 @@ int vl_method_kill(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
         if (r < 0)
                 return r;
 
-        if (isempty(p.swhom))
-                whom = KILL_ALL;
-        else {
-                whom = kill_whom_from_string(p.swhom);
-                if (whom < 0)
-                        return sd_varlink_error_invalid_parameter_name(link, "whom");
-        }
+        KillWhom whom = p.whom >= 0 ? p.whom : KILL_ALL;
 
         if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
                 r = varlink_verify_polkit_async_full(
@@ -555,14 +554,15 @@ int vl_method_open(sd_varlink *link, sd_json_variant *parameters, sd_varlink_met
                 return r;
 
         if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
-                /* Ensure only root can shell into the root namespace, unless it's specifically the host machine,
-                 * which is owned by uid 0 anyway and cannot be self-registered. This is to avoid unprivileged
-                 * users registering a process they own in the root user namespace, and then shelling in as root
+                /* Ensure only root can shell into the root namespace. This is to avoid unprivileged users
+                 * registering a process they own in the root user namespace, and then shelling in as root
                  * or another user. Note that the shell operation is privileged and requires 'auth_admin', so we
-                 * do not need to check the caller's uid, as that will be checked by polkit, and if they machine's
+                 * do not need to check the caller's uid, as that will be checked by polkit, and if the machine's
                  * and the caller's do not match, authorization will be required. It's only the case where the
                  * caller owns the machine that will be shortcut and needs to be checked here. */
-                if (machine->uid != 0 && machine->class != MACHINE_HOST) {
+                if (machine->uid != 0) {
+                        assert(machine->class != MACHINE_HOST);
+
                         r = pidref_in_same_namespace(&PIDREF_MAKE_FROM_PID(1), &machine->leader, NAMESPACE_USER);
                         if (r < 0)
                                 return log_debug_errno(
@@ -821,10 +821,10 @@ static void machine_mount_paramaters_done(MachineMountParameters *p) {
 int vl_method_bind_mount(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
         static const sd_json_dispatch_field dispatch_table[] = {
                 VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineMountParameters),
-                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, src),       SD_JSON_MANDATORY },
-                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, dest),      0                 },
-                { "readOnly",    SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, read_only), 0                 },
-                { "mkdir",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, mkdir),     0                 },
+                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, src),       SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineMountParameters, dest),      SD_JSON_STRICT                   },
+                { "readOnly",    SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, read_only), 0                                },
+                { "mkdir",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineMountParameters, mkdir),     0                                },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
         };
@@ -844,7 +844,7 @@ int vl_method_bind_mount(sd_varlink *link, sd_json_variant *parameters, sd_varli
         if (r != 0)
                 return r;
 
-        /* There is no need for extra validation since json_dispatch_const_path() does path_is_valid() and path_is_absolute(). */
+        /* There is no need for extra validation since json_dispatch_const_path() with SD_JSON_STRICT does path_is_normalized() and path_is_absolute(). */
         const char *dest = p.dest ?: p.src;
 
         Machine *machine;
@@ -931,9 +931,9 @@ static int copy_done(Operation *operation, int ret, sd_bus_error *error) {
 int vl_method_copy_internal(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata, bool copy_from) {
         static const sd_json_dispatch_field dispatch_table[] = {
                 VARLINK_DISPATCH_MACHINE_LOOKUP_FIELDS(MachineCopyParameters),
-                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, src),     SD_JSON_MANDATORY },
-                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, dest),    0                 },
-                { "replace",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineCopyParameters, replace), 0                 },
+                { "source",      SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, src),     SD_JSON_MANDATORY|SD_JSON_STRICT },
+                { "destination", SD_JSON_VARIANT_STRING,  json_dispatch_const_path, offsetof(MachineCopyParameters, dest),    SD_JSON_STRICT                   },
+                { "replace",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool, offsetof(MachineCopyParameters, replace), 0                                },
                 VARLINK_DISPATCH_POLKIT_FIELD,
                 {}
         };
@@ -954,7 +954,7 @@ int vl_method_copy_internal(sd_varlink *link, sd_json_variant *parameters, sd_va
         if (r != 0)
                 return r;
 
-        /* There is no need for extra validation since json_dispatch_const_path() does path_is_valid() and path_is_absolute(). */
+        /* There is no need for extra validation since json_dispatch_const_path() with SD_JSON_STRICT does path_is_normalized() and path_is_absolute(). */
         const char *dest = p.dest ?: p.src;
         const char *container_path = copy_from ? p.src : dest;
         const char *host_path = copy_from ? dest : p.src;

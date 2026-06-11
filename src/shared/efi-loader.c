@@ -8,6 +8,7 @@
 #include "log.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "proc-cmdline.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -312,6 +313,30 @@ int efi_measured_uki(int log_level) {
 #endif
 }
 
+int efi_measured_os(int log_level) {
+#if ENABLE_EFI
+        static int cached = -1;
+        int r;
+
+        /* Returns if we shall enable our measurement machinery */
+
+        if (cached >= 0)
+                return cached;
+
+        bool b;
+        r = proc_cmdline_get_bool("systemd.tpm2_measured_os", /* flags= */ 0, &b);
+        if (r < 0)
+                log_debug_errno(r, "Failed to parse systemd.tpm2_measured_os= kernel command line argument, ignoring: %m");
+        else if (r > 0)
+                return (cached = b);
+
+        /* If nothing is explicitly configured, just assume that if we booted with a measured UKI we also want a measured OS */
+        return (cached = efi_measured_uki(log_level));
+#else
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP), "Compiled without support for EFI");
+#endif
+}
+
 int efi_loader_get_config_timeout_one_shot(usec_t *ret) {
 #if ENABLE_EFI
         _cleanup_free_ char *v = NULL;
@@ -407,4 +432,15 @@ bool efi_loader_entry_name_valid(const char *s) {
                 return false;
 
         return in_charset(s, ALPHANUMERICAL "+-_.@");
+}
+
+bool efi_loader_entry_title_valid(const char *s) {
+        return string_is_safe(s, /* flags= */ 0);
+}
+
+bool efi_loader_entry_resource_filename_valid(const char *s) {
+        /* Validates file names so that they are safe for their inclusion in boot loader type #1
+         * entries. i.e. may not contain CCs, and should be ASCII */
+
+        return string_is_safe(s, STRING_ASCII|STRING_FILENAME);
 }

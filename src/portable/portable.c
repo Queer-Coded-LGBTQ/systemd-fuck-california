@@ -137,6 +137,9 @@ PortableMetadata *portable_metadata_unref(PortableMetadata *i) {
 }
 
 static int compare_metadata(PortableMetadata *const *x, PortableMetadata *const *y) {
+        assert(x);
+        assert(y);
+
         return strcmp((*x)->name, (*y)->name);
 }
 
@@ -145,6 +148,8 @@ int portable_metadata_hashmap_to_sorted_array(Hashmap *unit_files, PortableMetad
         _cleanup_free_ PortableMetadata **sorted = NULL;
         PortableMetadata *item;
         size_t k = 0;
+
+        assert(ret);
 
         sorted = new(PortableMetadata*, hashmap_size(unit_files));
         if (!sorted)
@@ -358,7 +363,7 @@ static int extract_now(
                 _cleanup_free_ char *relative = NULL, *resolved = NULL;
                 _cleanup_closedir_ DIR *d = NULL;
 
-                r = chase_and_opendirat(rfd, *i, CHASE_AT_RESOLVE_IN_ROOT, &relative, &d);
+                r = chase_and_opendirat(rfd, rfd, *i, /* chase_flags= */ 0, &relative, &d);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to open unit path '%s', ignoring: %m", *i);
                         continue;
@@ -519,7 +524,7 @@ static int portable_extract_by_path(
                                 seq[0] = safe_close(seq[0]);
                                 errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
 
-                                if (setns(CLONE_NEWUSER, userns_fd) < 0) {
+                                if (setns(userns_fd, CLONE_NEWUSER) < 0) {
                                         r = log_debug_errno(errno, "Failed to join userns: %m");
                                         report_errno_and_exit(errno_pipe_fd[1], r);
                                 }
@@ -605,8 +610,8 @@ static int portable_extract_by_path(
                  * there, and extract the metadata we need. The metadata is sent from the child back to us. */
 
                 /* Load some libraries before we fork workers off that want to use them */
-                (void) dlopen_cryptsetup();
-                (void) dlopen_libmount();
+                (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
+                (void) DLOPEN_LIBMOUNT(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
 
                 r = mkdtemp_malloc("/tmp/inspect-XXXXXX", &tmpdir);
                 if (r < 0)
@@ -1266,18 +1271,13 @@ static int portable_changes_add_with_prefix(
         return portable_changes_add(changes, n_changes, type_or_errno, path, source);
 }
 
-void portable_changes_free(PortableChange *changes, size_t n_changes) {
-        size_t i;
-
-        assert(changes || n_changes == 0);
-
-        for (i = 0; i < n_changes; i++) {
-                free(changes[i].path);
-                free(changes[i].source);
-        }
-
-        free(changes);
+static void portable_change_done(PortableChange *change) {
+        assert(change);
+        change->path = mfree(change->path);
+        change->source = mfree(change->source);
 }
+
+DEFINE_ARRAY_FREE_FUNC(portable_changes_free, PortableChange, portable_change_done);
 
 static const char *root_setting_from_image(ImageType type) {
         switch (type) {
@@ -2431,7 +2431,7 @@ int portable_detach(
                         portable_changes_add_with_prefix(changes, n_changes, PORTABLE_UNLINK, where, md, NULL);
         }
 
-        /* Now, also drop any image symlink or copy, for images outside of the sarch path */
+        /* Now, also drop any image symlink or copy, for images outside of the search path */
         SET_FOREACH(item, markers) {
                 _cleanup_free_ char *target = NULL;
 
