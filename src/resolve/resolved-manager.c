@@ -369,7 +369,7 @@ static int manager_network_monitor_listen(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_event_source_set_priority(m->network_event_source, SD_EVENT_PRIORITY_IMPORTANT+5);
+        r = sd_event_source_set_priority(m->network_event_source, SD_EVENT_PRIORITY_IMPORTANT-5);
         if (r < 0)
                 return r;
 
@@ -641,6 +641,8 @@ static void manager_set_defaults(Manager *m) {
         m->read_static_records = true;
         m->resolve_unicast_single_label = false;
         m->cache_from_localhost = false;
+        for (DnsProtocol p = 0; p < _DNS_PROTOCOL_MAX; p++)
+                m->cache_max[p] = DEFAULT_CACHE_MAX;
         m->stale_retention_usec = 0;
         m->refuse_record_types = set_free(m->refuse_record_types);
         m->resolv_conf_stat = (struct stat) {};
@@ -663,6 +665,9 @@ static int manager_dispatch_reload_signal(sd_event_source *s, const struct signa
         dns_trust_anchor_flush(&m->trust_anchor);
         manager_etc_hosts_flush(m);
         manager_static_records_flush(m);
+
+        m->etc_hosts_last = USEC_INFINITY;
+        m->static_records_last = USEC_INFINITY;
 
         manager_set_defaults(m);
 
@@ -1461,6 +1466,8 @@ static int manager_next_random_name(const char *old, char **ret_new) {
         uint64_t u, a;
         char *n;
 
+        assert(ret_new);
+
         p = strchr(old, 0);
         assert(p);
 
@@ -2151,9 +2158,9 @@ static int dns_configuration_json_append(
                         JSON_BUILD_PAIR_CONDITION_BOOLEAN(dnssec_mode >= 0, "dnssecSupported", dnssec_supported),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("dnssec", dnssec_mode_to_string(dnssec_mode)),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("dnsOverTLS", dns_over_tls_mode_to_string(dns_over_tls_mode)),
-                        JSON_BUILD_PAIR_STRING_NON_EMPTY("llmnr", resolve_support_to_string(llmnr_support)),
-                        JSON_BUILD_PAIR_STRING_NON_EMPTY("mDNS", resolve_support_to_string(mdns_support)),
-                        JSON_BUILD_PAIR_STRING_NON_EMPTY("resolvConfMode", resolv_conf_mode_to_string(resolv_conf_mode)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY_UNDERSCORIFY("llmnr", resolve_support_to_string(llmnr_support)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY_UNDERSCORIFY("mDNS", resolve_support_to_string(mdns_support)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY_UNDERSCORIFY("resolvConfMode", resolv_conf_mode_to_string(resolv_conf_mode)),
                         JSON_BUILD_PAIR_VARIANT_NON_NULL("scopes", scopes_json));
 }
 
@@ -2330,7 +2337,7 @@ int manager_send_dns_configuration_changed(Manager *m, Link *l, bool reset) {
         if (sd_json_variant_equal(configuration, m->dns_configuration_json))
                 return 0;
 
-        JSON_VARIANT_REPLACE(m->dns_configuration_json, TAKE_PTR(configuration));
+        json_variant_unref_and_replace(m->dns_configuration_json, configuration);
 
         r = varlink_many_notify(m->varlink_dns_configuration_subscription, m->dns_configuration_json);
         if (r < 0)

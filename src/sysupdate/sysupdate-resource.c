@@ -139,9 +139,11 @@ static int resource_load_from_directory_recursive(
                 if ((stripped = startswith(de->d_name, ".sysupdate.partial."))) {
                         de_d_name_stripped = stripped;
                         is_partial = true;
+                        is_pending = false;
                 } else if ((stripped = startswith(de->d_name, ".sysupdate.pending."))) {
                         de_d_name_stripped = stripped;
                         is_pending = true;
+                        is_partial = false;
                 } else
                         de_d_name_stripped = de->d_name;
 
@@ -192,6 +194,9 @@ static int resource_load_from_directory_recursive(
                 if (instance->metadata.mode == MODE_INVALID)
                         instance->metadata.mode = st.st_mode & 0775; /* mask out world-writability and suid and stuff, for safety */
 
+                /* Can’t be both partial and pending. */
+                assert(!(is_partial && is_pending));
+
                 instance->is_partial = is_partial;
                 instance->is_pending = is_pending;
         }
@@ -229,18 +234,22 @@ static int resource_load_from_blockdev(Resource *rr) {
 
         assert(rr);
 
+        r = DLOPEN_FDISK(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
+        if (r < 0)
+                return r;
+
         r = fdisk_new_context_at(AT_FDCWD, rr->path, /* read_only= */ true, /* sector_size= */ UINT32_MAX, &c);
         if (r < 0)
                 return log_error_errno(r, "Failed to create fdisk context from '%s': %m", rr->path);
 
-        if (!fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
+        if (!sym_fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
                 return log_error_errno(SYNTHETIC_ERRNO(EHWPOISON), "Disk %s has no GPT disk label, not suitable.", rr->path);
 
-        r = fdisk_get_partitions(c, &t);
+        r = sym_fdisk_get_partitions(c, &t);
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire partition table: %m");
 
-        n_partitions = fdisk_table_get_nents(t);
+        n_partitions = sym_fdisk_table_get_nents(t);
         for (size_t i = 0; i < n_partitions; i++)  {
                 _cleanup_(instance_metadata_destroy) InstanceMetadata extracted_fields = INSTANCE_METADATA_NULL;
                 _cleanup_(partition_info_destroy) PartitionInfo pinfo = PARTITION_INFO_NULL;
@@ -308,6 +317,9 @@ static int resource_load_from_blockdev(Resource *rr) {
 
                 if (instance->metadata.read_only < 0)
                         instance->metadata.read_only = instance->partition_info.read_only;
+
+                /* Can’t be both partial and pending. */
+                assert(!(is_partial && is_pending));
 
                 instance->is_partial = is_partial;
                 instance->is_pending = is_pending;
@@ -430,7 +442,7 @@ static int process_magic_file(
         /* Even if we ignore if people have non-empty files for this file, let's nonetheless warn about it,
          * so that people fix it. After all we want to retain liberty to maybe one day place some useful data
          * inside it */
-        if (iovec_memcmp(&IOVEC_MAKE(expected_hash, sizeof(expected_hash)), hash) != 0)
+        if (!iovec_equal(&IOVEC_MAKE(expected_hash, sizeof(expected_hash)), hash))
                 log_warning("Hash of best before marker file '%s' has unexpected value, proceeding anyway.", fn);
 
         struct tm parsed_tm = {};
@@ -491,6 +503,7 @@ static int resource_load_from_web(
         int r;
 
         assert(rr);
+        POINTER_MAY_BE_NULL(web_cache);
 
         ci = web_cache ? web_cache_get_item(*web_cache, rr->path, verify) : NULL;
         if (ci) {
@@ -852,9 +865,9 @@ int resource_resolve_path(
                 } else { /* boot, esp, or xbootldr */
                         r = 0;
                         if (IN_SET(rr->path_relative_to, PATH_RELATIVE_TO_BOOT, PATH_RELATIVE_TO_XBOOTLDR))
-                                r = find_xbootldr_and_warn(root, /* path= */ NULL, /* unprivileged_mode= */ -1, &relative_to);
+                                r = find_xbootldr_and_warn(root, /* path= */ NULL, /* unprivileged_mode= */ -1, &relative_to, /* ret_fd= */ NULL);
                         if (r == -ENOKEY || rr->path_relative_to == PATH_RELATIVE_TO_ESP)
-                                r = find_esp_and_warn(root, /* path= */ NULL, /* unprivileged_mode= */ -1, &relative_to);
+                                r = find_esp_and_warn(root, /* path= */ NULL, /* unprivileged_mode= */ -1, &relative_to, /* ret_fd= */ NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to resolve $BOOT: %m");
                         log_debug("Resolved $BOOT to '%s'", relative_to);

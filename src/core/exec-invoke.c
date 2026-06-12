@@ -21,7 +21,7 @@
 #include "ask-password-api.h"
 #include "barrier.h"
 #include "bitfield.h"
-#include "bpf-dlopen.h"
+#include "bpf-util.h"
 #include "bpf-restrict-fs.h"
 #include "btrfs-util.h"
 #include "capability-util.h"
@@ -53,7 +53,7 @@
 #include "libmount-util.h"
 #include "manager.h"
 #include "memfd-util.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "mstack.h"
@@ -877,51 +877,6 @@ restore_stdio:
         return r;
 }
 
-static int get_fixed_user(
-                const char *user_or_uid,
-                bool prefer_nss,
-                const char **ret_username,
-                uid_t *ret_uid,
-                gid_t *ret_gid,
-                const char **ret_home,
-                const char **ret_shell) {
-
-        int r;
-
-        assert(user_or_uid);
-        assert(ret_username);
-
-        r = get_user_creds(&user_or_uid, ret_uid, ret_gid, ret_home, ret_shell,
-                           USER_CREDS_CLEAN|(prefer_nss ? USER_CREDS_PREFER_NSS : 0));
-        if (r < 0)
-                return r;
-
-        /* user_or_uid is normalized by get_user_creds to username */
-        *ret_username = user_or_uid;
-
-        return 0;
-}
-
-static int get_fixed_group(
-                const char *group_or_gid,
-                const char **ret_groupname,
-                gid_t *ret_gid) {
-
-        int r;
-
-        assert(group_or_gid);
-        assert(ret_groupname);
-
-        r = get_group_creds(&group_or_gid, ret_gid, /* flags= */ 0);
-        if (r < 0)
-                return r;
-
-        /* group_or_gid is normalized by get_group_creds to groupname */
-        *ret_groupname = group_or_gid;
-
-        return 0;
-}
-
 static int get_supplementary_groups(
                 const ExecContext *c,
                 const char *user,
@@ -989,8 +944,7 @@ static int get_supplementary_groups(
                 if (k >= ngroups_max)
                         return -E2BIG;
 
-                const char *g = *i;
-                r = get_group_creds(&g, l_gids + k, /* flags= */ 0);
+                r = get_group_creds(*i, /* flags= */ 0, /* ret_name= */ NULL, l_gids + k);
                 if (r < 0)
                         return r;
 
@@ -1086,14 +1040,11 @@ static int enforce_user(
 
 #if HAVE_PAM
 
-static void pam_response_free_array(struct pam_response *responses, size_t n_responses) {
-        assert(responses || n_responses == 0);
-
-        FOREACH_ARRAY(resp, responses, n_responses)
-                erase_and_free(resp->resp);
-
-        free(responses);
+static void pam_response_done(struct pam_response *response) {
+        erase_and_free(ASSERT_PTR(response)->resp);
 }
+
+static DEFINE_ARRAY_FREE_FUNC(pam_response_free_array, struct pam_response, pam_response_done);
 
 typedef struct AskPasswordConvData {
         const ExecContext *context;
@@ -1362,9 +1313,9 @@ static int setup_pam(
          * parent process will exec() the actual daemon. We do things this way to ensure that the main PID of
          * the daemon is the one we initially fork()ed. */
 
-        r = dlopen_libpam();
+        r = DLOPEN_LIBPAM(LOG_ERR, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
         if (r < 0)
-                return log_error_errno(r, "PAM support not available: %m");
+                return r;
 
         r = barrier_create(&barrier);
         if (r < 0)
@@ -1628,7 +1579,7 @@ static bool seccomp_allows_drop_privileges(const ExecContext *c) {
         assert(c);
 
         /* No libseccomp, all is fine */
-        if (dlopen_libseccomp() < 0)
+        if (DLOPEN_LIBSECCOMP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED) < 0)
                 return true;
 
         /* No syscall filter, we are allowed to drop privileges */
@@ -1687,8 +1638,16 @@ static int apply_syscall_filter(const ExecContext *c, const ExecParameters *p) {
                 action = negative_action;
         }
 
-        /* Sending over exec_fd or handoff_timestamp_fd requires write() syscall. */
+        /* Sending over exec_fd or handoff_timestamp_fd requires write() syscall.
+         *
+         * Note: this mutates c->syscall_filter despite the 'const ExecContext *c' qualifier.
+         * That is intentional and safe here because apply_syscall_filter() runs only in the
+         * post-fork child, which holds a private copy of the address space; the hashmap
+         * change is never visible to the manager process. */
         if (p->exec_fd >= 0 || p->handoff_timestamp_fd >= 0) {
+                if (c->syscall_allow_list)
+                        log_debug("SystemCallFilter= allow-list in effect; adding 'write' syscall required for exec handoff.");
+
                 r = seccomp_filter_set_add_by_name(c->syscall_filter, c->syscall_allow_list, "write");
                 if (r < 0)
                         return r;
@@ -1930,7 +1889,7 @@ static int apply_restrict_filesystems(const ExecContext *c, const ExecParameters
         }
 
         /* We are in a new binary, so dl-open again */
-        r = dlopen_bpf();
+        r = DLOPEN_BPF(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
         if (r < 0)
                 return r;
 
@@ -2034,11 +1993,12 @@ static int build_environment(
                 const char *shell,
                 dev_t journal_stream_dev,
                 ino_t journal_stream_ino,
-                const char *memory_pressure_path,
+                char *const *pressure_path,
                 bool needs_sandboxing,
                 char ***ret) {
 
         _cleanup_strv_free_ char **e = NULL;
+        _cleanup_free_ char *_username = NULL, *_home = NULL, *_shell = NULL;
         size_t n = 0;
         pid_t exec_pid;
         int r;
@@ -2103,12 +2063,16 @@ static int build_environment(
         if (!username && !c->dynamic_user && p->runtime_scope == RUNTIME_SCOPE_SYSTEM) {
                 assert(!c->user);
 
-                r = get_fixed_user("root", /* prefer_nss= */ false, &username, NULL, NULL, &home, &shell);
+                r = get_user_creds("root", USER_CREDS_CLEAN, &_username, NULL, NULL, &_home, &_shell);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to determine credentials for user root: %s",
                                         STRERROR_USER(r));
                         return ERRNO_IS_NEG_BAD_ACCOUNT(r) ? -EINVAL : r;  /* Suppress confusing errno */
                 }
+
+                username = _username;
+                home = _home;
+                shell = _shell;
         }
 
         bool set_user_login_env = exec_context_get_set_login_environment(c);
@@ -2215,25 +2179,38 @@ static int build_environment(
         if (r < 0)
                 return r;
 
-        if (memory_pressure_path) {
-                r = strv_extend_joined_with_size(&e, &n, "MEMORY_PRESSURE_WATCH=", memory_pressure_path);
+        for (PressureResource t = 0; t < _PRESSURE_RESOURCE_MAX; t++) {
+                if (!pressure_path[t])
+                        continue;
+
+                const PressureResourceInfo *info = pressure_resource_get_info(t);
+
+                _cleanup_free_ char *env_watch = strjoin(info->env_watch, "=");
+                if (!env_watch)
+                        return -ENOMEM;
+
+                r = strv_extend_joined_with_size(&e, &n, env_watch, pressure_path[t]);
                 if (r < 0)
                         return r;
 
-                if (!path_equal(memory_pressure_path, "/dev/null")) {
+                if (!path_equal(pressure_path[t], "/dev/null")) {
                         _cleanup_free_ char *b = NULL, *x = NULL;
 
                         if (asprintf(&b, "%s " USEC_FMT " " USEC_FMT,
-                                     MEMORY_PRESSURE_DEFAULT_TYPE,
-                                     cgroup_context->memory_pressure_threshold_usec == USEC_INFINITY ? MEMORY_PRESSURE_DEFAULT_THRESHOLD_USEC :
-                                     CLAMP(cgroup_context->memory_pressure_threshold_usec, 1U, MEMORY_PRESSURE_DEFAULT_WINDOW_USEC),
-                                     MEMORY_PRESSURE_DEFAULT_WINDOW_USEC) < 0)
+                                     PRESSURE_DEFAULT_TYPE,
+                                     cgroup_context->pressure[t].threshold_usec == USEC_INFINITY ? PRESSURE_DEFAULT_THRESHOLD_USEC :
+                                     CLAMP(cgroup_context->pressure[t].threshold_usec, 1U, PRESSURE_DEFAULT_WINDOW_USEC),
+                                     PRESSURE_DEFAULT_WINDOW_USEC) < 0)
                                 return -ENOMEM;
 
                         if (base64mem(b, strlen(b) + 1, &x) < 0)
                                 return -ENOMEM;
 
-                        r = strv_extend_joined_with_size(&e, &n, "MEMORY_PRESSURE_WRITE=", x);
+                        _cleanup_free_ char *env_write = strjoin(info->env_write, "=");
+                        if (!env_write)
+                                return -ENOMEM;
+
+                        r = strv_extend_joined_with_size(&e, &n, env_write, x);
                         if (r < 0)
                                 return r;
                 }
@@ -2752,7 +2729,7 @@ static int create_many_symlinks(const char *root, const char *source, char **sym
         return 0;
 }
 
-static int set_exec_storage_quota(int fd, uint32_t proj_id, const QuotaLimit *ql) {
+static int set_exec_storage_quota(int fd, uint32_t proj_id, const ExecQuotaLimit *ql) {
         int r;
         uint64_t block_limit = 0, inode_limit = 0;
 
@@ -2842,7 +2819,7 @@ static int apply_exec_quotas(
                 const char *target_dir,
                 const char *cgroup_path,
                 ExecDirectoryType type,
-                const QuotaLimit *ql,
+                const ExecQuotaLimit *ql,
                 uint32_t *exec_dt_proj_id, /* in/out */
                 bool *already_enforced) {  /* in/out */
 
@@ -3855,7 +3832,7 @@ static int apply_mount_namespace(
                 const ExecParameters *params,
                 const ExecRuntime *runtime,
                 const PinnedResource *rootfs,
-                const char *memory_pressure_path,
+                char *const *pressure_path,
                 bool needs_sandboxing,
                 uid_t exec_directory_uid,
                 gid_t exec_directory_gid,
@@ -3887,16 +3864,28 @@ static int apply_mount_namespace(
         if (r < 0)
                 return r;
 
-        /* We need to make the pressure path writable even if /sys/fs/cgroups is made read-only, as the
-         * service will need to write to it in order to start the notifications. */
-        if (exec_is_cgroup_mount_read_only(context) && memory_pressure_path && !streq(memory_pressure_path, "/dev/null")) {
+        /* We need to make the pressure paths writable even if /sys/fs/cgroups is made read-only, as the
+         * service will need to write to them in order to start the notifications. */
+        bool need_pressure_rw = false;
+        for (PressureResource t = 0; t < _PRESSURE_RESOURCE_MAX; t++)
+                if (pressure_path[t] && !streq(pressure_path[t], "/dev/null")) {
+                        need_pressure_rw = true;
+                        break;
+                }
+
+        if (exec_is_cgroup_mount_read_only(context) && need_pressure_rw) {
                 read_write_paths_cleanup = strv_copy(context->read_write_paths);
                 if (!read_write_paths_cleanup)
                         return -ENOMEM;
 
-                r = strv_extend(&read_write_paths_cleanup, memory_pressure_path);
-                if (r < 0)
-                        return r;
+                for (PressureResource t = 0; t < _PRESSURE_RESOURCE_MAX; t++) {
+                        if (!pressure_path[t] || streq(pressure_path[t], "/dev/null"))
+                                continue;
+
+                        r = strv_extend(&read_write_paths_cleanup, pressure_path[t]);
+                        if (r < 0)
+                                return r;
+                }
 
                 read_write_paths = read_write_paths_cleanup;
         } else
@@ -4130,7 +4119,7 @@ static int apply_working_directory(
 
                 r = chase(wd,
                           runtime->ephemeral_copy ?: context->root_directory,
-                          CHASE_PREFIX_ROOT|CHASE_AT_RESOLVE_IN_ROOT|CHASE_TRIGGER_AUTOFS,
+                          CHASE_PREFIX_ROOT|CHASE_TRIGGER_AUTOFS,
                           /* ret_path= */ NULL,
                           &dfd);
                 if (r >= 0)
@@ -4152,11 +4141,21 @@ static int apply_root_directory(
         assert(exit_status);
 
         if (params->flags & EXEC_APPLY_CHROOT)
-                if (!needs_mount_ns && context->root_directory)
+                if (!needs_mount_ns && context->root_directory) {
                         if (chroot(runtime->ephemeral_copy ?: context->root_directory) < 0) {
                                 *exit_status = EXIT_CHROOT;
                                 return -errno;
                         }
+
+                        /* chroot(2) changes only the process root, not cwd. Move cwd into the new root
+                         * immediately so that a subsequent apply_working_directory() failure that is
+                         * silently ignored via working_directory_missing_ok cannot leave cwd pointing
+                         * at a pre-chroot dentry outside the new root. */
+                        if (chdir("/") < 0) {
+                                *exit_status = EXIT_CHROOT;
+                                return -errno;
+                        }
+                }
 
         return 0;
 }
@@ -4346,16 +4345,13 @@ static int send_user_lookup(
         return 0;
 }
 
-static int acquire_home(const ExecContext *c, const char **home, char **ret_buf) {
-        int r;
-
+static int acquire_home(const ExecContext *c, char **home) {
         assert(c);
         assert(home);
-        assert(ret_buf);
 
         /* If WorkingDirectory=~ is set, try to acquire a usable home directory. */
 
-        if (*home) /* Already acquired from get_fixed_user()? */
+        if (*home) /* Already acquired from get_user_creds()? */
                 return 0;
 
         if (!c->working_directory_home)
@@ -4364,12 +4360,7 @@ static int acquire_home(const ExecContext *c, const char **home, char **ret_buf)
         if (c->dynamic_user || (c->user && is_this_me(c->user) <= 0))
                 return -EADDRNOTAVAIL;
 
-        r = get_home_dir(ret_buf);
-        if (r < 0)
-                return r;
-
-        *home = *ret_buf;
-        return 1;
+        return get_home_dir(home);
 }
 
 static int compile_suggested_paths(const ExecContext *c, const ExecParameters *p, char ***ret) {
@@ -4689,7 +4680,7 @@ static int setup_delegated_namespaces(
                 const ExecRuntime *runtime,
                 const PinnedResource *rootfs,
                 bool delegate,
-                const char *memory_pressure_path,
+                char *const *pressure_path,
                 uid_t uid,
                 gid_t gid,
                 const ExecCommand *command,
@@ -4820,7 +4811,7 @@ static int setup_delegated_namespaces(
                                 params,
                                 runtime,
                                 rootfs,
-                                memory_pressure_path,
+                                pressure_path,
                                 needs_sandboxing,
                                 uid,
                                 gid,
@@ -4850,23 +4841,23 @@ static int setup_delegated_namespaces(
         return 0;
 }
 
-static int set_memory_thp(MemoryTHP thp) {
+static int set_memory_thp(ExecMemoryTHP thp) {
         int r;
 
         switch (thp) {
 
-        case MEMORY_THP_INHERIT:
+        case EXEC_MEMORY_THP_INHERIT:
                 return 0;
 
-        case MEMORY_THP_DISABLE:
+        case EXEC_MEMORY_THP_DISABLE:
                 r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0));
                 break;
 
-        case MEMORY_THP_MADVISE:
+        case EXEC_MEMORY_THP_MADVISE:
                 r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 1, PR_THP_DISABLE_EXCEPT_ADVISED, 0, 0));
                 break;
 
-        case MEMORY_THP_SYSTEM:
+        case EXEC_MEMORY_THP_SYSTEM:
                 r = RET_NERRNO(prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0));
                 break;
 
@@ -5146,6 +5137,10 @@ static int setup_term_environment(const ExecContext *context, char ***env) {
         return strv_env_replace_strdup(env, "TERM=" FALLBACK_TERM);
 }
 
+static inline void free_pressure_paths(char *(*p)[_PRESSURE_RESOURCE_MAX]) {
+        free_many_charp(*p, _PRESSURE_RESOURCE_MAX);
+}
+
 int exec_invoke(
                 const ExecCommand *command,
                 const ExecContext *context,
@@ -5156,9 +5151,9 @@ int exec_invoke(
 
         _cleanup_strv_free_ char **our_env = NULL, **pass_env = NULL, **joined_exec_search_path = NULL, **accum_env = NULL;
         int r;
-        const char *username = NULL, *groupname = NULL;
-        _cleanup_free_ char *home_buffer = NULL, *memory_pressure_path = NULL, *own_user = NULL;
-        const char *pwent_home = NULL, *shell = NULL;
+        const char *username = NULL;
+        _cleanup_free_ char *pwent_home = NULL, *shell = NULL, *_own_user = NULL, *_username = NULL;
+        _cleanup_(free_pressure_paths) char *pressure_path[_PRESSURE_RESOURCE_MAX] = {};
         dev_t journal_stream_dev = 0;
         ino_t journal_stream_ino = 0;
         bool needs_sandboxing,          /* Do we need to set up full sandboxing? (i.e. all namespacing, all MAC stuff, caps, yadda yadda */
@@ -5394,44 +5389,48 @@ int exec_invoke(
                         username = runtime->dynamic_creds->user->name;
 
         } else {
-                const char *u;
-
                 if (context->user)
-                        u = context->user;
+                        username = context->user;
                 else if (context->pam_name || FLAGS_SET(command->flags, EXEC_COMMAND_VIA_SHELL)) {
                         /* If PAM is enabled but no user name is explicitly selected, then use our own one. */
-                        own_user = getusername_malloc();
-                        if (!own_user) {
+                        username = _own_user = getusername_malloc();
+                        if (!username) {
                                 *exit_status = EXIT_USER;
-                                return log_error_errno(r, "Failed to determine my own user ID: %m");
+                                return log_oom();
                         }
-                        u = own_user;
-                } else
-                        u = NULL;
+                }
 
-                if (u) {
+                if (username) {
                         /* We can't use nss unconditionally for root without risking deadlocks if some IPC services
                          * will be started by pid1 and are ordered after us. But if SetLoginEnvironment= is
                          * enabled *explicitly* (i.e. no exec_context_get_set_login_environment() here),
                          * or PAM shall be invoked, let's consult NSS even for root, so that the user
                          * gets accurate $SHELL in session(-like) contexts. */
-                        r = get_fixed_user(u,
-                                           /* prefer_nss= */ context->set_login_environment > 0 || context->pam_name,
-                                           &username, &uid, &gid, &pwent_home, &shell);
+                        bool prefer_nss = context->set_login_environment > 0 || context->pam_name;
+
+                        r = get_user_creds(username,
+                                           USER_CREDS_CLEAN|(prefer_nss ? USER_CREDS_PREFER_NSS : 0),
+                                           &_username,
+                                           &uid,
+                                           &gid,
+                                           &pwent_home,
+                                           &shell);
                         if (r < 0) {
                                 *exit_status = EXIT_USER;
                                 log_error_errno(r, "Failed to determine credentials for user '%s': %s",
-                                                u, STRERROR_USER(r));
+                                                username, STRERROR_USER(r));
                                 return ERRNO_IS_NEG_BAD_ACCOUNT(r) ? -EINVAL : r;  /* Suppress confusing errno */
                         }
+
+                        username = _username;
                 }
 
                 if (context->group) {
-                        r = get_fixed_group(context->group, &groupname, &gid);
+                        r = get_group_creds(context->group, /* flags= */ 0, /* ret_name= */ NULL, &gid);
                         if (r < 0) {
                                 *exit_status = EXIT_GROUP;
                                 log_error_errno(r, "Failed to determine credentials for group '%s': %s",
-                                                u, STRERROR_GROUP(r));
+                                                context->group, STRERROR_GROUP(r));
                                 return ERRNO_IS_NEG_BAD_ACCOUNT(r) ? -EINVAL : r;  /* Suppress confusing errno */
                         }
                 }
@@ -5454,7 +5453,7 @@ int exec_invoke(
                 params->user_lookup_fd = safe_close(params->user_lookup_fd);
         }
 
-        r = acquire_home(context, &pwent_home, &home_buffer);
+        r = acquire_home(context, &pwent_home);
         if (r < 0) {
                 *exit_status = EXIT_CHDIR;
                 return log_error_errno(r, "Failed to determine $HOME for the invoking user: %m");
@@ -5684,11 +5683,11 @@ int exec_invoke(
         r = set_memory_thp(context->memory_thp);
         if (r == -EOPNOTSUPP)
                 log_debug_errno(r, "Setting MemoryTHP=%s is not supported, ignoring.",
-                                memory_thp_to_string(context->memory_thp));
+                                exec_memory_thp_to_string(context->memory_thp));
         else if (r < 0) {
                 *exit_status = EXIT_MEMORY_THP;
                 return log_error_errno(r, "Failed to set MemoryTHP=%s: %m",
-                                       memory_thp_to_string(context->memory_thp));
+                                       exec_memory_thp_to_string(context->memory_thp));
         }
 
 #if ENABLE_UTMP
@@ -5753,36 +5752,44 @@ int exec_invoke(
                 }
 
                 if (is_pressure_supported() > 0) {
-                        if (cgroup_context_want_memory_pressure(cgroup_context)) {
-                                r = cg_get_path(params->cgroup_path, "memory.pressure", &memory_pressure_path);
-                                if (r < 0) {
-                                        *exit_status = EXIT_MEMORY;
-                                        return log_oom();
-                                }
+                        for (PressureResource t = 0; t < _PRESSURE_RESOURCE_MAX; t++) {
+                                if (cgroup_context_want_pressure(cgroup_context, t)) {
+                                        _cleanup_free_ char *pressure_file = strjoin(pressure_resource_to_string(t), ".pressure");
+                                        if (!pressure_file) {
+                                                *exit_status = EXIT_MEMORY;
+                                                return log_oom();
+                                        }
 
-                                r = chmod_and_chown(memory_pressure_path, 0644, uid, gid);
-                                if (r < 0) {
-                                        log_full_errno(r == -ENOENT || ERRNO_IS_PRIVILEGE(r) ? LOG_DEBUG : LOG_WARNING, r,
-                                                       "Failed to adjust ownership of '%s', ignoring: %m", memory_pressure_path);
-                                        memory_pressure_path = mfree(memory_pressure_path);
-                                }
-                                /* First we use the current cgroup path to chmod and chown the memory pressure path, then pass the path relative
-                                 * to the cgroup namespace to environment variables and mounts. If chown/chmod fails, we should not pass memory
-                                 * pressure path environment variable or read-write mount to the unit. This is why we check if
-                                 * memory_pressure_path != NULL in the conditional below. */
-                                if (memory_pressure_path && needs_sandboxing && exec_needs_cgroup_namespace(context)) {
-                                        memory_pressure_path = mfree(memory_pressure_path);
-                                        r = cg_get_path("/", "memory.pressure", &memory_pressure_path);
+                                        r = cg_get_path(params->cgroup_path, pressure_file, &pressure_path[t]);
                                         if (r < 0) {
                                                 *exit_status = EXIT_MEMORY;
                                                 return log_oom();
                                         }
-                                }
-                        } else if (cgroup_context->memory_pressure_watch == CGROUP_PRESSURE_WATCH_NO) {
-                                memory_pressure_path = strdup("/dev/null"); /* /dev/null is explicit indicator for turning of memory pressure watch */
-                                if (!memory_pressure_path) {
-                                        *exit_status = EXIT_MEMORY;
-                                        return log_oom();
+
+                                        r = chmod_and_chown(pressure_path[t], 0644, uid, gid);
+                                        if (r < 0) {
+                                                log_full_errno(r == -ENOENT || ERRNO_IS_PRIVILEGE(r) ? LOG_DEBUG : LOG_WARNING, r,
+                                                               "Failed to adjust ownership of '%s', ignoring: %m", pressure_path[t]);
+                                                pressure_path[t] = mfree(pressure_path[t]);
+                                        }
+                                        /* First we use the current cgroup path to chmod and chown the pressure path, then pass the
+                                         * path relative to the cgroup namespace to environment variables and mounts. If chown/chmod
+                                         * fails, we should not pass pressure path environment variable or read-write mount to the
+                                         * unit. This is why we check if pressure_path[t] != NULL in the conditional below. */
+                                        if (pressure_path[t] && needs_sandboxing && exec_needs_cgroup_namespace(context)) {
+                                                pressure_path[t] = mfree(pressure_path[t]);
+                                                r = cg_get_path("/", pressure_file, &pressure_path[t]);
+                                                if (r < 0) {
+                                                        *exit_status = EXIT_MEMORY;
+                                                        return log_oom();
+                                                }
+                                        }
+                                } else if (cgroup_context->pressure[t].watch == CGROUP_PRESSURE_WATCH_NO) {
+                                        pressure_path[t] = strdup("/dev/null"); /* /dev/null is explicit indicator for turning off pressure watch */
+                                        if (!pressure_path[t]) {
+                                                *exit_status = EXIT_MEMORY;
+                                                return log_oom();
+                                        }
                                 }
                         }
                 }
@@ -5829,7 +5836,7 @@ int exec_invoke(
                         shell,
                         journal_stream_dev,
                         journal_stream_ino,
-                        memory_pressure_path,
+                        pressure_path,
                         needs_sandboxing,
                         &our_env);
         if (r < 0) {
@@ -5991,10 +5998,10 @@ int exec_invoke(
         }
 
         /* Load a bunch of libraries we'll possibly need later, before we turn off dlopen() */
-        (void) dlopen_bpf();
-        (void) dlopen_cryptsetup();
-        (void) dlopen_libmount();
-        (void) dlopen_libseccomp();
+        (void) DLOPEN_BPF(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
+        (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
+        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
+        (void) DLOPEN_LIBSECCOMP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
 
         /* Let's now disable further dlopen()ing of libraries, since we are about to do namespace
          * shenanigans, and do not want to mix resources from host and namespace */
@@ -6005,8 +6012,10 @@ int exec_invoke(
                  * Users with CAP_SYS_ADMIN can set up user namespaces last because they will be able to
                  * set up all of the other namespaces (i.e. network, mount, UTS) without a user namespace. */
 
-                if (context->user_namespace_path && runtime->shared->userns_storage_socket[0] >= 0)
+                if (context->user_namespace_path && runtime->shared->userns_storage_socket[0] >= 0) {
+                        *exit_status = EXIT_USER;
                         return log_error_errno(SYNTHETIC_ERRNO(EPERM), "UserNamespacePath= is configured, but user namespace setup not permitted");
+                }
 
                 PrivateUsers pu = exec_context_get_effective_private_users(context, params);
                 if (pu == PRIVATE_USERS_NO)
@@ -6047,7 +6056,7 @@ int exec_invoke(
                         runtime,
                         &rootfs,
                         /* delegate= */ false,
-                        memory_pressure_path,
+                        pressure_path,
                         uid,
                         gid,
                         command,
@@ -6091,12 +6100,16 @@ int exec_invoke(
          * case of mount namespaces being less privileged when the mount point list is copied from a
          * different user namespace). */
         if (needs_sandboxing && context->user_namespace_path && runtime->shared && runtime->shared->userns_storage_socket[0] >= 0) {
-                if (!namespace_type_supported(NAMESPACE_USER))
+                if (!namespace_type_supported(NAMESPACE_USER)) {
+                        *exit_status = EXIT_USER;
                         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "UserNamespacePath= is not supported, refusing.");
+                }
 
                 r = setup_shareable_ns(runtime->shared->userns_storage_socket, CLONE_NEWUSER);
-                if (ERRNO_IS_NEG_PRIVILEGE(r))
-                        return log_notice_errno(r, "PrivateUsers= is configured, but user namespace setup not permitted, refusing.");
+                if (ERRNO_IS_NEG_PRIVILEGE(r)) {
+                        *exit_status = EXIT_USER;
+                        return log_error_errno(r, "UserNamespacePath= is configured, but user namespace setup not permitted, refusing.");
+                }
                 if (r < 0) {
                         *exit_status = EXIT_USER;
                         return log_error_errno(r, "Failed to set up user namespacing: %m");
@@ -6144,7 +6157,7 @@ int exec_invoke(
                         runtime,
                         &rootfs,
                         /* delegate= */ true,
-                        memory_pressure_path,
+                        pressure_path,
                         uid,
                         gid,
                         command,

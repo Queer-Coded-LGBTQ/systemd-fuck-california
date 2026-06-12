@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "sd-event.h"
 #include "sd-json.h"
 #include "sd-varlink.h"
@@ -19,7 +21,7 @@
 #include "install-file.h"
 #include "io-util.h"
 #include "json-util.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "oci-util.h"
 #include "ordered-set.h"
 #include "path-util.h"
@@ -29,6 +31,7 @@
 #include "pull-oci.h"
 #include "rm-rf.h"
 #include "set.h"
+#include "sha256.h"
 #include "signal-util.h"
 #include "stat-util.h"
 #include "string-util.h"
@@ -191,9 +194,6 @@ int oci_pull_new(
                 .glue = TAKE_PTR(g),
                 .userns_fd = -EBADF,
         };
-
-        i->glue->on_finished = pull_job_curl_on_finished;
-        i->glue->userdata = i;
 
         *ret = TAKE_PTR(i);
 
@@ -1193,7 +1193,7 @@ static int oci_pull_make_local(OciPull *i) {
                 return r;
 
         if (!iovec_is_set(&i->config) ||
-            iovec_memcmp(&i->config, &IOVEC_MAKE_STRING("{}")) == 0)
+            iovec_equal(&i->config, &IOVEC_MAKE_STRING("{}")))
                 log_info("Image has no configuration, not saving.");
         else {
                 r = oci_pull_save_nspawn_settings(i);
