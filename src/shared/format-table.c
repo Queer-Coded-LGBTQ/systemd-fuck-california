@@ -87,6 +87,7 @@ typedef struct TableData {
         union {
                 uint8_t data[0];    /* data is generic array */
                 bool boolean;
+                int tristate;
                 usec_t timestamp;
                 usec_t timespan;
                 uint64_t size;
@@ -342,6 +343,7 @@ static size_t table_data_size(TableDataType type, const void *data) {
         case TABLE_PERCENT:
         case TABLE_IFINDEX:
         case TABLE_SIGNAL:
+        case TABLE_TRISTATE:
                 return sizeof(int);
 
         case TABLE_IN_ADDR:
@@ -935,6 +937,7 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...) {
                         uint64_t uint64;
                         int percent;
                         int ifindex;
+                        int tristate;
                         bool b;
                         union in_addr_union address;
                         sd_id128_t id128;
@@ -970,6 +973,11 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...) {
                 case TABLE_BOOLEAN:
                         buffer.b = va_arg(ap, int);
                         data = &buffer.b;
+                        break;
+
+                case TABLE_TRISTATE:
+                        buffer.tristate = va_arg(ap, int);
+                        data = &buffer.tristate;
                         break;
 
                 case TABLE_TIMESTAMP:
@@ -1073,12 +1081,12 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...) {
                         break;
 
                 case TABLE_IN_ADDR:
-                        buffer.address = *va_arg(ap, union in_addr_union *);
+                        buffer.address.in = *va_arg(ap, struct in_addr *);
                         data = &buffer.address.in;
                         break;
 
                 case TABLE_IN6_ADDR:
-                        buffer.address = *va_arg(ap, union in_addr_union *);
+                        buffer.address.in6 = *va_arg(ap, struct in6_addr *);
                         data = &buffer.address.in6;
                         break;
 
@@ -1434,9 +1442,22 @@ static int cell_data_compare(TableData *a, size_t index_a, TableData *b, size_t 
                         return strv_compare(a->strv, b->strv);
 
                 case TABLE_BOOLEAN:
+                case TABLE_BOOLEAN_CHECKMARK:
                         if (!a->boolean && b->boolean)
                                 return -1;
                         if (a->boolean && !b->boolean)
+                                return 1;
+                        return 0;
+
+                case TABLE_TRISTATE:
+                        /* NB: we do not use CMP() here, since we want to collapse all negative and all
+                         * positive into one bucket each. */
+                        if ((a->tristate < 0 && b->tristate >= 0) ||
+                            (a->tristate == 0 && b->tristate > 0))
+                                return -1;
+
+                        if ((b->tristate < 0 && a->tristate >= 0) ||
+                            (b->tristate == 0 && a->tristate > 0))
                                 return 1;
                         return 0;
 
@@ -1543,6 +1564,10 @@ static int cell_data_compare(TableData *a, size_t index_a, TableData *b, size_t 
 static int table_data_compare(const size_t *a, const size_t *b, Table *t) {
         int r;
 
+        /* This is called from qsort()s inner loops. Correctly implemented qsort will never pass NULL so we
+           just suppress the check via POINTER_MAY_BE_NULL instead of assert() to avoid the runtime cost. */
+        POINTER_MAY_BE_NULL(a);
+        POINTER_MAY_BE_NULL(b);
         assert(t);
         assert(t->sort_map);
 
@@ -1686,6 +1711,12 @@ static const char* table_data_format(
 
         case TABLE_BOOLEAN_CHECKMARK:
                 return glyph(d->boolean ? GLYPH_CHECK_MARK : GLYPH_CROSS_MARK);
+
+        case TABLE_TRISTATE:
+                if (d->tristate < 0)
+                        return table_ersatz_string(t);
+
+                return yes_no(d->tristate);
 
         case TABLE_TIMESTAMP:
         case TABLE_TIMESTAMP_UTC:
@@ -2185,35 +2216,40 @@ int table_set_column_width(Table *t, size_t column, size_t width) {
         return r;
 }
 
-int table_sync_column_width(Table *a, size_t column_a, Table *b, size_t column_b) {
-        size_t w1, w2;
-        int r;
+int _table_sync_column_widths(size_t column, Table *a, ...) {
+        size_t max = 0;
+        va_list ap;
+        int r = 0;
 
         assert(a);
-        assert(b);
 
-        /* Make both tables have specified columns of same width */
+        /* Make the specified column have the same width in the tables. */
 
-        r = table_data_requested_width(a, column_a, &w1);
-        if (r < 0)
-                return log_error_errno(r, "Failed to query table column width: %m");
+        va_start(ap, a);
+        for (Table *t = a; t; t = va_arg(ap, Table*)) {
+                size_t w;
 
-        r = table_data_requested_width(b, column_b, &w2);
+                r = table_data_requested_width(t, column, &w);
+                if (r < 0)
+                        break;
+
+                max = MAX(max, w);
+        }
+        va_end(ap);
         if (r < 0)
                 return log_error_errno(r, "Failed to query table column width: %m");
 
         r = 0;
-        RET_GATHER(r, table_set_column_width(a, column_a, MAX(w1, w2)));
-        RET_GATHER(r, table_set_column_width(b, column_b, MAX(w1, w2)));
+        va_start(ap, a);
+        for (Table *t = a; t; t = va_arg(ap, Table*))
+                RET_GATHER(r, table_set_column_width(t, column, max));
+        va_end(ap);
+
         return r;
 }
 
-int table_print(Table *t, FILE *f) {
-        size_t n_rows, *minimum_width, *maximum_width, display_columns, *requested_width,
-                table_minimum_width, table_maximum_width, table_requested_width, table_effective_width,
-                *width = NULL;
+int table_print_full(Table *t, FILE *f, bool flush) {
         _cleanup_free_ size_t *sorted = NULL;
-        uint64_t *column_weight, weight_sum;
         int r;
 
         assert(t);
@@ -2224,7 +2260,7 @@ int table_print(Table *t, FILE *f) {
         /* Ensure we have no incomplete rows */
         assert(t->n_cells % t->n_columns == 0);
 
-        n_rows = t->n_cells / t->n_columns;
+        size_t n_rows = t->n_cells / t->n_columns;
         assert(n_rows > 0); /* at least the header row must be complete */
 
         if (t->sort_map) {
@@ -2240,17 +2276,14 @@ int table_print(Table *t, FILE *f) {
                 typesafe_qsort_r(sorted, n_rows, table_data_compare, t);
         }
 
-        if (t->display_map)
-                display_columns = t->n_display_map;
-        else
-                display_columns = t->n_columns;
-
+        size_t display_columns = t->display_map ? t->n_display_map : t->n_columns;
         assert(display_columns > 0);
 
-        minimum_width = newa(size_t, display_columns);
-        maximum_width = newa(size_t, display_columns);
-        requested_width = newa(size_t, display_columns);
-        column_weight = newa0(uint64_t, display_columns);
+        size_t *minimum_width = newa(size_t, display_columns),
+                *maximum_width = newa(size_t, display_columns),
+                *requested_width = newa(size_t, display_columns),
+                *width = NULL;
+        uint64_t *column_weight = newa0(uint64_t, display_columns);
 
         for (size_t j = 0; j < display_columns; j++) {
                 minimum_width[j] = 1;
@@ -2333,10 +2366,11 @@ int table_print(Table *t, FILE *f) {
                 }
 
                 /* One space between each column */
+                size_t table_requested_width, table_minimum_width, table_maximum_width, table_effective_width;
                 table_requested_width = table_minimum_width = table_maximum_width = display_columns - 1;
 
                 /* Calculate the total weight for all columns, plus the minimum, maximum and requested width for the table. */
-                weight_sum = 0;
+                uint64_t weight_sum = 0;
                 for (size_t j = 0; j < display_columns; j++) {
                         weight_sum += column_weight[j];
 
@@ -2628,7 +2662,19 @@ int table_print(Table *t, FILE *f) {
                 } while (more_sublines);
         }
 
+        if (!flush)
+                return 0;
+
         return fflush_and_check(f);
+}
+
+int table_print_or_warn(Table *t) {
+        int r;
+
+        r = table_print(t);
+        if (r < 0)
+                return table_log_print_error(r);
+        return 0;
 }
 
 int table_format(Table *t, char **ret) {
@@ -2643,7 +2689,7 @@ int table_format(Table *t, char **ret) {
         if (!f)
                 return -ENOMEM;
 
-        r = table_print(t, f);
+        r = table_print_full(t, f, /* flush= */ true);
         if (r < 0)
                 return r;
 
@@ -2750,6 +2796,12 @@ static int table_data_to_json(TableData *d, sd_json_variant **ret) {
         case TABLE_BOOLEAN_CHECKMARK:
         case TABLE_BOOLEAN:
                 return sd_json_variant_new_boolean(ret, d->boolean);
+
+        case TABLE_TRISTATE:
+                if (d->tristate < 0)
+                        return sd_json_variant_new_null(ret);
+
+                return sd_json_variant_new_boolean(ret, d->tristate);
 
         case TABLE_TIMESTAMP:
         case TABLE_TIMESTAMP_UTC:
@@ -3132,7 +3184,7 @@ int table_print_json(Table *t, FILE *f, sd_json_format_flags_t flags) {
         assert(t);
 
         if (!sd_json_format_enabled(flags)) /* If JSON output is turned off, use regular output */
-                return table_print(t, f);
+                return table_print_full(t, f, /* flush= */ true);
 
         if (!f)
                 f = stdout;

@@ -190,15 +190,16 @@ static int pin_choice(
         _cleanup_free_ char *resolved_path = NULL;
         int r;
 
-        assert(toplevel_fd >= 0 || IN_SET(toplevel_fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(toplevel_fd));
         assert(inode_path);
         assert(filter);
         assert(ret);
 
         if (inode_fd < 0 || FLAGS_SET(flags, PICK_RESOLVE)) {
                 r = chaseat(toplevel_fd,
+                            toplevel_fd,
                             inode_path,
-                            CHASE_AT_RESOLVE_IN_ROOT,
+                            /* flags= */ 0,
                             FLAGS_SET(flags, PICK_RESOLVE) ? &resolved_path : NULL,
                             inode_fd < 0 ? &inode_fd : NULL);
                 if (r < 0)
@@ -321,13 +322,13 @@ static int make_choice(
         _cleanup_close_ int inode_fd = TAKE_FD(_inode_fd);
         int r;
 
-        assert(toplevel_fd >= 0 || IN_SET(toplevel_fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(toplevel_fd));
         assert(inode_path);
         assert(filter);
         assert(ret);
 
         if (inode_fd < 0) {
-                r = chaseat(toplevel_fd, inode_path, CHASE_AT_RESOLVE_IN_ROOT, NULL, &inode_fd);
+                r = chaseat(toplevel_fd, toplevel_fd, inode_path, /* flags= */ 0, NULL, &inode_fd);
                 if (r < 0)
                         return r;
         }
@@ -344,7 +345,7 @@ static int make_choice(
                         return log_oom_debug();
 
                 _cleanup_close_ int object_fd = -EBADF;
-                r = chaseat(toplevel_fd, p, CHASE_AT_RESOLVE_IN_ROOT, &object_path, &object_fd);
+                r = chaseat(toplevel_fd, toplevel_fd, p, /* flags= */ 0, &object_path, &object_fd);
                 if (r == -ENOENT) {
                         *ret = PICK_RESULT_NULL;
                         return 0;
@@ -512,7 +513,7 @@ static int path_pick_one(
         uint32_t filter_type_mask;
         int r;
 
-        assert(toplevel_fd >= 0 || IN_SET(toplevel_fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(toplevel_fd));
         assert(path);
         assert(filter);
         assert(ret);
@@ -661,7 +662,7 @@ int path_pick(const char *toplevel_path,
         _cleanup_(pick_result_done) PickResult best = PICK_RESULT_NULL;
         int r;
 
-        assert(toplevel_fd >= 0 || IN_SET(toplevel_fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(toplevel_fd));
         assert(path);
         assert(filters || n_filters == 0);
         assert(ret);
