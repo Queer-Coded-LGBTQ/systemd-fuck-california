@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "architecture.h"
+#include "crypto-util.h"
 #include "hexdecoct.h"
 #include "tests.h"
 #include "tpm2-util.h"
@@ -782,25 +782,25 @@ TEST(tpm2b_public_to_openssl_pkey) {
         _cleanup_(EVP_PKEY_freep) EVP_PKEY *pkey_rsa = NULL;
         assert_se(tpm2_tpm2b_public_to_openssl_pkey(&public, &pkey_rsa) >= 0);
 
-        _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx_rsa = EVP_PKEY_CTX_new(pkey_rsa, NULL);
+        _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx_rsa = sym_EVP_PKEY_CTX_new(pkey_rsa, NULL);
         assert_se(ctx_rsa);
-        assert_se(EVP_PKEY_verify_init(ctx_rsa) == 1);
-        assert_se(EVP_PKEY_CTX_set_signature_md(ctx_rsa, EVP_sha256()) > 0);
+        assert_se(sym_EVP_PKEY_verify_init(ctx_rsa) == 1);
+        assert_se(sym_EVP_PKEY_CTX_set_signature_md(ctx_rsa, sym_EVP_sha256()) > 0);
 
         DEFINE_HEX_PTR(sig_rsa, "9f70a9e68911be3ec464cae91126328307bf355872127e042d6c61e0a80982872c151033bcf727abfae5fc9500c923120011e7ef4aa5fc690a59a034697b6022c141b4b209e2df6f4b282288cd9181073fbe7158ce113c79d87623423c1f3996ff931e59cc91db74f8e8656215b1436fc93ddec0f1f8fa8510826e674b250f047e6cba94c95ff98072a286baca94646b577974a1e00d56c21944e38960d8ee90511a2f938e5cf1ac7b7cc7ff8e3ac001d321254d3e4f988b90e9f6f873c26ecd0a12a626b3474833cdbb9e9f793238f6c97ee5b75a1a89bb7a7858d34ecfa6d34ac58d95085e6c4fbbebd47a4364be2725c2c6b3fa15d916f3c0b62a66fe76ae");
-        assert_se(EVP_PKEY_verify(ctx_rsa, sig_rsa, sig_rsa_len, (unsigned char*) msg, msg_len) == 1);
+        assert_se(sym_EVP_PKEY_verify(ctx_rsa, sig_rsa, sig_rsa_len, (unsigned char*) msg, msg_len) == 1);
 
         /* ECC */
         tpm2b_public_ecc_init(&public, TPM2_ECC_NIST_P256, "6fc0ecf3645c673ab7e86d1ec5b315afb950257c5f68ab23296160006711fac2", "8dd2ef7a2c9ecede91493ba98c8fb3f893aff325c6a1e0f752c657b2d6ca1413");
         _cleanup_(EVP_PKEY_freep) EVP_PKEY *pkey_ecc = NULL;
         assert_se(tpm2_tpm2b_public_to_openssl_pkey(&public, &pkey_ecc) >= 0);
 
-        _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx_ecc = EVP_PKEY_CTX_new(pkey_ecc, NULL);
+        _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx_ecc = sym_EVP_PKEY_CTX_new(pkey_ecc, NULL);
         assert_se(ctx_ecc);
-        assert_se(EVP_PKEY_verify_init(ctx_ecc) == 1);
+        assert_se(sym_EVP_PKEY_verify_init(ctx_ecc) == 1);
 
         DEFINE_HEX_PTR(sig_ecc, "304602210092447ac0b5b32e90923f79bb4aba864b9c546a9900cf193a83243d35d189a2110221009a8b4df1dfa85e225eff9c606694d4d205a7a3968c9552f50bc2790209a90001");
-        assert_se(EVP_PKEY_verify(ctx_ecc, sig_ecc, sig_ecc_len, (unsigned char*) msg, msg_len) == 1);
+        assert_se(sym_EVP_PKEY_verify(ctx_ecc, sig_ecc, sig_ecc_len, (unsigned char*) msg, msg_len) == 1);
 }
 
 static void get_tpm2b_public_from_pem(const void *pem, size_t pem_size, TPM2B_PUBLIC *ret) {
@@ -876,13 +876,6 @@ static void check_tpm2b_public_from_rsa_pem(const char *pem, const char *hexn, u
 }
 
 TEST(tpm2b_public_from_openssl_pkey) {
-        // TODO: this test fails on s390x but only on Github Actions, re-enable once
-        // https://github.com/systemd/systemd/issues/38229 is fixed
-        if (strstr_ptr(ci_environment(), "github-actions") && uname_architecture() == ARCHITECTURE_S390X) {
-                log_notice("%s: skipping test on GH Actions because of systemd/systemd#38229", __func__);
-                return;
-        }
-
         /* standard ECC key */
         check_tpm2b_public_from_ecc_pem("2d2d2d2d2d424547494e205055424c4943204b45592d2d2d2d2d0a4d466b77457759484b6f5a497a6a3043415159494b6f5a497a6a30444151634451674145726a6e4575424c73496c3972687068777976584e50686a346a426e500a44586e794a304b395579724e6764365335413532542b6f5376746b436a365a726c34685847337741515558706f426c532b7448717452714c35513d3d0a2d2d2d2d2d454e44205055424c4943204b45592d2d2d2d2d0a",
                                         "ae39c4b812ec225f6b869870caf5cd3e18f88c19cf0d79f22742bd532acd81de",
@@ -1271,7 +1264,7 @@ static void check_seal_unseal_for_handle(Tpm2Context *c, TPM2_HANDLE handle) {
                         &srk,
                         &unsealed_secret) >= 0);
 
-        assert_se(iovec_memcmp(&secret, &unsealed_secret) == 0);
+        assert_se(iovec_equal(&secret, &unsealed_secret));
 }
 
 static void check_seal_unseal(Tpm2Context *c) {
