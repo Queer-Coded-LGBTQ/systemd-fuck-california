@@ -126,7 +126,9 @@ static int help(void) {
                program_invocation_short_name,
                ansi_highlight(),
                ansi_normal());
-        table_print(options, stdout);
+        r = table_print_or_warn(options);
+        if (r < 0)
+                return r;
 
         printf("\nSee the %s for details.\n", link);
         return 0;
@@ -137,10 +139,9 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
 
-        OptionParser state = {};
-        const char *arg;
+        OptionParser opts = { argc, argv };
 
-        FOREACH_OPTION(&state, c, argc, argv, &arg, /* on_error= */ return c)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
                         return help();
@@ -165,7 +166,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         break;
                 }
 
-        char **args = option_parser_get_args(&state, argc, argv);
+        char **args = option_parser_get_args(&opts);
 
         if ((arg_unregister || arg_cat_flags != CAT_CONFIG_OFF) && !strv_isempty(args))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),

@@ -56,7 +56,7 @@ int acquire_boot_times(sd_bus *bus, bool require_finished, BootTimes **ret) {
                 { "InitRDGeneratorsFinishTimestampMonotonic", "t", NULL, offsetof(BootTimes, initrd_generators_finish_time) },
                 { "InitRDUnitsLoadStartTimestampMonotonic",   "t", NULL, offsetof(BootTimes, initrd_unitsload_start_time)   },
                 { "InitRDUnitsLoadFinishTimestampMonotonic",  "t", NULL, offsetof(BootTimes, initrd_unitsload_finish_time)  },
-                { "SoftRebootsCount",                         "t", NULL, offsetof(BootTimes, soft_reboots_count)            },
+                { "SoftRebootsCount",                         "u", NULL, offsetof(BootTimes, soft_reboots_count)            },
                 {},
         };
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -172,6 +172,8 @@ int pretty_boot_time(sd_bus *bus, char **ret) {
         BootTimes *t;
         int r;
 
+        assert(ret);
+
         r = acquire_boot_times(bus, /* require_finished= */ true, &t);
         if (r < 0)
                 return r;
@@ -210,7 +212,7 @@ int pretty_boot_time(sd_bus *bus, char **ret) {
                 return log_oom();
         if (timestamp_is_set(t->initrd_time) && !strextend(&text, FORMAT_TIMESPAN(t->userspace_time - t->initrd_time, USEC_PER_MSEC), " (initrd) + "))
                 return log_oom();
-        if (t->soft_reboots_count > 0 && strextendf(&text, "%s (soft reboot #%" PRIu64 ") + ", FORMAT_TIMESPAN(t->userspace_time, USEC_PER_MSEC), t->soft_reboots_count) < 0)
+        if (t->soft_reboots_count > 0 && strextendf(&text, "%s (soft reboot #%" PRIu32 ") + ", FORMAT_TIMESPAN(t->userspace_time, USEC_PER_MSEC), t->soft_reboots_count) < 0)
                 return log_oom();
 
         if (!strextend(&text, FORMAT_TIMESPAN(t->finish_time - t->userspace_time, USEC_PER_MSEC), " (userspace) "))
@@ -296,6 +298,8 @@ int acquire_time_data(sd_bus *bus, bool require_finished, UnitTimes **out) {
         size_t c = 0;
         UnitInfo u;
         int r;
+
+        assert(out);
 
         r = acquire_boot_times(bus, require_finished, &boot_times);
         if (r < 0)

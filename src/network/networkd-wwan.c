@@ -37,7 +37,7 @@ Bearer* bearer_free(Bearer *b) {
         free(b->name);
         free(b->apn);
 
-        in_addr_full_array_free(b->dns, b->n_dns);
+        in_addr_full_free_array(b->dns, b->n_dns);
 
         return mfree(b);
 }
@@ -235,6 +235,7 @@ int link_get_modem(Link *link, Modem **ret) {
         assert(link);
         assert(link->manager);
         assert(link->ifname);
+        assert(ret);
 
         HASHMAP_FOREACH(modem, link->manager->modems_by_path)
                 if (modem->port_name && streq(modem->port_name, link->ifname)) {
@@ -477,7 +478,7 @@ static int link_apply_bearer_impl(Link *link, Bearer *b) {
                         if (r < 0)
                                 return r;
 
-                        r = link_request_bearer_route(link, AF_INET6, &b->ip6_gateway, NULL);
+                        r = link_request_bearer_route(link, AF_INET6, &b->ip6_gateway, &b->ip6_address);
                         if (r < 0)
                                 return r;
                 }
