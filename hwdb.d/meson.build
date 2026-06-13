@@ -19,6 +19,7 @@ hwdb_files_notest = files(
 hwdb_files_test = files(
         '20-dmi-id.hwdb',
         '20-net-ifname.hwdb',
+        '40-imds.hwdb',
         '60-autosuspend.hwdb',
         '60-autosuspend-fingerprint-reader.hwdb',
         '60-evdev.hwdb',
@@ -40,6 +41,7 @@ hwdb_files_test = files(
         '70-software-radio.hwdb',
         '70-sound-card.hwdb',
         '70-touchpad.hwdb',
+        '70-vsock.hwdb',
         '80-ieee1394-unit-function.hwdb',
         '82-net-auto-link-local.hwdb')
 

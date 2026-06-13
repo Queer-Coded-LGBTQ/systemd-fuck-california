@@ -21,6 +21,7 @@
 #include "audit-fd.h"
 #include "boot-timestamps.h"
 #include "bpf-restrict-fs.h"
+#include "bpf-restrict-fsaccess.h"
 #include "build-path.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
@@ -56,10 +57,11 @@
 #include "libaudit-util.h"
 #include "locale-setup.h"
 #include "log.h"
+#include "luo.h"
 #include "manager-dump.h"
 #include "manager-serialize.h"
 #include "manager.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "notify-recv.h"
 #include "parse-util.h"
@@ -75,6 +77,7 @@
 #include "rm-rf.h"
 #include "selinux-util.h"
 #include "serialize.h"
+#include "service.h"
 #include "set.h"
 #include "signal-util.h"
 #include "socket-util.h"
@@ -93,6 +96,7 @@
 #include "umask-util.h"
 #include "unit-name.h"
 #include "user-util.h"
+#include "varlink-unit.h"
 #include "varlink.h"
 #include "virt.h"
 #include "watchdog.h"
@@ -616,9 +620,13 @@ static char** sanitize_environment(char **l) {
                         l,
                         "CACHE_DIRECTORY",
                         "CONFIGURATION_DIRECTORY",
+                        "CPU_PRESSURE_WATCH",
+                        "CPU_PRESSURE_WRITE",
                         "CREDENTIALS_DIRECTORY",
                         "EXIT_CODE",
                         "EXIT_STATUS",
+                        "IO_PRESSURE_WATCH",
+                        "IO_PRESSURE_WRITE",
                         "INVOCATION_ID",
                         "JOURNAL_STREAM",
                         "LISTEN_FDNAMES",
@@ -796,26 +804,38 @@ static int manager_setup_sigchld_event_source(Manager *m) {
         return 0;
 }
 
-int manager_setup_memory_pressure_event_source(Manager *m) {
+typedef int (*pressure_add_t)(sd_event *, sd_event_source **, sd_event_handler_t, void *);
+typedef int (*pressure_set_period_t)(sd_event_source *, usec_t, usec_t);
+
+static const struct {
+        pressure_add_t add;
+        pressure_set_period_t set_period;
+} pressure_dispatch_table[_PRESSURE_RESOURCE_MAX] = {
+        [PRESSURE_MEMORY] = { sd_event_add_memory_pressure, sd_event_source_set_memory_pressure_period },
+        [PRESSURE_CPU]    = { sd_event_add_cpu_pressure,    sd_event_source_set_cpu_pressure_period    },
+        [PRESSURE_IO]     = { sd_event_add_io_pressure,     sd_event_source_set_io_pressure_period     },
+};
+
+int manager_setup_pressure_event_source(Manager *m, PressureResource t) {
         int r;
 
         assert(m);
+        assert(t >= 0 && t < _PRESSURE_RESOURCE_MAX);
 
-        m->memory_pressure_event_source = sd_event_source_disable_unref(m->memory_pressure_event_source);
+        m->pressure_event_source[t] = sd_event_source_disable_unref(m->pressure_event_source[t]);
 
-        r = sd_event_add_memory_pressure(m->event, &m->memory_pressure_event_source, NULL, NULL);
+        r = pressure_dispatch_table[t].add(m->event, &m->pressure_event_source[t], NULL, NULL);
         if (r < 0)
                 log_full_errno(ERRNO_IS_NOT_SUPPORTED(r) || ERRNO_IS_PRIVILEGE(r) || (r == -EHOSTDOWN) ? LOG_DEBUG : LOG_NOTICE, r,
-                               "Failed to establish memory pressure event source, ignoring: %m");
-        else if (m->defaults.memory_pressure_threshold_usec != USEC_INFINITY) {
+                               "Failed to establish %s pressure event source, ignoring: %m", pressure_resource_to_string(t));
+        else if (m->defaults.pressure[t].threshold_usec != USEC_INFINITY) {
 
-                /* If there's a default memory pressure threshold set, also apply it to the service manager itself */
-                r = sd_event_source_set_memory_pressure_period(
-                                m->memory_pressure_event_source,
-                                m->defaults.memory_pressure_threshold_usec,
-                                MEMORY_PRESSURE_DEFAULT_WINDOW_USEC);
+                r = pressure_dispatch_table[t].set_period(
+                                m->pressure_event_source[t],
+                                m->defaults.pressure[t].threshold_usec,
+                                PRESSURE_DEFAULT_WINDOW_USEC);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to adjust memory pressure threshold, ignoring: %m");
+                        log_warning_errno(r, "Failed to adjust %s pressure threshold, ignoring: %m", pressure_resource_to_string(t));
         }
 
         return 0;
@@ -924,7 +944,12 @@ int manager_new(RuntimeScope runtime_scope, ManagerTestRunFlags test_run_flags, 
                 .dump_ratelimit = (const RateLimit) { .interval = 10 * USEC_PER_MINUTE, .burst = 10 },
 
                 .executor_fd = -EBADF,
+
+                .restrict_fsaccess_bss_map_fd = -EBADF,
         };
+
+        FOREACH_ELEMENT(fd, m->restrict_fsaccess_link_fds)
+                *fd = -EBADF;
 
         unit_defaults_init(&m->defaults, runtime_scope);
 
@@ -1001,9 +1026,11 @@ int manager_new(RuntimeScope runtime_scope, ManagerTestRunFlags test_run_flags, 
                 if (r < 0)
                         return r;
 
-                r = manager_setup_memory_pressure_event_source(m);
-                if (r < 0)
-                        return r;
+                for (PressureResource t = 0; t < _PRESSURE_RESOURCE_MAX; t++) {
+                        r = manager_setup_pressure_event_source(m, t);
+                        if (r < 0)
+                                return r;
+                }
 
 #if HAVE_LIBBPF
                 if (MANAGER_IS_SYSTEM(m) && bpf_restrict_fs_supported(/* initialize= */ true)) {
@@ -1711,7 +1738,8 @@ Manager* manager_free(Manager *m) {
         sd_event_source_unref(m->user_lookup_event_source);
         sd_event_source_unref(m->handoff_timestamp_event_source);
         sd_event_source_unref(m->pidref_event_source);
-        sd_event_source_unref(m->memory_pressure_event_source);
+        FOREACH_ARRAY(pressure_event_source, m->pressure_event_source, _PRESSURE_RESOURCE_MAX)
+                sd_event_source_unref(*pressure_event_source);
 
         safe_close(m->signal_fd);
         safe_close(m->notify_fd);
@@ -1764,6 +1792,8 @@ Manager* manager_free(Manager *m) {
 #if BPF_FRAMEWORK
         bpf_restrict_fs_destroy(m->restrict_fs);
 #endif
+        close_many(m->restrict_fsaccess_link_fds, ELEMENTSOF(m->restrict_fsaccess_link_fds));
+        safe_close(m->restrict_fsaccess_bss_map_fd);
 
         safe_close(m->executor_fd);
         free(m->executor_path);
@@ -1848,6 +1878,93 @@ static void manager_catchup(Manager *m) {
 
                 unit_catchup(u);
         }
+}
+
+ListenFDsTag* listen_fds_tag_free(ListenFDsTag *t) {
+        if (!t)
+                return NULL;
+
+        free(t->unit_id);
+        free(t->fdname);
+        return mfree(t);
+}
+
+DEFINE_HASH_OPS_FULL(
+                fd_to_listen_fds_tag_hash_ops,
+                void, trivial_hash_func, trivial_compare_func, close_fd_ptr,
+                ListenFDsTag, listen_fds_tag_free);
+
+int manager_dispatch_external_fd_to_unit(
+                Manager *m,
+                const char *unit_id,
+                const char *fdname,
+                uint64_t index,
+                int fd_in,
+                const char *log_context) {
+
+        _cleanup_close_ int fd = ASSERT_FD(fd_in);
+        Unit *u = NULL;
+        int r;
+
+        assert(m);
+        assert(unit_id);
+        assert(fdname);
+        assert(log_context);
+
+        /* Load the unit eagerly: if the unit file exists this brings it into UNIT_LOADED, otherwise it
+         * lands in UNIT_NOT_FOUND. In both cases we want to attach the fd so it's preserved until the
+         * unit is fully stopped (or its file appears via daemon-reload). */
+        r = manager_load_unit(m, unit_id, /* path= */ NULL, /* e= */ NULL, &u);
+        if (r < 0)
+                return log_warning_errno(r, "%s: failed to load unit '%s', closing fd '%s': %m",
+                                         log_context, unit_id, fdname);
+
+        if (!UNIT_VTABLE(u)->attach_external_fd_to_fdstore)
+                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
+                                         "%s: unit '%s' does not support fd restoration, closing fd '%s'.",
+                                         log_context, unit_id, fdname);
+
+        r = UNIT_VTABLE(u)->attach_external_fd_to_fdstore(u, TAKE_FD(fd), fdname, index);
+        if (r < 0)
+                return log_unit_warning_errno(u, r, "%s: failed to attach fd '%s' to fd store: %m",
+                                              log_context, fdname);
+
+        return 1; /* fd consumed */
+}
+
+static int manager_distribute_listen_fds_named(Manager *m, Hashmap *named_listen_fds) {
+        assert(m);
+
+        /* Route fds whose LISTEN_FDNAMES name was a numeric index into the matching unit's fd store.
+         * The hashmap is built and owned by main.c's collect_fds(), keyed by fd, with ListenFDsTag* values
+         * that already carry the parsed unit-id, original fdname and index (resolved against the
+         * upstream-pushed fdstore-mapping memfd). We steal entries here so any leftover (skipped) entries
+         * are still cleaned up by the hashmap's destructor on the caller side. */
+
+        if (MANAGER_IS_TEST_RUN(m))
+                return 0;
+
+        for (;;) {
+                _cleanup_(listen_fds_tag_freep) ListenFDsTag *t = NULL;
+                _cleanup_close_ int fd = -EBADF;
+                void *key;
+
+                t = hashmap_steal_first_key_and_value(named_listen_fds, &key);
+                if (!t)
+                        break;
+
+                fd = PTR_TO_FD(key);
+
+                if (!t->unit_id || !t->fdname)
+                        continue;
+
+                if (!unit_name_is_valid(t->unit_id, UNIT_NAME_ANY))
+                        continue;
+
+                (void) manager_dispatch_external_fd_to_unit(m, t->unit_id, t->fdname, t->index, TAKE_FD(fd), "LISTEN_FDS");
+        }
+
+        return 0;
 }
 
 static void manager_distribute_fds(Manager *m, FDSet *fds) {
@@ -1982,6 +2099,8 @@ Manager* manager_reloading_start(Manager *m) {
 }
 
 void manager_reloading_stopp(Manager **m) {
+        assert(m);
+
         if (*m) {
                 assert((*m)->n_reloading > 0);
                 (*m)->n_reloading--;
@@ -2004,7 +2123,7 @@ static int manager_make_runtime_dir(Manager *m) {
         return 0;
 }
 
-int manager_startup(Manager *m, FILE *serialization, FDSet *fds, const char *root) {
+int manager_startup(Manager *m, FILE *serialization, FDSet *fds, Hashmap *named_listen_fds, const char *root) {
         int r;
 
         assert(m);
@@ -2073,6 +2192,15 @@ int manager_startup(Manager *m, FILE *serialization, FDSet *fds, const char *roo
                 if (m->previous_objective == MANAGER_SOFT_REBOOT)
                         m->soft_reboots_count++;
 
+                /* If a LUO (Live Update Orchestrator) session from a previous kexec is available, restore
+                 * preserved file descriptors into the appropriate service fd stores now, before coldplug. */
+                (void) manager_luo_restore_fd_stores(m);
+
+                /* Pick up fds passed via the LISTEN_FDS=/LISTEN_FDNAMES= protocol that are tagged with a
+                 * unit id ("unit-id|fdname"), and route them into the matching unit's fd store. Untagged
+                 * fds remain in 'fds' and are handed to socket units below as before. */
+                (void) manager_distribute_listen_fds_named(m, named_listen_fds);
+
                 /* Any fds left? Find some unit which wants them. This is useful to allow container managers to pass
                  * some file descriptors to us pre-initialized. This enables socket-based activation of entire
                  * containers. */
@@ -2112,11 +2240,22 @@ int manager_startup(Manager *m, FILE *serialization, FDSet *fds, const char *roo
                 /* Clean up runtime objects */
                 manager_vacuum(m);
 
+                /* After deserialization, refresh the upstream JSON mapping memfd so the supervisor's
+                 * view of our fd store stays consistent with the indices we just restored. */
+                (void) service_propagate_fd_store_mapping_upstream(m);
+
                 if (serialization)
                         /* Let's wait for the UnitNew/JobNew messages being sent, before we notify that the
                          * reload is finished */
                         m->send_reloading_done = true;
         }
+
+        /* Set up RestrictFileSystemAccess= BPF LSM after deserialization (so we can detect deserialized link FDs)
+         * and before clearing switching_root (so we can close the initramfs trust window). This must
+         * run after set_manager_settings() has set m->restrict_filesystem_access. */
+        r = bpf_restrict_fsaccess_setup(m);
+        if (r < 0)
+                return r;
 
         manager_ready(m);
 
@@ -2501,6 +2640,8 @@ int manager_load_startable_unit_or_warn(
         Unit *unit;
         int r;
 
+        assert(ret);
+
         r = manager_load_unit(m, name, path, &error, &unit);
         if (r < 0)
                 return log_error_errno(r, "Failed to load %s %s: %s",
@@ -2613,6 +2754,7 @@ static unsigned manager_dispatch_dbus_queue(Manager *m) {
                 assert(u->in_dbus_queue);
 
                 bus_unit_send_change_signal(u);
+                varlink_unit_send_change_signal(u);
                 n++;
 
                 if (budget != UINT_MAX)
@@ -2623,6 +2765,7 @@ static unsigned manager_dispatch_dbus_queue(Manager *m) {
                 assert(j->in_dbus_queue);
 
                 bus_job_send_change_signal(j);
+                varlink_job_send_change_signal(j);
                 n++;
 
                 if (budget != UINT_MAX)
@@ -3269,7 +3412,6 @@ static int manager_dispatch_jobs_in_progress(sd_event_source *source, usec_t use
 }
 
 int manager_loop(Manager *m) {
-        RateLimit rl = { .interval = 1*USEC_PER_SEC, .burst = 50000 };
         int r;
 
         assert(m);
@@ -3284,7 +3426,7 @@ int manager_loop(Manager *m) {
 
         while (m->objective == MANAGER_OK) {
 
-                if (!ratelimit_below(&rl)) {
+                if (!ratelimit_below(&m->event_loop_ratelimit)) {
                         /* Yay, something is going seriously wrong, pause a little */
                         log_warning("Looping too fast. Throttling execution a little.");
                         sleep(1);
@@ -3553,12 +3695,14 @@ int manager_set_watchdog_pretimeout_governor(Manager *m, const char *governor) {
         if (MANAGER_IS_USER(m))
                 return 0;
 
+        governor = empty_to_null(governor);
+
         if (streq_ptr(m->watchdog_pretimeout_governor, governor))
                 return 0;
 
-        p = strdup(governor);
-        if (!p)
-                return -ENOMEM;
+        r = strdup_to(&p, governor);
+        if (r < 0)
+                return r;
 
         r = watchdog_setup_pretimeout_governor(governor);
         if (r < 0)
@@ -3576,12 +3720,14 @@ int manager_override_watchdog_pretimeout_governor(Manager *m, const char *govern
         if (MANAGER_IS_USER(m))
                 return 0;
 
+        governor = empty_to_null(governor);
+
         if (streq_ptr(m->watchdog_pretimeout_governor_overridden, governor))
                 return 0;
 
-        p = strdup(governor);
-        if (!p)
-                return -ENOMEM;
+        r = strdup_to(&p, governor);
+        if (r < 0)
+                return r;
 
         r = watchdog_setup_pretimeout_governor(governor);
         if (r < 0)
@@ -3619,6 +3765,10 @@ int manager_reload(Manager *m) {
 
         /* 💀 This is the point of no return, from here on there is no way back. 💀 */
         reloading = NULL;
+
+        /* Bump before sending the Reloading signal, so any client that reads
+         * ReloadCount in response to that signal observes the new value. */
+        m->reload_count = saturate_add(m->reload_count, 1, UINT64_MAX);
 
         bus_manager_send_reloading(m, true);
 
@@ -4298,8 +4448,9 @@ int manager_set_unit_defaults(Manager *m, const UnitDefaults *defaults) {
         m->defaults.oom_score_adjust = defaults->oom_score_adjust;
         m->defaults.oom_score_adjust_set = defaults->oom_score_adjust_set;
 
-        m->defaults.memory_pressure_watch = defaults->memory_pressure_watch;
-        m->defaults.memory_pressure_threshold_usec = defaults->memory_pressure_threshold_usec;
+        memcpy(m->defaults.pressure, defaults->pressure, sizeof(m->defaults.pressure));
+
+        m->defaults.memory_zswap_writeback = defaults->memory_zswap_writeback;
 
         free_and_replace(m->defaults.smack_process_label, label);
         rlimit_free_all(m->defaults.rlimit);
@@ -4497,10 +4648,9 @@ const char* manager_get_confirm_spawn(Manager *m) {
                 goto fail;
         }
 
-        if (!S_ISCHR(st.st_mode)) {
-                r = -ENOTTY;
+        r = stat_verify_char(&st);
+        if (r < 0)
                 goto fail;
-        }
 
         last_errno = 0;
         return m->confirm_spawn;
@@ -4969,6 +5119,7 @@ static int manager_dispatch_pidref_transport_fd(sd_event_source *source, int fd,
 
         if (n != sizeof(child_pid)) {
                 log_warning("Got pidref message of unexpected size %zi (expected %zu), ignoring.", n, sizeof(child_pid));
+                cmsg_close_all(&msghdr);
                 return 0;
         }
 
@@ -4987,6 +5138,8 @@ static int manager_dispatch_pidref_transport_fd(sd_event_source *source, int fd,
                         child_pidfd = *CMSG_TYPED_DATA(cmsg, int);
                 }
         }
+
+        /* From this point on, the fds are owned by our local variables. Call cmsg_close_all no more. */
 
         /* Verify and set parent pidref. */
         if (!ucred || !pid_is_valid(ucred->pid)) {
@@ -5191,11 +5344,16 @@ void unit_defaults_init(UnitDefaults *defaults, RuntimeScope scope) {
                 .tasks_max = DEFAULT_TASKS_MAX,
                 .timer_accuracy_usec = 1 * USEC_PER_MINUTE,
 
-                .memory_pressure_watch = CGROUP_PRESSURE_WATCH_AUTO,
-                .memory_pressure_threshold_usec = MEMORY_PRESSURE_DEFAULT_THRESHOLD_USEC,
+                .pressure = {
+                        [PRESSURE_MEMORY] = { .watch = CGROUP_PRESSURE_WATCH_AUTO, .threshold_usec = PRESSURE_DEFAULT_THRESHOLD_USEC },
+                        [PRESSURE_CPU]    = { .watch = CGROUP_PRESSURE_WATCH_AUTO, .threshold_usec = PRESSURE_DEFAULT_THRESHOLD_USEC },
+                        [PRESSURE_IO]     = { .watch = CGROUP_PRESSURE_WATCH_AUTO, .threshold_usec = PRESSURE_DEFAULT_THRESHOLD_USEC },
+                },
 
                 .oom_policy = OOM_STOP,
                 .oom_score_adjust_set = false,
+
+                .memory_zswap_writeback = true,
         };
 }
 
